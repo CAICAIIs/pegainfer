@@ -521,10 +521,30 @@ __global__ void deepseek_add_f32_bf16_to_bf16_kernel(
   out[idx] = __float2bfloat16(a[idx] + __bfloat162float(b[idx]));
 }
 
-__global__ void deepseek_moe_clear_i32_kernel(int* data, int n, int value) {
+__global__ void deepseek_moe_clear_mapping_kernel(
+    int *__restrict__ pos_to_token,
+    int *__restrict__ pos_to_token_topk,
+    int *__restrict__ token_topk_to_pos,
+    int *__restrict__ expert_indptr,
+    int *__restrict__ expert_cursor,
+    int *__restrict__ local_count,
+    int route_elems,
+    int local_experts) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx < n) {
-    data[idx] = value;
+  if (idx < route_elems) {
+    pos_to_token[idx] = -1;
+    pos_to_token_topk[idx] = -1;
+    token_topk_to_pos[idx] = -1;
+  }
+  if (idx < local_experts) {
+    expert_indptr[idx] = 0;
+    expert_cursor[idx] = 0;
+  }
+  if (idx == local_experts) {
+    expert_indptr[local_experts] = 0;
+  }
+  if (idx == 0) {
+    local_count[0] = 0;
   }
 }
 
@@ -670,25 +690,13 @@ cudaError_t deepseek_moe_local_mapping_cuda(
     cudaStream_t stream) {
   constexpr int threads = 256;
   int route_elems = seq_len * topk;
-  int clear_blocks = (route_elems + threads - 1) / threads;
   int route_blocks = (route_elems + threads - 1) / threads;
+  int clear_elems = route_elems > local_experts + 1 ? route_elems : local_experts + 1;
+  int clear_blocks = (clear_elems + threads - 1) / threads;
   cudaError_t err = cudaSuccess;
-  deepseek_moe_clear_i32_kernel<<<clear_blocks, threads, 0, stream>>>(pos_to_token, route_elems, -1);
-  err = cudaGetLastError();
-  if (err != cudaSuccess) return err;
-  deepseek_moe_clear_i32_kernel<<<clear_blocks, threads, 0, stream>>>(pos_to_token_topk, route_elems, -1);
-  err = cudaGetLastError();
-  if (err != cudaSuccess) return err;
-  deepseek_moe_clear_i32_kernel<<<route_blocks, threads, 0, stream>>>(token_topk_to_pos, route_elems, -1);
-  err = cudaGetLastError();
-  if (err != cudaSuccess) return err;
-  deepseek_moe_clear_i32_kernel<<<1, 256, 0, stream>>>(expert_indptr, local_experts + 1, 0);
-  err = cudaGetLastError();
-  if (err != cudaSuccess) return err;
-  deepseek_moe_clear_i32_kernel<<<1, 256, 0, stream>>>(expert_cursor, local_experts, 0);
-  err = cudaGetLastError();
-  if (err != cudaSuccess) return err;
-  deepseek_moe_clear_i32_kernel<<<1, 1, 0, stream>>>(local_count, 1, 0);
+  deepseek_moe_clear_mapping_kernel<<<clear_blocks, threads, 0, stream>>>(
+      pos_to_token, pos_to_token_topk, token_topk_to_pos,
+      expert_indptr, expert_cursor, local_count, route_elems, local_experts);
   err = cudaGetLastError();
   if (err != cudaSuccess) return err;
 
