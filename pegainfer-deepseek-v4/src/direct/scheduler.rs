@@ -7,15 +7,13 @@ use pegainfer_core::engine::{
 };
 use tokio::sync::mpsc;
 
-use super::worker::{
-    DirectBatchDecodeEntry, FullDirectRuntime, ensure_direct_decode_caches,
-    load_full_direct_runtime, run_direct_decode_batch_logits, run_direct_decode_logits,
-    run_prefill_logits_and_seed_decode_cache,
-};
 #[cfg(test)]
+use super::worker::reset_direct_decode_cache_slot_for_test;
 use super::worker::{
-    clone_direct_decode_cache_slot_for_test, ensure_direct_decode_batch_caches_for_test,
-    reset_direct_decode_cache_slot_for_test,
+    DirectBatchDecodeEntry, FullDirectRuntime, clone_direct_decode_cache_slot,
+    ensure_direct_decode_batch_caches, ensure_direct_decode_caches, load_full_direct_runtime,
+    run_direct_decode_batch_logits, run_direct_decode_logits,
+    run_prefill_logits_and_seed_decode_cache,
 };
 use crate::Config;
 
@@ -86,6 +84,8 @@ impl DirectKvCacheActiveSnapshot {
 pub struct DirectKvCacheSnapshot {
     capacity_seq_len: usize,
     allocated_seq_len: usize,
+    request_slots: usize,
+    active_count: usize,
     active: Option<DirectKvCacheActiveSnapshot>,
     total_reservations: u64,
     total_releases: u64,
@@ -103,6 +103,14 @@ impl DirectKvCacheSnapshot {
 
     pub fn allocated_seq_len(&self) -> usize {
         self.allocated_seq_len
+    }
+
+    pub fn request_slots(&self) -> usize {
+        self.request_slots
+    }
+
+    pub fn active_count(&self) -> usize {
+        self.active_count
     }
 
     pub fn active(&self) -> Option<&DirectKvCacheActiveSnapshot> {
@@ -140,6 +148,7 @@ impl DirectKvCacheSnapshot {
 
 #[derive(Clone, Debug)]
 pub struct DirectKvCacheLease {
+    slot_id: usize,
     request_epoch: u64,
     prompt_len: usize,
     max_new_tokens: usize,
@@ -147,6 +156,10 @@ pub struct DirectKvCacheLease {
 }
 
 impl DirectKvCacheLease {
+    pub fn slot_id(&self) -> usize {
+        self.slot_id
+    }
+
     pub fn request_epoch(&self) -> u64 {
         self.request_epoch
     }
@@ -300,6 +313,7 @@ impl DeepSeekV4DirectGenerator {
             });
         }
 
+        self.kv_cache.set_request_slots(1)?;
         let kv_cache = self
             .kv_cache
             .reserve(request_epoch, prompt_tokens.len(), max_new_tokens)?;
@@ -419,6 +433,82 @@ impl DeepSeekV4DirectGenerator {
         Ok(step)
     }
 
+    fn prepare_active_set_slots(&mut self, max_seq_len: usize, request_slots: usize) -> Result<()> {
+        self.kv_cache.set_request_slots(request_slots)?;
+        ensure_direct_decode_batch_caches(&mut self.runtime, self.config, max_seq_len)
+    }
+
+    fn start_greedy_request_in_slot(
+        &mut self,
+        prompt_tokens: &[u32],
+        max_new_tokens: usize,
+        ignore_eos: bool,
+        slot_id: usize,
+    ) -> Result<DeepSeekV4RequestState> {
+        if prompt_tokens.is_empty() {
+            bail!("DeepSeek V4 request produced an empty prompt");
+        }
+        let request_epoch = self.next_request_epoch;
+        self.next_request_epoch = self
+            .next_request_epoch
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("DeepSeek V4 request epoch exhausted"))?;
+        let kv_cache = self.kv_cache.reserve_in_slot(
+            request_epoch,
+            prompt_tokens.len(),
+            max_new_tokens,
+            Some(slot_id),
+        )?;
+        self.kv_cache.attach_prepared(&kv_cache)?;
+        let next_logits = run_prefill_logits_and_seed_decode_cache(
+            &mut self.runtime,
+            self.config,
+            prompt_tokens,
+        )?;
+        if slot_id != 0 {
+            clone_direct_decode_cache_slot(&mut self.runtime, 0, slot_id)?;
+        }
+        Ok(DeepSeekV4RequestState {
+            request_epoch,
+            kv_cache: Some(kv_cache),
+            prompt_len: prompt_tokens.len(),
+            max_new_tokens,
+            ignore_eos,
+            generated: Vec::with_capacity(max_new_tokens),
+            next_logits: Some(next_logits),
+            finish_reason: None,
+        })
+    }
+
+    #[cfg(test)]
+    fn decode_greedy_batch_step(
+        &mut self,
+        states: &mut [&mut DeepSeekV4RequestState],
+    ) -> Result<Vec<DirectDecodeStep>> {
+        let steps = states
+            .iter()
+            .map(|state| self.sample_greedy_step(state))
+            .collect::<Result<Vec<_>>>()?;
+        let mut pairs = states
+            .iter_mut()
+            .zip(steps.iter().cloned())
+            .map(|(state, step)| (&mut **state, step))
+            .collect::<Vec<_>>();
+        advance_greedy_batch_steps_with_decode(&mut self.kv_cache, &mut pairs, |entries| {
+            run_direct_decode_batch_logits(&mut self.runtime, entries)
+        })?;
+        Ok(steps)
+    }
+
+    fn decode_greedy_batch_step_from_steps(
+        &mut self,
+        states_and_steps: &mut [(&mut DeepSeekV4RequestState, DirectDecodeStep)],
+    ) -> Result<()> {
+        advance_greedy_batch_steps_with_decode(&mut self.kv_cache, states_and_steps, |entries| {
+            run_direct_decode_batch_logits(&mut self.runtime, entries)
+        })
+    }
+
     #[allow(dead_code)] // PR A lands the runtime batch path before scheduler wiring.
     pub(crate) fn decode_batch_logits_for_test(
         &mut self,
@@ -437,7 +527,7 @@ impl DeepSeekV4DirectGenerator {
 
     #[cfg(test)]
     fn prepare_batch_decode_slots_for_test(&mut self, max_seq_len: usize) -> Result<()> {
-        ensure_direct_decode_batch_caches_for_test(&mut self.runtime, self.config, max_seq_len)
+        ensure_direct_decode_batch_caches(&mut self.runtime, self.config, max_seq_len)
     }
 
     #[cfg(test)]
@@ -453,7 +543,7 @@ impl DeepSeekV4DirectGenerator {
             prompt_tokens,
         )?;
         if slot_id != 0 {
-            clone_direct_decode_cache_slot_for_test(&mut self.runtime, 0, slot_id)?;
+            clone_direct_decode_cache_slot(&mut self.runtime, 0, slot_id)?;
         }
         Ok(logits)
     }
@@ -501,6 +591,7 @@ impl DeepSeekV4DirectGenerator {
 
 #[derive(Clone, Debug)]
 struct DirectKvCacheActive {
+    slot_id: usize,
     request_epoch: u64,
     prompt_len: usize,
     max_new_tokens: usize,
@@ -512,7 +603,7 @@ struct DirectKvCacheActive {
 struct DirectKvCacheManager {
     capacity_seq_len: usize,
     allocated_seq_len: usize,
-    active: Option<DirectKvCacheActive>,
+    active: Vec<Option<DirectKvCacheActive>>,
     total_reservations: u64,
     total_releases: u64,
     total_rejections: u64,
@@ -527,7 +618,7 @@ impl DirectKvCacheManager {
         Self {
             capacity_seq_len,
             allocated_seq_len: 0,
-            active: None,
+            active: vec![None],
             total_reservations: 0,
             total_releases: 0,
             total_rejections: 0,
@@ -544,14 +635,52 @@ impl DirectKvCacheManager {
         prompt_len: usize,
         max_new_tokens: usize,
     ) -> Result<DirectKvCacheLease> {
+        self.reserve_in_slot(request_epoch, prompt_len, max_new_tokens, None)
+    }
+
+    fn reserve_in_slot(
+        &mut self,
+        request_epoch: u64,
+        prompt_len: usize,
+        max_new_tokens: usize,
+        preferred_slot: Option<usize>,
+    ) -> Result<DirectKvCacheLease> {
         let reserved_seq_len = prompt_len
             .checked_add(max_new_tokens)
             .ok_or_else(|| anyhow::anyhow!("DeepSeek V4 KV cache reservation length overflow"))?;
-        if self.active.is_some() {
+        let slot_id = match preferred_slot {
+            Some(slot_id) => {
+                ensure!(
+                    slot_id < self.active.len(),
+                    "DeepSeek V4 KV cache preferred slot {slot_id} out of range {}",
+                    self.active.len()
+                );
+                slot_id
+            }
+            None => self
+                .active
+                .iter()
+                .position(Option::is_none)
+                .ok_or_else(|| {
+                    self.total_rejections += 1;
+                    let reject = DirectKvCacheReject {
+                        reason: DirectKvCacheRejectReason::ActiveRequest,
+                        requested_seq_len: reserved_seq_len,
+                        capacity_seq_len: self.capacity_seq_len,
+                    };
+                    self.last_reject = Some(reject.clone());
+                    DirectKvCacheReservationError {
+                        reject,
+                        message: "DeepSeek V4 KV cache already has all request slots active"
+                            .to_string(),
+                    }
+                })?,
+        };
+        if self.active[slot_id].is_some() {
             return self.reject(
                 DirectKvCacheRejectReason::ActiveRequest,
                 reserved_seq_len,
-                "DeepSeek V4 KV cache already has an active request",
+                "DeepSeek V4 KV cache requested slot already has an active request",
             );
         }
         if reserved_seq_len > self.capacity_seq_len {
@@ -566,12 +695,14 @@ impl DirectKvCacheManager {
         }
 
         let lease = DirectKvCacheLease {
+            slot_id,
             request_epoch,
             prompt_len,
             max_new_tokens,
             reserved_seq_len,
         };
-        self.active = Some(DirectKvCacheActive {
+        self.active[slot_id] = Some(DirectKvCacheActive {
+            slot_id,
             request_epoch,
             prompt_len,
             max_new_tokens,
@@ -583,10 +714,25 @@ impl DirectKvCacheManager {
         Ok(lease)
     }
 
+    fn set_request_slots(&mut self, request_slots: usize) -> Result<()> {
+        ensure!(
+            request_slots > 0,
+            "DeepSeek V4 KV cache request slots must be positive"
+        );
+        let active_count = self.active.iter().filter(|slot| slot.is_some()).count();
+        ensure!(
+            active_count == 0,
+            "DeepSeek V4 KV cache cannot resize request slots while {active_count} request(s) are active"
+        );
+        self.active.resize_with(request_slots, || None);
+        Ok(())
+    }
+
     fn attach_prepared(&mut self, lease: &DirectKvCacheLease) -> Result<()> {
         let active = self
             .active
-            .as_mut()
+            .get_mut(lease.slot_id)
+            .and_then(Option::as_mut)
             .ok_or_else(|| anyhow::anyhow!("DeepSeek V4 KV cache attach without reservation"))?;
         ensure!(
             active.request_epoch == lease.request_epoch,
@@ -614,8 +760,21 @@ impl DirectKvCacheManager {
     fn release(&mut self, lease: &DirectKvCacheLease) -> Result<()> {
         let active = self
             .active
+            .get_mut(lease.slot_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "DeepSeek V4 KV cache release slot {} out of range",
+                    lease.slot_id
+                )
+            })?
             .take()
             .ok_or_else(|| anyhow::anyhow!("DeepSeek V4 KV cache release without active lease"))?;
+        ensure!(
+            active.slot_id == lease.slot_id,
+            "DeepSeek V4 KV cache release slot mismatch: active={}, lease={}",
+            active.slot_id,
+            lease.slot_id
+        );
         ensure!(
             active.request_epoch == lease.request_epoch,
             "DeepSeek V4 KV cache release epoch mismatch: active={}, lease={}",
@@ -636,16 +795,17 @@ impl DirectKvCacheManager {
         DirectKvCacheSnapshot {
             capacity_seq_len: self.capacity_seq_len,
             allocated_seq_len: self.allocated_seq_len,
-            active: self
-                .active
-                .as_ref()
-                .map(|active| DirectKvCacheActiveSnapshot {
+            request_slots: self.active.len(),
+            active_count: self.active.iter().filter(|slot| slot.is_some()).count(),
+            active: self.active.iter().find_map(Option::as_ref).map(|active| {
+                DirectKvCacheActiveSnapshot {
                     request_epoch: active.request_epoch,
                     prompt_len: active.prompt_len,
                     max_new_tokens: active.max_new_tokens,
                     reserved_seq_len: active.reserved_seq_len,
                     attached: active.attached,
-                }),
+                }
+            }),
             total_reservations: self.total_reservations,
             total_releases: self.total_releases,
             total_rejections: self.total_rejections,
@@ -737,6 +897,90 @@ where
     }
 }
 
+#[allow(dead_code)] // PR B exposes this through the scheduler active-set path.
+fn advance_greedy_batch_steps_with_decode<F>(
+    kv_cache: &mut DirectKvCacheManager,
+    states_and_steps: &mut [(&mut DeepSeekV4RequestState, DirectDecodeStep)],
+    decode_next_logits: F,
+) -> Result<()>
+where
+    F: FnOnce(&[DirectBatchDecodeEntry]) -> Result<Vec<Vec<f32>>>,
+{
+    for (state, step) in states_and_steps.iter() {
+        ensure_step_matches_state(state, step)?;
+    }
+
+    let mut decode_indices = Vec::new();
+    let mut decode_entries = Vec::new();
+    for (idx, (state, step)) in states_and_steps.iter_mut().enumerate() {
+        if state.is_finished() {
+            continue;
+        }
+
+        if let Some(finish_reason) = step.finish_reason()
+            && step.token().is_none()
+        {
+            state.next_logits = None;
+            state.finish_reason = Some(finish_reason);
+            release_greedy_request_from(kv_cache, state)?;
+            continue;
+        }
+
+        let Some(token) = step.token() else {
+            bail!("DeepSeek V4 batch decode step without token or finish reason");
+        };
+        state
+            .next_logits
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("DeepSeek V4 request state missing consumed logits"))?;
+        state.generated.push(token);
+        if let Some(finish_reason) = step.finish_reason() {
+            state.finish_reason = Some(finish_reason);
+            release_greedy_request_from(kv_cache, state)?;
+            continue;
+        }
+
+        let lease = state.kv_cache.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("DeepSeek V4 active request state missing KV cache lease")
+        })?;
+        decode_indices.push(idx);
+        decode_entries.push(DirectBatchDecodeEntry {
+            token_id: token,
+            start_pos: step.start_pos(),
+            slot_id: lease.slot_id(),
+        });
+    }
+
+    if decode_entries.is_empty() {
+        return Ok(());
+    }
+
+    let rows = match decode_next_logits(&decode_entries) {
+        Ok(rows) => rows,
+        Err(err) => {
+            for idx in decode_indices {
+                let state = &mut states_and_steps[idx].0;
+                if let Err(release_err) = release_greedy_request_from(kv_cache, state) {
+                    warn!(
+                        "failed to release DeepSeek V4 KV cache after batch decode error: {release_err:#}"
+                    );
+                }
+            }
+            return Err(err);
+        }
+    };
+    ensure!(
+        rows.len() == decode_indices.len(),
+        "DeepSeek V4 batch decode returned {} rows for {} requests",
+        rows.len(),
+        decode_indices.len()
+    );
+    for (idx, next_logits) in decode_indices.into_iter().zip(rows) {
+        states_and_steps[idx].0.next_logits = Some(next_logits);
+    }
+    Ok(())
+}
+
 pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<EngineHandle> {
     if options.device_ordinals != (0..8).collect::<Vec<_>>() {
         bail!(
@@ -765,7 +1009,23 @@ pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<Eng
             };
             info!("DeepSeek V4 scheduler ready");
             while let Some(req) = submit_rx.blocking_recv() {
-                handle_request(&mut generator, req);
+                let mut wave = vec![req];
+                while wave.len() < 2 {
+                    match submit_rx.try_recv() {
+                        Ok(req) => wave.push(req),
+                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                    }
+                }
+                if wave.len() == 1 {
+                    handle_request(
+                        &mut generator,
+                        wave.pop()
+                            .expect("DeepSeek V4 scheduler wave must contain request"),
+                    );
+                } else {
+                    handle_request_wave(&mut generator, wave);
+                }
             }
             info!("DeepSeek V4 scheduler exiting");
         })
@@ -851,6 +1111,214 @@ fn handle_request(generator: &mut DeepSeekV4DirectGenerator, req: GenerateReques
     }
 }
 
+struct PendingDirectRequest {
+    req: GenerateRequest,
+    prompt_len: usize,
+    slot_id: usize,
+}
+
+struct ActiveDirectRequest {
+    req: GenerateRequest,
+    prompt_len: usize,
+    state: DeepSeekV4RequestState,
+}
+
+fn handle_request_wave(generator: &mut DeepSeekV4DirectGenerator, requests: Vec<GenerateRequest>) {
+    let mut pending = Vec::new();
+    for req in requests {
+        let prompt_len = req.prompt_tokens.len();
+        if req.echo {
+            let _ = req.token_tx.send(TokenEvent::PromptTokens {
+                ids: req.prompt_tokens.clone(),
+                logprobs: vec![None; prompt_len],
+            });
+        }
+        if req.params.temperature > 0.0 || req.params.top_k != -1 || req.params.top_p < 1.0 {
+            reject_request(
+                &req,
+                prompt_len,
+                format!(
+                    "DeepSeek V4 direct engine currently serves greedy decoding only; requested temperature={}, top_k={}, top_p={}",
+                    req.params.temperature, req.params.top_k, req.params.top_p
+                ),
+            );
+            continue;
+        }
+        if req.logprobs > 0 {
+            reject_request(
+                &req,
+                prompt_len,
+                "DeepSeek V4 direct engine does not return logprobs yet".to_string(),
+            );
+            continue;
+        }
+        if req.max_tokens == 0 {
+            let _ = req.token_tx.send(TokenEvent::Finished {
+                finish_reason: FinishReason::Length,
+                prompt_tokens: prompt_len,
+                completion_tokens: 0,
+            });
+            continue;
+        }
+        let slot_id = pending.len();
+        pending.push(PendingDirectRequest {
+            req,
+            prompt_len,
+            slot_id,
+        });
+    }
+    if pending.is_empty() {
+        return;
+    }
+
+    let max_seq_len = pending
+        .iter()
+        .map(|pending| pending.prompt_len + pending.req.max_tokens)
+        .max()
+        .expect("pending direct request set must not be empty");
+    if let Err(err) = generator.prepare_active_set_slots(max_seq_len, pending.len()) {
+        for pending in pending {
+            send_request_error(
+                &pending.req,
+                pending.prompt_len,
+                0,
+                format!("DeepSeek V4 direct batch scheduler prepare failed: {err:#}"),
+            );
+        }
+        return;
+    }
+
+    let mut active = Vec::with_capacity(pending.len());
+    for pending in pending.into_iter().rev() {
+        match generator.start_greedy_request_in_slot(
+            &pending.req.prompt_tokens,
+            pending.req.max_tokens,
+            pending.req.params.ignore_eos,
+            pending.slot_id,
+        ) {
+            Ok(state) => active.push(ActiveDirectRequest {
+                req: pending.req,
+                prompt_len: pending.prompt_len,
+                state,
+            }),
+            Err(err) => {
+                send_request_error(
+                    &pending.req,
+                    pending.prompt_len,
+                    0,
+                    format!("DeepSeek V4 direct batch scheduler admission failed: {err:#}"),
+                );
+                for active in &mut active {
+                    if let Err(release_err) = generator.release_greedy_request(&mut active.state) {
+                        warn!(
+                            "failed to release DeepSeek V4 KV cache after batch admission error: {release_err:#}"
+                        );
+                    }
+                    send_request_error(
+                        &active.req,
+                        active.prompt_len,
+                        active.state.generated().len(),
+                        format!(
+                            "DeepSeek V4 direct batch scheduler admission failed after this request was admitted: {err:#}"
+                        ),
+                    );
+                }
+                return;
+            }
+        }
+    }
+
+    while !active.is_empty() {
+        let mut steps = Vec::with_capacity(active.len());
+        let mut dropped = Vec::new();
+        for (idx, active_req) in active.iter_mut().enumerate() {
+            match generator.sample_greedy_step(&active_req.state) {
+                Ok(step) => {
+                    if let Some(token) = step.token()
+                        && active_req
+                            .req
+                            .token_tx
+                            .send(TokenEvent::Token {
+                                id: token,
+                                logprob: None,
+                            })
+                            .is_err()
+                    {
+                        if let Err(release_err) =
+                            generator.release_greedy_request(&mut active_req.state)
+                        {
+                            warn!(
+                                "failed to release DeepSeek V4 KV cache after receiver drop: {release_err:#}"
+                            );
+                        }
+                        dropped.push(idx);
+                        steps.push(None);
+                        continue;
+                    }
+                    steps.push(Some(step));
+                }
+                Err(err) => {
+                    send_request_error(
+                        &active_req.req,
+                        active_req.prompt_len,
+                        active_req.state.generated().len(),
+                        format!("DeepSeek V4 direct batch scheduler sample failed: {err:#}"),
+                    );
+                    if let Err(release_err) =
+                        generator.release_greedy_request(&mut active_req.state)
+                    {
+                        warn!(
+                            "failed to release DeepSeek V4 KV cache after sample error: {release_err:#}"
+                        );
+                    }
+                    dropped.push(idx);
+                    steps.push(None);
+                }
+            }
+        }
+        for idx in dropped.into_iter().rev() {
+            active.swap_remove(idx);
+            steps.swap_remove(idx);
+        }
+        if active.is_empty() {
+            break;
+        }
+
+        let mut pairs = active
+            .iter_mut()
+            .zip(steps.into_iter())
+            .filter_map(|(active_req, step)| step.map(|step| (&mut active_req.state, step)))
+            .collect::<Vec<_>>();
+        if let Err(err) = generator.decode_greedy_batch_step_from_steps(&mut pairs) {
+            for active_req in &mut active {
+                send_request_error(
+                    &active_req.req,
+                    active_req.prompt_len,
+                    active_req.state.generated().len(),
+                    format!("DeepSeek V4 direct batch scheduler decode failed: {err:#}"),
+                );
+            }
+            active.clear();
+            break;
+        }
+
+        let mut finished = Vec::new();
+        for (idx, active_req) in active.iter().enumerate() {
+            if let Some(finish_reason) = active_req.state.finish_reason() {
+                let _ = active_req.req.token_tx.send(TokenEvent::Finished {
+                    finish_reason,
+                    prompt_tokens: active_req.prompt_len,
+                    completion_tokens: active_req.state.generated().len(),
+                });
+                finished.push(idx);
+            }
+        }
+        for idx in finished.into_iter().rev() {
+            active.swap_remove(idx);
+        }
+    }
+}
+
 fn ensure_step_matches_state(
     state: &DeepSeekV4RequestState,
     step: &DirectDecodeStep,
@@ -905,6 +1373,20 @@ fn reject_request(req: &GenerateRequest, prompt_len: usize, reason: String) {
     });
 }
 
+fn send_request_error(
+    req: &GenerateRequest,
+    prompt_len: usize,
+    completion_tokens: usize,
+    message: String,
+) {
+    warn!("{message}");
+    let _ = req.token_tx.send(TokenEvent::Error {
+        message,
+        prompt_tokens: prompt_len,
+        completion_tokens,
+    });
+}
+
 fn argmax_f32(values: &[f32]) -> usize {
     let mut best_idx = 0;
     let mut best = f32::NEG_INFINITY;
@@ -929,7 +1411,7 @@ mod tests {
         manager.attach_prepared(&lease).unwrap();
 
         let err = manager.reserve(2, 4, 4).unwrap_err().to_string();
-        assert!(err.contains("active request"));
+        assert!(err.contains("request slots active"));
         let snapshot = manager.snapshot();
         assert_eq!(snapshot.total_reservations(), 1);
         assert_eq!(snapshot.total_rejections(), 1);
@@ -1023,6 +1505,37 @@ mod tests {
     }
 
     #[test]
+    fn kv_cache_manager_releases_only_matching_slot() {
+        let mut manager = DirectKvCacheManager::new(16);
+        manager.set_request_slots(2).unwrap();
+        let slot0 = manager.reserve_in_slot(1, 4, 4, Some(0)).unwrap();
+        let slot1 = manager.reserve_in_slot(2, 3, 3, Some(1)).unwrap();
+        manager.attach_prepared(&slot0).unwrap();
+        manager.attach_prepared(&slot1).unwrap();
+
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.request_slots(), 2);
+        assert_eq!(snapshot.active_count(), 2);
+        assert_eq!(slot0.slot_id(), 0);
+        assert_eq!(slot1.slot_id(), 1);
+
+        manager.release(&slot1).unwrap();
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.active_count(), 1);
+        assert_eq!(snapshot.total_releases(), 1);
+        assert_eq!(snapshot.active().unwrap().request_epoch(), 1);
+
+        let replacement = manager.reserve_in_slot(3, 2, 2, Some(1)).unwrap();
+        assert_eq!(replacement.slot_id(), 1);
+        manager.release(&slot0).unwrap();
+        manager.attach_prepared(&replacement).unwrap();
+        manager.release(&replacement).unwrap();
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.active_count(), 0);
+        assert_eq!(snapshot.total_releases(), 3);
+    }
+
+    #[test]
     #[ignore = "requires 8 GPUs and DeepSeek-V4-Flash weights"]
     fn batch_decode_logits_match_two_single_decode_rows() -> Result<()> {
         let model_path = env::var_os("PEGAINFER_TEST_MODEL_PATH")
@@ -1048,6 +1561,58 @@ mod tests {
         let single_b = decode_logits_for_token(&mut generator, &prompt_b, token_b)?;
         assert_logits_close("row0 prompt A", &single_a, &batch[0]);
         assert_logits_close("row1 prompt B", &single_b, &batch[1]);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires 8 GPUs and DeepSeek-V4-Flash weights"]
+    fn active_set_batch_tick_releases_each_slot() -> Result<()> {
+        let model_path = env::var_os("PEGAINFER_TEST_MODEL_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("models/DeepSeek-V4-Flash"));
+        let mut generator = DeepSeekV4DirectGenerator::from_model_dir(&model_path)?;
+        let prompt_a = (1000..1128).collect::<Vec<u32>>();
+        let prompt_b = (2000..2128).collect::<Vec<u32>>();
+
+        generator.prepare_active_set_slots(prompt_a.len() + 2, 2)?;
+        let mut state_a = generator.start_greedy_request_in_slot(&prompt_a, 2, true, 1)?;
+        let mut state_b = generator.start_greedy_request_in_slot(&prompt_b, 2, true, 0)?;
+        assert_eq!(state_a.kv_cache_lease().unwrap().slot_id(), 1);
+        assert_eq!(state_b.kv_cache_lease().unwrap().slot_id(), 0);
+        assert_eq!(generator.kv_cache_snapshot().active_count(), 2);
+
+        let steps = generator.decode_greedy_batch_step(&mut [&mut state_a, &mut state_b])?;
+        let token_a = steps[0]
+            .token()
+            .ok_or_else(|| anyhow::anyhow!("active-set prompt A unexpectedly finished"))?;
+        let token_b = steps[1]
+            .token()
+            .ok_or_else(|| anyhow::anyhow!("active-set prompt B unexpectedly finished"))?;
+        assert_eq!(state_a.generated(), &[token_a]);
+        assert_eq!(state_b.generated(), &[token_b]);
+        assert_eq!(generator.kv_cache_snapshot().active_count(), 2);
+        let batch_a = state_a
+            .next_logits
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("active-set row A missing next logits"))?
+            .clone();
+        let batch_b = state_b
+            .next_logits
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("active-set row B missing next logits"))?
+            .clone();
+
+        generator.decode_greedy_batch_step(&mut [&mut state_a, &mut state_b])?;
+        assert!(state_a.is_finished());
+        assert!(state_b.is_finished());
+        let snapshot = generator.kv_cache_snapshot();
+        assert_eq!(snapshot.active_count(), 0);
+        assert_eq!(snapshot.total_releases(), 2);
+
+        let single_a = decode_logits_for_token(&mut generator, &prompt_a, token_a)?;
+        let single_b = decode_logits_for_token(&mut generator, &prompt_b, token_b)?;
+        assert_logits_close("active-set row0 prompt A", &single_a, &batch_a);
+        assert_logits_close("active-set row1 prompt B", &single_b, &batch_b);
         Ok(())
     }
 

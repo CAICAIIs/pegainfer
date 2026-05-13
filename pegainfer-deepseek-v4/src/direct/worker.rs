@@ -2,9 +2,7 @@ use std::{path::Path, thread};
 
 use anyhow::{Context, Result, ensure};
 use crossbeam_channel as channel;
-#[cfg(test)]
-use cudarc::driver::DeviceRepr;
-use cudarc::driver::{CudaSlice, DevicePtrMut, result as cuda_result};
+use cudarc::driver::{CudaSlice, DevicePtrMut, DeviceRepr, result as cuda_result};
 
 use crate::{
     Config, DeepSeekRopeCache, F32Logits, LayerDecodeCache, RankGpuContext, RankWeightView,
@@ -65,7 +63,6 @@ enum RankCommand {
         entries: Vec<DirectBatchDecodeEntry>,
         resp: channel::Sender<Result<RankBatchResult>>,
     },
-    #[cfg(test)]
     CloneCacheSlot {
         src_slot: usize,
         dst_slot: usize,
@@ -389,13 +386,12 @@ impl RankWorker {
                                     .map(|logits| (rank, logits));
                                     let _ = resp.send(result);
                                 }
-                                #[cfg(test)]
                                 RankCommand::CloneCacheSlot {
                                     src_slot,
                                     dst_slot,
                                     resp,
                                 } => {
-                                    let result = clone_rank_decode_cache_slot_for_test(
+                                    let result = clone_rank_decode_cache_slot(
                                         &ctx,
                                         config,
                                         &mut caches,
@@ -487,8 +483,7 @@ impl RankWorker {
             .map_err(|_| anyhow::anyhow!("DeepSeek rank worker dropped ResetCaches response"))?
     }
 
-    #[cfg(test)]
-    fn clone_cache_slot_for_test(&self, src_slot: usize, dst_slot: usize) -> Result<()> {
+    fn clone_cache_slot(&self, src_slot: usize, dst_slot: usize) -> Result<()> {
         let (resp_tx, resp_rx) = channel::bounded(1);
         self.tx
             .send(RankCommand::CloneCacheSlot {
@@ -644,8 +639,7 @@ pub(super) fn ensure_direct_decode_caches(
     ensure_direct_decode_caches_with_slots(runtime, config, max_seq_len, 1)
 }
 
-#[cfg(test)]
-pub(super) fn ensure_direct_decode_batch_caches_for_test(
+pub(super) fn ensure_direct_decode_batch_caches(
     runtime: &mut FullDirectRuntime,
     config: &Config,
     max_seq_len: usize,
@@ -801,8 +795,7 @@ fn reset_rank_decode_cache_slot_for_test(
     Ok(())
 }
 
-#[cfg(test)]
-fn clone_rank_decode_cache_slot_for_test(
+fn clone_rank_decode_cache_slot(
     ctx: &RankGpuContext,
     config: &Config,
     caches: &mut [LayerDecodeCache],
@@ -889,7 +882,6 @@ fn clone_rank_decode_cache_slot_for_test(
     Ok(())
 }
 
-#[cfg(test)]
 fn clone_slot_rows<T>(
     ctx: &RankGpuContext,
     data: &mut CudaSlice<T>,
@@ -1543,8 +1535,7 @@ pub(super) fn run_direct_decode_batch_logits(
     rank0_batch_logits(results)
 }
 
-#[cfg(test)]
-pub(super) fn clone_direct_decode_cache_slot_for_test(
+pub(super) fn clone_direct_decode_cache_slot(
     runtime: &mut FullDirectRuntime,
     src_slot: usize,
     dst_slot: usize,
@@ -1555,7 +1546,7 @@ pub(super) fn clone_direct_decode_cache_slot_for_test(
     );
     for (rank, worker) in runtime.workers.iter().enumerate() {
         worker
-            .clone_cache_slot_for_test(src_slot, dst_slot)
+            .clone_cache_slot(src_slot, dst_slot)
             .with_context(|| format!("clone rank worker cache slot rank {rank}"))?;
     }
     Ok(())
