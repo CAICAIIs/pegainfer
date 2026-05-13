@@ -29,16 +29,18 @@ Use this document as the baseline contract before changing the DeepSeek V4 sched
 
 ## Reproducible Commands
 
+Run these commands from any checkout at or after PR #101's merge commit `d6d2cee`. Keep build artifacts outside the repository checkout.
+
 Build the HTTP server on the 5090 host:
 
 ```bash
-cd ~/develop/xingming/PegaInfer-Dev/pegainfer-pr101
+cd /path/to/pegainfer
 export PATH=/usr/local/cuda-13.1/bin:$PWD/.venv/bin:$PATH
 export CUDA_HOME=/usr/local/cuda-13.1
 export PEGAINFER_TILELANG_PYTHON=$PWD/.venv/bin/python
 export PEGAINFER_TRITON_PYTHON=$PWD/.venv/bin/python
 export PEGAINFER_NVCC_JOBS=8
-export CARGO_TARGET_DIR=/root/develop/xingming/PegaInfer-Dev/target-pr101
+export CARGO_TARGET_DIR=/path/to/pegainfer-target
 
 cargo build --release -p pegainfer-server --features deepseek-v4 --bin pegainfer
 ```
