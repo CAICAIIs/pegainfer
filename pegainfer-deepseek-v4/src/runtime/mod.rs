@@ -9,8 +9,8 @@ use pegainfer_kernels::ffi;
 use crate::{
     config::Config,
     model::{
-        AttentionWeights, CompressorWeights, ExpertWeights, FfnWeights, IndexerWeights,
-        QuantLinearRef, RankWeightView, TensorRef,
+        AttentionWeights, CompressorWeights, FfnWeights, IndexerWeights, QuantLinearRef,
+        RankWeightView, TensorRef,
     },
     weights::RankGpuContext,
 };

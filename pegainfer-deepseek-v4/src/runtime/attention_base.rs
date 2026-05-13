@@ -205,23 +205,14 @@ pub fn apply_rope_attention_projections(
         projections.head_dim
     );
 
-    apply_rope_hidden_in_place(
+    apply_rope_q_kv_in_place(
         ctx,
         &mut projections.q,
+        &mut projections.kv,
         rope,
         projections.local_heads,
         projections.head_dim,
         start_pos,
-        false,
-    )?;
-    apply_rope_hidden_in_place(
-        ctx,
-        &mut projections.kv,
-        rope,
-        1,
-        projections.head_dim,
-        start_pos,
-        false,
     )?;
     fp8_act_quant_nope_bf16_hidden_in_place(
         ctx,
@@ -261,23 +252,14 @@ pub(crate) fn apply_rope_attention_projections_view(
         projections.head_dim
     );
 
-    apply_rope_hidden_in_place(
+    apply_rope_q_kv_in_place(
         ctx,
         projections.q,
+        projections.kv,
         rope,
         projections.local_heads,
         projections.head_dim,
         start_pos,
-        false,
-    )?;
-    apply_rope_hidden_in_place(
-        ctx,
-        projections.kv,
-        rope,
-        1,
-        projections.head_dim,
-        start_pos,
-        false,
     )?;
     fp8_act_quant_nope_bf16_hidden_in_place(
         ctx,
@@ -287,6 +269,72 @@ pub(crate) fn apply_rope_attention_projections_view(
         rope.rotary_dim,
         64,
     )?;
+    Ok(())
+}
+
+pub(crate) fn apply_rope_q_kv_in_place(
+    ctx: &RankGpuContext,
+    q: &mut Bf16HiddenStates,
+    kv: &mut Bf16HiddenStates,
+    rope: &DeepSeekRopeCache,
+    local_heads: usize,
+    head_dim: usize,
+    start_pos: usize,
+) -> Result<()> {
+    ctx.set_current()?;
+    ensure!(
+        q.hidden_dim == local_heads * head_dim,
+        "RoPE q hidden dim mismatch: expected {}, got {}",
+        local_heads * head_dim,
+        q.hidden_dim
+    );
+    ensure!(
+        kv.hidden_dim == head_dim,
+        "RoPE kv hidden dim mismatch: expected {}, got {}",
+        head_dim,
+        kv.hidden_dim
+    );
+    ensure!(
+        q.seq_len == kv.seq_len,
+        "RoPE q/kv seq_len mismatch: q={}, kv={}",
+        q.seq_len,
+        kv.seq_len
+    );
+    ensure!(
+        start_pos + q.seq_len <= rope.max_seq_len,
+        "RoPE q/kv range [{}..{}) exceeds cache len {}",
+        start_pos,
+        start_pos + q.seq_len,
+        rope.max_seq_len
+    );
+    ensure!(
+        rope.rotary_dim <= head_dim,
+        "rotary_dim {} exceeds head_dim {}",
+        rope.rotary_dim,
+        head_dim
+    );
+
+    {
+        let (q_ptr, _q_guard) = q.data.device_ptr_mut(&ctx.stream);
+        let (kv_ptr, _kv_guard) = kv.data.device_ptr_mut(&ctx.stream);
+        let (cos_ptr, _cos_guard) = rope.cos.device_ptr(&ctx.stream);
+        let (sin_ptr, _sin_guard) = rope.sin.device_ptr(&ctx.stream);
+        let result = unsafe {
+            ffi::deepseek_apply_rope_q_kv_cuda(
+                q_ptr as *mut ffi::Half,
+                kv_ptr as *mut ffi::Half,
+                cos_ptr as *const f32,
+                sin_ptr as *const f32,
+                q.seq_len as i32,
+                local_heads as i32,
+                head_dim as i32,
+                rope.rotary_dim as i32,
+                start_pos as i32,
+                ctx.stream.cu_stream(),
+            )
+        };
+        result.result()?;
+    }
     Ok(())
 }
 

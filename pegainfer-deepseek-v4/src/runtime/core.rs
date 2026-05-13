@@ -1836,96 +1836,6 @@ pub(crate) fn bf16_linear_bf16_hidden_into(
     Ok(())
 }
 
-pub fn swiglu_clamp_bf16_hidden(
-    ctx: &RankGpuContext,
-    gate: &Bf16HiddenStates,
-    up: &Bf16HiddenStates,
-    limit: f32,
-) -> Result<Bf16HiddenStates> {
-    ctx.set_current()?;
-    ensure!(
-        gate.hidden_dim == up.hidden_dim,
-        "SwiGLU hidden dim mismatch: gate={}, up={}",
-        gate.hidden_dim,
-        up.hidden_dim
-    );
-    ensure!(
-        gate.seq_len == up.seq_len,
-        "SwiGLU seq len mismatch: gate={}, up={}",
-        gate.seq_len,
-        up.seq_len
-    );
-
-    let mut out = Bf16HiddenStates::uninit(ctx, gate.hidden_dim, gate.seq_len)?;
-    swiglu_clamp_bf16_hidden_into(ctx, gate, up, limit, &mut out)?;
-    Ok(out)
-}
-
-pub(crate) fn swiglu_clamp_bf16_hidden_into(
-    ctx: &RankGpuContext,
-    gate: &Bf16HiddenStates,
-    up: &Bf16HiddenStates,
-    limit: f32,
-    out: &mut Bf16HiddenStates,
-) -> Result<()> {
-    ctx.set_current()?;
-    ensure!(
-        gate.hidden_dim == up.hidden_dim,
-        "SwiGLU hidden dim mismatch: gate={}, up={}",
-        gate.hidden_dim,
-        up.hidden_dim
-    );
-    ensure!(
-        gate.seq_len == up.seq_len,
-        "SwiGLU seq len mismatch: gate={}, up={}",
-        gate.seq_len,
-        up.seq_len
-    );
-    ensure!(
-        out.hidden_dim == gate.hidden_dim,
-        "SwiGLU output hidden dim mismatch: expected {}, got {}",
-        gate.hidden_dim,
-        out.hidden_dim
-    );
-    ensure!(
-        out.data.len() >= gate.hidden_dim * gate.seq_len,
-        "SwiGLU output seq capacity too small: need {}, have {}",
-        gate.hidden_dim * gate.seq_len,
-        out.data.len()
-    );
-    out.seq_len = gate.seq_len;
-    {
-        let (gate_ptr, _gate_guard) = gate.data.device_ptr(&ctx.stream);
-        let (up_ptr, _up_guard) = up.data.device_ptr(&ctx.stream);
-        let (out_ptr, _out_guard) = out.data.device_ptr_mut(&ctx.stream);
-        let result = unsafe {
-            ffi::deepseek_swiglu_clamp_cuda(
-                gate_ptr as *const ffi::Half,
-                up_ptr as *const ffi::Half,
-                out_ptr as *mut ffi::Half,
-                (gate.hidden_dim * gate.seq_len) as i32,
-                limit,
-                ctx.stream.cu_stream(),
-            )
-        };
-        result.result()?;
-    }
-    Ok(())
-}
-
-pub fn local_expert_forward_bf16_hidden(
-    ctx: &RankGpuContext,
-    input: &Bf16HiddenStates,
-    expert: &ExpertWeights<'_>,
-    swiglu_limit: f32,
-) -> Result<Bf16HiddenStates> {
-    ctx.set_current()?;
-    let gate = fp4_linear_bf16_hidden(ctx, input, &expert.w1)?;
-    let up = fp4_linear_bf16_hidden(ctx, input, &expert.w3)?;
-    let activated = swiglu_clamp_bf16_hidden(ctx, &gate, &up, swiglu_limit)?;
-    fp4_linear_bf16_hidden(ctx, &activated, &expert.w2)
-}
-
 pub fn shared_expert_forward_bf16_hidden(
     ctx: &RankGpuContext,
     input: &Bf16HiddenStates,
@@ -1933,10 +1843,39 @@ pub fn shared_expert_forward_bf16_hidden(
     swiglu_limit: f32,
 ) -> Result<Bf16HiddenStates> {
     ctx.set_current()?;
-    let gate = fp8_linear_bf16_hidden(ctx, input, &ffn.shared_w1)?;
-    let up = fp8_linear_bf16_hidden(ctx, input, &ffn.shared_w3)?;
-    let activated = swiglu_clamp_bf16_hidden(ctx, &gate, &up, swiglu_limit)?;
-    fp8_linear_bf16_hidden(ctx, &activated, &ffn.shared_w2)
+    let inter_dim = ffn.shared_w1.weight.tensor.shape[0];
+    let out_dim = ffn.shared_w2.weight.tensor.shape[0];
+    let mut gate = Bf16HiddenStates::uninit(ctx, inter_dim, input.seq_len)?;
+    let mut up = Bf16HiddenStates::uninit(ctx, inter_dim, input.seq_len)?;
+    let mut out = Bf16HiddenStates::uninit(ctx, out_dim, input.seq_len)?;
+    let max_fp8_input_dim = input.hidden_dim.max(inter_dim);
+    let mut fp8_act_workspace =
+        unsafe { ctx.stream.alloc::<u8>(input.seq_len * max_fp8_input_dim)? };
+    let mut fp8_act_scale_workspace = unsafe {
+        ctx.stream
+            .alloc::<u8>(input.seq_len * max_fp8_input_dim.div_ceil(128))?
+    };
+    fp8_w1_w3_bf16_hidden_into(
+        ctx,
+        input,
+        &ffn.shared_w1,
+        &ffn.shared_w3,
+        &mut gate,
+        &mut up,
+        &mut fp8_act_workspace,
+        &mut fp8_act_scale_workspace,
+    )?;
+    fp8_w2_swiglu_bf16_hidden_into(
+        ctx,
+        &gate,
+        &up,
+        swiglu_limit,
+        &ffn.shared_w2,
+        &mut out,
+        &mut fp8_act_workspace,
+        &mut fp8_act_scale_workspace,
+    )?;
+    Ok(out)
 }
 
 pub(crate) fn shared_expert_forward_bf16_hidden_scratch<'a>(

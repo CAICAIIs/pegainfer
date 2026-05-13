@@ -69,6 +69,11 @@ FP4_LINEAR_SHAPES = [
     ("expert_w2", 4096, 2048),
 ]
 
+# The grouped FP4 kernels only need the TileLang dynamic shared-memory window
+# used by their per-CTA tiles. Keeping the old 96 KiB request suppresses
+# occupancy on sparse decode MoE shapes without improving correctness.
+FP4_GROUPED_GEMM_SHARED_BYTES = 32768
+
 FP4_QUANT_INPLACE_SHAPES = [
     # name, hidden dim (N), block size
     ("n128", 128, 32),
@@ -787,7 +792,7 @@ extern "C" int deepseek_tilelang_fp4_grouped_gemm_n{out_dim}_k{in_dim}(
     int local_experts,
     cudaStream_t stream) {{
   constexpr int kThreads = 128;
-  constexpr int kSharedBytes = 98304;
+  constexpr int kSharedBytes = {FP4_GROUPED_GEMM_SHARED_BYTES};
   cudaError_t err = cudaFuncSetAttribute(
       {grouped_name},
       cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -828,7 +833,7 @@ extern "C" int deepseek_tilelang_fp4_grouped_w13_gemm_n{out_dim}_k{in_dim}(
     int local_experts,
     cudaStream_t stream) {{
   constexpr int kThreads = 128;
-  constexpr int kSharedBytes = 98304;
+  constexpr int kSharedBytes = {FP4_GROUPED_GEMM_SHARED_BYTES};
   cudaError_t err = cudaFuncSetAttribute(
       {w13_name},
       cudaFuncAttributeMaxDynamicSharedMemorySize,

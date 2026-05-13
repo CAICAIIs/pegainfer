@@ -282,36 +282,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn deepseek_moe_fp4_grouped_linear_cuda(
-        x: *const Half,
-        weights: *const *const u8,
-        scales: *const *const u8,
-        expert_indptr: *const i32,
-        out: *mut Half,
-        rows: i32,
-        in_dim: i32,
-        out_dim: i32,
-        local_experts: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn deepseek_moe_fp4_grouped_linear_with_workspace_cuda(
-        x: *const Half,
-        weights: *const *const u8,
-        scales: *const *const u8,
-        expert_indptr: *const i32,
-        out: *mut Half,
-        act: *mut u8,
-        act_bytes: usize,
-        act_scale: *mut u8,
-        act_scale_bytes: usize,
-        rows: i32,
-        in_dim: i32,
-        out_dim: i32,
-        local_experts: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
     pub fn deepseek_moe_fp4_grouped_w1_w3_with_workspace_cuda(
         x: *const Half,
         w1_weights: *const *const u8,
@@ -347,15 +317,6 @@ unsafe extern "C" {
         in_dim: i32,
         out_dim: i32,
         local_experts: i32,
-        limit: f32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn deepseek_swiglu_clamp_cuda(
-        gate: *const Half,
-        up: *const Half,
-        out: *mut Half,
-        n: i32,
         limit: f32,
         stream: CUstream,
     ) -> CUresult;
@@ -430,8 +391,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn deepseek_moe_clear_bf16_cuda(data: *mut Half, n: i32, stream: CUstream) -> CUresult;
-
     pub fn deepseek_moe_reduce_fused_f32_cuda(
         expanded: *const Half,
         route_weights: *const f32,
@@ -440,15 +399,6 @@ unsafe extern "C" {
         seq_len: i32,
         hidden_dim: i32,
         topk: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn deepseek_moe_accumulate_weighted_bf16_to_f32_cuda(
-        expert_out: *const Half,
-        route_weights: *const f32,
-        route: i32,
-        out: *mut f32,
-        hidden_dim: i32,
         stream: CUstream,
     ) -> CUresult;
 

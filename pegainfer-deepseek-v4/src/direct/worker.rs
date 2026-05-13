@@ -121,11 +121,13 @@ impl RankWorker {
         ctx: RankGpuContext,
         weights: RankWeightView<'static>,
         comm: cudarc::nccl::safe::Comm,
+        moe_comm: cudarc::nccl::safe::Comm,
         config: &'static Config,
     ) -> Result<Self> {
         let (tx, rx) = channel::unbounded();
         let (startup_tx, startup_rx) = channel::bounded(1);
         let comm = OwnedRankComm(comm);
+        let moe_comm = OwnedRankComm(moe_comm);
         let handle = thread::Builder::new()
             .name(format!("deepseek-v4-rank-{rank}"))
             .spawn(move || {
@@ -188,6 +190,7 @@ impl RankWorker {
                                         &weights,
                                         &ptr_cache,
                                         comm.get(),
+                                        moe_comm.get(),
                                         &ropes,
                                         config,
                                         token_id,
@@ -317,15 +320,26 @@ pub(super) fn load_full_direct_runtime(
         .collect::<Vec<_>>();
     let worker_comms = cudarc::nccl::safe::Comm::from_devices(decode_streams)
         .map_err(|err| anyhow::anyhow!("decode NCCL comm creation failed: {err:?}"))?;
+    let moe_streams = contexts
+        .iter()
+        .map(|ctx| {
+            ctx.ctx
+                .new_stream()
+                .with_context(|| format!("create MoE NCCL stream for rank {}", ctx.device_ordinal))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let moe_comms = cudarc::nccl::safe::Comm::from_devices(moe_streams)
+        .map_err(|err| anyhow::anyhow!("decode MoE NCCL comm creation failed: {err:?}"))?;
     let mut workers = Vec::with_capacity(8);
-    for (((rank, ctx), view), comm) in contexts
+    for ((((rank, ctx), view), comm), moe_comm) in contexts
         .iter()
         .cloned()
         .enumerate()
         .zip(views.iter().cloned())
         .zip(worker_comms.into_iter())
+        .zip(moe_comms.into_iter())
     {
-        workers.push(RankWorker::spawn(rank, ctx, view, comm, config)?);
+        workers.push(RankWorker::spawn(rank, ctx, view, comm, moe_comm, config)?);
     }
     Ok(FullDirectRuntime { workers })
 }
@@ -440,6 +454,7 @@ fn run_decode_on_rank_lane(
     weights: &RankWeightView<'_>,
     ptr_cache: &crate::MoeGroupedPtrCache,
     comm: &cudarc::nccl::safe::Comm,
+    moe_comm: &cudarc::nccl::safe::Comm,
     ropes: &[DeepSeekRopeCache],
     config: &Config,
     token_id: u32,
@@ -500,6 +515,7 @@ fn run_decode_on_rank_lane(
                 weights,
                 ptr_cache,
                 comm,
+                moe_comm,
                 config,
                 layer,
                 hc_input,
@@ -530,6 +546,7 @@ fn run_decode_on_rank_lane(
                 weights,
                 ptr_cache,
                 comm,
+                moe_comm,
                 config,
                 layer,
                 &scratch.entry.hc_expand,

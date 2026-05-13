@@ -38,12 +38,12 @@ pub use runtime::{
     hc_post_bf16_hidden, hc_pre_bf16_hidden, hc_pre_norm_bf16_hidden, head_rms_norm_bf16_hidden,
     indexed_attention_cache_bf16_hidden, indexed_attention_prefill_bf16_hidden,
     indexer_scores_decode_bf16_hidden, indexer_scores_prefill_bf16_hidden,
-    indexer_topk_indices_decode, indexer_topk_indices_prefill, local_expert_forward_bf16_hidden,
+    indexer_topk_indices_decode, indexer_topk_indices_prefill,
     local_experts_forward_packed_bf16_hidden, moe_rank_local_bf16_hidden, precompute_rope_cache,
     rank_local_logits_from_hidden, reduce_moe_fused_output_f32, rms_norm_bf16_hidden,
     score_route_bf16_hidden, shared_expert_forward_bf16_hidden,
-    sparse_attention_prefill_bf16_hidden, swiglu_clamp_bf16_hidden,
-    window_and_compress_topk_indices, window_topk_indices, window_topk_indices_decode,
+    sparse_attention_prefill_bf16_hidden, window_and_compress_topk_indices, window_topk_indices,
+    window_topk_indices_decode,
 };
 pub use weights::{
     GpuRawTensor, RankGpuContext, RankManifest, RankWeights, TensorInfo, load_rank_manifest,

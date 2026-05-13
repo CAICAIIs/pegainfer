@@ -12,21 +12,6 @@
 #include <random>
 #include <vector>
 
-extern "C" int deepseek_tilelang_act_quant_k2048(
-    const void* x,
-    void* y,
-    void* scales,
-    int m,
-    cudaStream_t stream);
-
-extern "C" cudaError_t deepseek_swiglu_clamp_cuda(
-    const __nv_bfloat16* gate,
-    const __nv_bfloat16* up,
-    __nv_bfloat16* out,
-    int n,
-    float limit,
-    cudaStream_t stream);
-
 namespace {
 
 constexpr int kInterDim = 2048;
@@ -41,16 +26,6 @@ constexpr int kScaleCols = kInterDim / kGroupSize;
     if (_err != cudaSuccess) {                                                 \
       std::fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__,       \
                    cudaGetErrorString(_err));                                  \
-      std::exit(1);                                                            \
-    }                                                                          \
-  } while (0)
-
-#define TK_CHECK(expr)                                                         \
-  do {                                                                         \
-    int _err = (expr);                                                         \
-    if (_err != 0) {                                                           \
-      std::fprintf(stderr, "TileLang launcher error %s:%d: %d\n", __FILE__,    \
-                   __LINE__, _err);                                            \
       std::exit(1);                                                            \
     }                                                                          \
   } while (0)
@@ -341,18 +316,12 @@ int main(int argc, char** argv) {
   auto* gate = device_copy(gate_host);
   auto* up = device_copy(up_host);
 
-  __nv_bfloat16* activated = nullptr;
-  unsigned char* ref_q = nullptr;
-  unsigned char* ref_scale = nullptr;
   unsigned char* fused_q = nullptr;
   unsigned char* fused_scale = nullptr;
   float* gate_acc = nullptr;
   float* up_acc = nullptr;
   unsigned char* accum_q = nullptr;
   unsigned char* accum_scale = nullptr;
-  CUDA_CHECK(cudaMalloc(&activated, elems * sizeof(__nv_bfloat16)));
-  CUDA_CHECK(cudaMalloc(&ref_q, elems));
-  CUDA_CHECK(cudaMalloc(&ref_scale, scale_elems));
   CUDA_CHECK(cudaMalloc(&fused_q, elems));
   CUDA_CHECK(cudaMalloc(&fused_scale, scale_elems));
   CUDA_CHECK(cudaMalloc(&gate_acc, elems * sizeof(float)));
@@ -369,12 +338,6 @@ int main(int argc, char** argv) {
   CUDA_CHECK(cudaMemcpy(gate_acc, gate_acc_host.data(), elems * sizeof(float), cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(up_acc, up_acc_host.data(), elems * sizeof(float), cudaMemcpyHostToDevice));
 
-  auto run_baseline = [&]() {
-    CUDA_CHECK(deepseek_swiglu_clamp_cuda(
-        gate, up, activated, static_cast<int>(elems), args.limit, stream));
-    TK_CHECK(deepseek_tilelang_act_quant_k2048(
-        activated, ref_q, ref_scale, args.rows, stream));
-  };
   auto run_fused = [&]() {
     swiglu_clamp_act_quant_k2048(gate, up, fused_q, fused_scale, args.rows, args.limit, stream);
     CUDA_CHECK(cudaGetLastError());
@@ -392,30 +355,22 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaGetLastError());
   };
 
-  run_baseline();
   run_fused();
   run_accumulator_upper_bound();
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
-  std::vector<unsigned char> ref_q_host(elems);
-  std::vector<unsigned char> ref_scale_host(scale_elems);
   std::vector<unsigned char> fused_q_host(elems);
   std::vector<unsigned char> fused_scale_host(scale_elems);
   std::vector<unsigned char> accum_q_host(elems);
   std::vector<unsigned char> accum_scale_host(scale_elems);
-  CUDA_CHECK(cudaMemcpy(ref_q_host.data(), ref_q, elems, cudaMemcpyDeviceToHost));
-  CUDA_CHECK(cudaMemcpy(ref_scale_host.data(), ref_scale, scale_elems, cudaMemcpyDeviceToHost));
   CUDA_CHECK(cudaMemcpy(fused_q_host.data(), fused_q, elems, cudaMemcpyDeviceToHost));
   CUDA_CHECK(cudaMemcpy(fused_scale_host.data(), fused_scale, scale_elems, cudaMemcpyDeviceToHost));
   CUDA_CHECK(cudaMemcpy(accum_q_host.data(), accum_q, elems, cudaMemcpyDeviceToHost));
   CUDA_CHECK(cudaMemcpy(accum_scale_host.data(), accum_scale, scale_elems, cudaMemcpyDeviceToHost));
 
-  const int q_mismatches =
-      compare_u8(ref_q_host, fused_q_host, "fp8") +
-      compare_u8(ref_q_host, accum_q_host, "accum_fp8");
+  const int q_mismatches = compare_u8(fused_q_host, accum_q_host, "accum_fp8");
   const int scale_mismatches =
-      compare_u8(ref_scale_host, fused_scale_host, "scale") +
-      compare_u8(ref_scale_host, accum_scale_host, "accum_scale");
+      compare_u8(fused_scale_host, accum_scale_host, "accum_scale");
   if (q_mismatches || scale_mismatches) {
     std::fprintf(stderr, "FUZZ FAIL q_mismatches=%d scale_mismatches=%d\n",
                  q_mismatches, scale_mismatches);
@@ -423,23 +378,19 @@ int main(int argc, char** argv) {
   }
 
   for (int i = 0; i < args.warmup; ++i) {
-    run_baseline();
     run_fused();
     run_accumulator_upper_bound();
     run_materialized_accumulator();
   }
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
-  float baseline_ms = time_ms(stream, args.iters, run_baseline);
   float fused_ms = time_ms(stream, args.iters, run_fused);
   float materialized_accumulator_ms = time_ms(stream, args.iters, run_materialized_accumulator);
   float accumulator_upper_bound_ms = time_ms(stream, args.iters, run_accumulator_upper_bound);
 
   std::printf("SwiGLU+act_quant fuzz: PASS rows=%d seed=%d limit=%.3f\n",
               args.rows, args.seed, args.limit);
-  std::printf("baseline_swiglu_plus_act_quant_ms=%.6f\n", baseline_ms);
   std::printf("fused_swiglu_act_quant_ms=%.6f\n", fused_ms);
-  std::printf("speedup=%.3fx\n", baseline_ms / fused_ms);
   std::printf("materialized_accumulator_to_gate_up_plus_quant_ms=%.6f\n",
               materialized_accumulator_ms);
   std::printf("accumulator_direct_swiglu_quant_upper_bound_ms=%.6f\n",

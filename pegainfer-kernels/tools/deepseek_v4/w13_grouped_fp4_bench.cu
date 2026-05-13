@@ -61,6 +61,27 @@ extern "C" int deepseek_tilelang_fp4_grouped_w13_gemm_n2048_k4096(
     int local_experts,
     cudaStream_t stream);
 
+extern "C" __global__ void deepseek_tilelang_fp4_grouped_w13_gemm_n2048_k4096_kernel(
+    const void* a,
+    const void* const* w1,
+    const void* const* w3,
+    void* gate_out,
+    void* up_out,
+    const void* scales_a,
+    const void* const* scales_w1,
+    const void* const* scales_w3,
+    const int* expert_indptr,
+    int m);
+
+extern "C" __global__ void deepseek_tilelang_fp4_grouped_gemm_n4096_k2048_kernel(
+    const void* a,
+    const void* const* b,
+    void* c,
+    const void* scales_a,
+    const void* const* scales_b,
+    const int* expert_indptr,
+    int m);
+
 namespace {
 
 constexpr int kInDim = 4096;
@@ -100,10 +121,35 @@ struct Args {
   int warmup = 20;
   int iters = 200;
   int seed = 42;
+  int shared_bytes = 0;
+  int capacity_launch_rows = 0;
+  int compact_launch_rows = 0;
+  std::vector<int> counts;
 };
 
 Args parse_args(int argc, char** argv) {
   Args args;
+  auto parse_counts = [](const char* text) {
+    std::vector<int> counts;
+    const char* cursor = text;
+    while (*cursor != '\0') {
+      char* end = nullptr;
+      long value = std::strtol(cursor, &end, 10);
+      if (end == cursor || value < 0 || value > 1'000'000) {
+        std::fprintf(stderr, "invalid --counts entry near '%s'\n", cursor);
+        std::exit(2);
+      }
+      counts.push_back(static_cast<int>(value));
+      cursor = end;
+      if (*cursor == ',') {
+        ++cursor;
+      } else if (*cursor != '\0') {
+        std::fprintf(stderr, "invalid --counts separator near '%s'\n", cursor);
+        std::exit(2);
+      }
+    }
+    return counts;
+  };
   for (int i = 1; i < argc; ++i) {
     auto read_int = [&](const char* name, int* out) {
       if (std::strcmp(argv[i], name) == 0 && i + 1 < argc) {
@@ -116,29 +162,62 @@ Args parse_args(int argc, char** argv) {
         read_int("--active-experts", &args.active_experts) ||
         read_int("--rows-per-active", &args.rows_per_active) ||
         read_int("--warmup", &args.warmup) || read_int("--iters", &args.iters) ||
-        read_int("--seed", &args.seed)) {
+        read_int("--seed", &args.seed) || read_int("--shared-bytes", &args.shared_bytes) ||
+        read_int("--capacity-launch-rows", &args.capacity_launch_rows) ||
+        read_int("--compact-launch-rows", &args.compact_launch_rows)) {
+      continue;
+    }
+    if (std::strcmp(argv[i], "--counts") == 0 && i + 1 < argc) {
+      args.counts = parse_counts(argv[++i]);
       continue;
     }
     std::fprintf(stderr,
                  "usage: %s [--rows N] [--experts N] [--warmup N] [--iters N] "
-                 "[--seed N] [--active-experts N] [--rows-per-active N]\n",
+                 "[--seed N] [--active-experts N] [--rows-per-active N] "
+                 "[--shared-bytes N] [--capacity-launch-rows N] "
+                 "[--compact-launch-rows N] [--counts c0,c1,...]\n",
                  argv[0]);
     std::exit(2);
+  }
+  if (!args.counts.empty()) {
+    if (args.active_experts != 0 || args.rows_per_active != 0) {
+      std::fprintf(stderr, "--counts cannot be combined with active prefix mode\n");
+      std::exit(2);
+    }
+    args.experts = static_cast<int>(args.counts.size());
+    args.rows = 0;
+    for (int count : args.counts) {
+      args.rows += count;
+      if (count > 0) {
+        ++args.active_experts;
+        args.rows_per_active = std::max(args.rows_per_active, count);
+      }
+    }
+    if (args.rows == 0 || args.active_experts == 0) {
+      std::fprintf(stderr, "--counts needs at least one nonzero expert\n");
+      std::exit(2);
+    }
   }
   if ((args.active_experts == 0) != (args.rows_per_active == 0)) {
     std::fprintf(stderr, "active mode needs both --active-experts and --rows-per-active\n");
     std::exit(2);
   }
-  if (args.active_experts > 0) {
+  if (args.active_experts > 0 && args.counts.empty()) {
     args.rows = args.active_experts * args.rows_per_active;
   }
-  if (args.rows <= 0 || args.experts <= 0 || args.warmup < 0 || args.iters <= 0) {
+  if (args.rows <= 0 || args.experts <= 0 || args.warmup < 0 || args.iters <= 0 ||
+      args.shared_bytes < 0 || args.capacity_launch_rows < 0 ||
+      args.compact_launch_rows < 0) {
     std::fprintf(stderr, "invalid arguments\n");
     std::exit(2);
   }
   if (args.active_experts < 0 || args.rows_per_active < 0 ||
       args.active_experts > args.experts) {
     std::fprintf(stderr, "invalid active expert arguments\n");
+    std::exit(2);
+  }
+  if (args.compact_launch_rows > 0 && args.active_experts == 0) {
+    std::fprintf(stderr, "--compact-launch-rows requires active mode\n");
     std::exit(2);
   }
   return args;
@@ -171,6 +250,14 @@ std::vector<int> make_active_prefix_indptr(int active_experts, int rows_per_acti
   return indptr;
 }
 
+std::vector<int> make_indptr_from_counts(const std::vector<int>& counts) {
+  std::vector<int> indptr(counts.size() + 1, 0);
+  for (size_t e = 0; e < counts.size(); ++e) {
+    indptr[e + 1] = indptr[e] + counts[e];
+  }
+  return indptr;
+}
+
 std::vector<int> make_active_prefix_full_indptr(
     int experts,
     int active_experts,
@@ -180,6 +267,25 @@ std::vector<int> make_active_prefix_full_indptr(
     indptr[e] = e * rows_per_active;
   }
   return indptr;
+}
+
+std::vector<int> make_active_indices(const std::vector<int>& counts) {
+  std::vector<int> indices;
+  for (int e = 0; e < static_cast<int>(counts.size()); ++e) {
+    if (counts[e] > 0) {
+      indices.push_back(e);
+    }
+  }
+  return indices;
+}
+
+std::vector<int> compact_counts(const std::vector<int>& counts, const std::vector<int>& indices) {
+  std::vector<int> compact;
+  compact.reserve(indices.size());
+  for (int expert : indices) {
+    compact.push_back(counts[expert]);
+  }
+  return compact;
 }
 
 template <typename T>
@@ -205,6 +311,22 @@ void fill_ptrs(
   *out_device_ptrs = device;
 }
 
+void fill_selected_ptrs(
+    unsigned char* base,
+    size_t stride,
+    const std::vector<int>& experts,
+    void*** out_device_ptrs) {
+  std::vector<const void*> host;
+  host.reserve(experts.size());
+  for (int expert : experts) {
+    host.push_back(base + static_cast<size_t>(expert) * stride);
+  }
+  void** device = nullptr;
+  CUDA_CHECK(cudaMalloc(&device, host.size() * sizeof(void*)));
+  CUDA_CHECK(cudaMemcpy(device, host.data(), host.size() * sizeof(void*), cudaMemcpyHostToDevice));
+  *out_device_ptrs = device;
+}
+
 float time_ms(cudaStream_t stream, int iters, const std::function<void()>& fn) {
   cudaEvent_t start;
   cudaEvent_t stop;
@@ -221,6 +343,76 @@ float time_ms(cudaStream_t stream, int iters, const std::function<void()>& fn) {
   CUDA_CHECK(cudaEventDestroy(start));
   CUDA_CHECK(cudaEventDestroy(stop));
   return ms / iters;
+}
+
+int launch_w13_raw(
+    const void* a,
+    const void* const* w1,
+    const void* const* w3,
+    void* gate_out,
+    void* up_out,
+    const void* scales_a,
+    const void* const* scales_w1,
+    const void* const* scales_w3,
+    const int* expert_indptr,
+    int m,
+    int local_experts,
+    int shared_bytes,
+    cudaStream_t stream) {
+  constexpr int kThreads = 128;
+  cudaError_t err = cudaFuncSetAttribute(
+      deepseek_tilelang_fp4_grouped_w13_gemm_n2048_k4096_kernel,
+      cudaFuncAttributeMaxDynamicSharedMemorySize,
+      shared_bytes);
+  if (err != cudaSuccess && err != cudaErrorInvalidValue && err != cudaErrorNotSupported) {
+    return static_cast<int>(err);
+  }
+  dim3 grid(32, (m + 31) / 32, local_experts);
+  deepseek_tilelang_fp4_grouped_w13_gemm_n2048_k4096_kernel<<<
+      grid, kThreads, shared_bytes, stream>>>(
+      a,
+      w1,
+      w3,
+      gate_out,
+      up_out,
+      scales_a,
+      scales_w1,
+      scales_w3,
+      expert_indptr,
+      m);
+  return static_cast<int>(cudaGetLastError());
+}
+
+int launch_w2_raw(
+    const void* a,
+    const void* const* b,
+    void* c,
+    const void* scales_a,
+    const void* const* scales_b,
+    const int* expert_indptr,
+    int m,
+    int local_experts,
+    int shared_bytes,
+    cudaStream_t stream) {
+  constexpr int kThreads = 128;
+  cudaError_t err = cudaFuncSetAttribute(
+      deepseek_tilelang_fp4_grouped_gemm_n4096_k2048_kernel,
+      cudaFuncAttributeMaxDynamicSharedMemorySize,
+      shared_bytes);
+  if (err != cudaSuccess && err != cudaErrorInvalidValue) {
+    return static_cast<int>(err);
+  }
+  dim3 grid(32, (m + 31) / 32, local_experts);
+  deepseek_tilelang_fp4_grouped_gemm_n4096_k2048_kernel<<<
+      grid, kThreads, shared_bytes, stream>>>(
+      a,
+      b,
+      c,
+      scales_a,
+      scales_b,
+      expert_indptr,
+      m);
+  return static_cast<int>(cudaGetLastError());
 }
 
 int compare_u16(
@@ -315,10 +507,16 @@ int main(int argc, char** argv) {
   fill_ptrs(w2, w2_weight_bytes_per_expert, args.experts, &w2_ptrs);
   fill_ptrs(s2, w2_weight_scale_bytes_per_expert, args.experts, &s2_ptrs);
 
+  const bool counts_mode = !args.counts.empty();
   const bool active_mode = args.active_experts > 0;
-  std::vector<int> indptr_host = active_mode
-      ? make_active_prefix_full_indptr(args.experts, args.active_experts, args.rows_per_active)
-      : make_indptr(args.rows, args.experts);
+  const std::vector<int> active_indices =
+      counts_mode ? make_active_indices(args.counts) : std::vector<int>{};
+  std::vector<int> indptr_host = counts_mode
+      ? make_indptr_from_counts(args.counts)
+      : (active_mode
+             ? make_active_prefix_full_indptr(args.experts, args.active_experts,
+                                              args.rows_per_active)
+             : make_indptr(args.rows, args.experts));
   auto* indptr = device_copy(indptr_host);
   void** w1_compact_ptrs = nullptr;
   void** w3_compact_ptrs = nullptr;
@@ -329,13 +527,23 @@ int main(int argc, char** argv) {
   int* compact_indptr = nullptr;
   std::vector<int> compact_indptr_host;
   if (active_mode) {
-    fill_ptrs(w1, weight_bytes_per_expert, args.active_experts, &w1_compact_ptrs);
-    fill_ptrs(w3, weight_bytes_per_expert, args.active_experts, &w3_compact_ptrs);
-    fill_ptrs(s1, weight_scale_bytes_per_expert, args.active_experts, &s1_compact_ptrs);
-    fill_ptrs(s3, weight_scale_bytes_per_expert, args.active_experts, &s3_compact_ptrs);
-    fill_ptrs(w2, w2_weight_bytes_per_expert, args.active_experts, &w2_compact_ptrs);
-    fill_ptrs(s2, w2_weight_scale_bytes_per_expert, args.active_experts, &s2_compact_ptrs);
-    compact_indptr_host = make_active_prefix_indptr(args.active_experts, args.rows_per_active);
+    if (counts_mode) {
+      fill_selected_ptrs(w1, weight_bytes_per_expert, active_indices, &w1_compact_ptrs);
+      fill_selected_ptrs(w3, weight_bytes_per_expert, active_indices, &w3_compact_ptrs);
+      fill_selected_ptrs(s1, weight_scale_bytes_per_expert, active_indices, &s1_compact_ptrs);
+      fill_selected_ptrs(s3, weight_scale_bytes_per_expert, active_indices, &s3_compact_ptrs);
+      fill_selected_ptrs(w2, w2_weight_bytes_per_expert, active_indices, &w2_compact_ptrs);
+      fill_selected_ptrs(s2, w2_weight_scale_bytes_per_expert, active_indices, &s2_compact_ptrs);
+      compact_indptr_host = make_indptr_from_counts(compact_counts(args.counts, active_indices));
+    } else {
+      fill_ptrs(w1, weight_bytes_per_expert, args.active_experts, &w1_compact_ptrs);
+      fill_ptrs(w3, weight_bytes_per_expert, args.active_experts, &w3_compact_ptrs);
+      fill_ptrs(s1, weight_scale_bytes_per_expert, args.active_experts, &s1_compact_ptrs);
+      fill_ptrs(s3, weight_scale_bytes_per_expert, args.active_experts, &s3_compact_ptrs);
+      fill_ptrs(w2, w2_weight_bytes_per_expert, args.active_experts, &w2_compact_ptrs);
+      fill_ptrs(s2, w2_weight_scale_bytes_per_expert, args.active_experts, &s2_compact_ptrs);
+      compact_indptr_host = make_active_prefix_indptr(args.active_experts, args.rows_per_active);
+    }
     compact_indptr = device_copy(compact_indptr_host);
   }
 
@@ -370,20 +578,43 @@ int main(int argc, char** argv) {
         act, reinterpret_cast<const void* const*>(w3_ptrs), up_ref, act_scale,
         reinterpret_cast<const void* const*>(s3_ptrs), indptr, args.rows, args.experts, stream));
   };
+  const int compact_launch_rows =
+      args.compact_launch_rows > 0 ? args.compact_launch_rows : args.rows;
   auto run_w13 = [&]() {
-    TK_CHECK(deepseek_tilelang_fp4_grouped_w13_gemm_n2048_k4096(
-        act, reinterpret_cast<const void* const*>(w1_ptrs),
-        reinterpret_cast<const void* const*>(w3_ptrs), gate_w13, up_w13, act_scale,
-        reinterpret_cast<const void* const*>(s1_ptrs),
-        reinterpret_cast<const void* const*>(s3_ptrs), indptr, args.rows, args.experts, stream));
+    if (args.shared_bytes > 0 || args.capacity_launch_rows > 0) {
+      const int launch_rows =
+          args.capacity_launch_rows > 0 ? args.capacity_launch_rows : args.rows;
+      const int shared_bytes = args.shared_bytes > 0 ? args.shared_bytes : 32768;
+      TK_CHECK(launch_w13_raw(
+          act, reinterpret_cast<const void* const*>(w1_ptrs),
+          reinterpret_cast<const void* const*>(w3_ptrs), gate_w13, up_w13, act_scale,
+          reinterpret_cast<const void* const*>(s1_ptrs),
+          reinterpret_cast<const void* const*>(s3_ptrs), indptr, launch_rows, args.experts,
+          shared_bytes, stream));
+    } else {
+      TK_CHECK(deepseek_tilelang_fp4_grouped_w13_gemm_n2048_k4096(
+          act, reinterpret_cast<const void* const*>(w1_ptrs),
+          reinterpret_cast<const void* const*>(w3_ptrs), gate_w13, up_w13, act_scale,
+          reinterpret_cast<const void* const*>(s1_ptrs),
+          reinterpret_cast<const void* const*>(s3_ptrs), indptr, args.rows, args.experts, stream));
+    }
   };
   auto run_w13_compact = [&]() {
-    TK_CHECK(deepseek_tilelang_fp4_grouped_w13_gemm_n2048_k4096(
-        act, reinterpret_cast<const void* const*>(w1_compact_ptrs),
-        reinterpret_cast<const void* const*>(w3_compact_ptrs), gate_compact, up_compact, act_scale,
-        reinterpret_cast<const void* const*>(s1_compact_ptrs),
-        reinterpret_cast<const void* const*>(s3_compact_ptrs), compact_indptr, args.rows,
-        args.active_experts, stream));
+    if (args.shared_bytes > 0) {
+      TK_CHECK(launch_w13_raw(
+          act, reinterpret_cast<const void* const*>(w1_compact_ptrs),
+          reinterpret_cast<const void* const*>(w3_compact_ptrs), gate_compact, up_compact,
+          act_scale, reinterpret_cast<const void* const*>(s1_compact_ptrs),
+          reinterpret_cast<const void* const*>(s3_compact_ptrs), compact_indptr, compact_launch_rows,
+          args.active_experts, args.shared_bytes, stream));
+    } else {
+      TK_CHECK(deepseek_tilelang_fp4_grouped_w13_gemm_n2048_k4096(
+          act, reinterpret_cast<const void* const*>(w1_compact_ptrs),
+          reinterpret_cast<const void* const*>(w3_compact_ptrs), gate_compact, up_compact,
+          act_scale, reinterpret_cast<const void* const*>(s1_compact_ptrs),
+          reinterpret_cast<const void* const*>(s3_compact_ptrs), compact_indptr, compact_launch_rows,
+          args.active_experts, stream));
+    }
   };
 
   __nv_bfloat16* w2_x = nullptr;
@@ -406,15 +637,32 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemsetAsync(w2_compact, 0x88, w2_out_elems * sizeof(__nv_bfloat16), stream));
   }
   auto run_w2_capacity = [&]() {
-    TK_CHECK(deepseek_tilelang_fp4_grouped_gemm_n4096_k2048(
-        w2_act, reinterpret_cast<const void* const*>(w2_ptrs), w2_capacity, w2_act_scale,
-        reinterpret_cast<const void* const*>(s2_ptrs), indptr, args.rows, args.experts, stream));
+    if (args.shared_bytes > 0 || args.capacity_launch_rows > 0) {
+      const int launch_rows =
+          args.capacity_launch_rows > 0 ? args.capacity_launch_rows : args.rows;
+      const int shared_bytes = args.shared_bytes > 0 ? args.shared_bytes : 32768;
+      TK_CHECK(launch_w2_raw(
+          w2_act, reinterpret_cast<const void* const*>(w2_ptrs), w2_capacity, w2_act_scale,
+          reinterpret_cast<const void* const*>(s2_ptrs), indptr, launch_rows, args.experts,
+          shared_bytes, stream));
+    } else {
+      TK_CHECK(deepseek_tilelang_fp4_grouped_gemm_n4096_k2048(
+          w2_act, reinterpret_cast<const void* const*>(w2_ptrs), w2_capacity, w2_act_scale,
+          reinterpret_cast<const void* const*>(s2_ptrs), indptr, args.rows, args.experts, stream));
+    }
   };
   auto run_w2_compact = [&]() {
-    TK_CHECK(deepseek_tilelang_fp4_grouped_gemm_n4096_k2048(
-        w2_act, reinterpret_cast<const void* const*>(w2_compact_ptrs), w2_compact, w2_act_scale,
-        reinterpret_cast<const void* const*>(s2_compact_ptrs), compact_indptr, args.rows,
-        args.active_experts, stream));
+    if (args.shared_bytes > 0) {
+      TK_CHECK(launch_w2_raw(
+          w2_act, reinterpret_cast<const void* const*>(w2_compact_ptrs), w2_compact,
+          w2_act_scale, reinterpret_cast<const void* const*>(s2_compact_ptrs), compact_indptr,
+          compact_launch_rows, args.active_experts, args.shared_bytes, stream));
+    } else {
+      TK_CHECK(deepseek_tilelang_fp4_grouped_gemm_n4096_k2048(
+          w2_act, reinterpret_cast<const void* const*>(w2_compact_ptrs), w2_compact, w2_act_scale,
+          reinterpret_cast<const void* const*>(s2_compact_ptrs), compact_indptr, compact_launch_rows,
+          args.active_experts, stream));
+    }
   };
 
   run_baseline();
@@ -479,15 +727,30 @@ int main(int argc, char** argv) {
 
   std::printf("W13 grouped FP4 fuzz: PASS rows=%d experts=%d seed=%d\n",
               args.rows, args.experts, args.seed);
+  if (args.shared_bytes > 0) {
+    std::printf("raw_launch_shared_bytes=%d\n", args.shared_bytes);
+  }
+  if (args.capacity_launch_rows > 0) {
+    std::printf("capacity_launch_rows=%d\n", args.capacity_launch_rows);
+  }
   std::printf("expert_indptr:");
   for (int value : indptr_host) std::printf(" %d", value);
   std::printf("\n");
+  if (counts_mode) {
+    std::printf("counts:");
+    for (int value : args.counts) std::printf(" %d", value);
+    std::printf("\n");
+    std::printf("active_indices:");
+    for (int value : active_indices) std::printf(" %d", value);
+    std::printf("\n");
+  }
   std::printf("baseline_two_gemm_ms=%.6f\n", baseline_ms);
   std::printf("w13_one_gemm_ms=%.6f\n", w13_ms);
   std::printf("speedup=%.3fx\n", baseline_ms / w13_ms);
   if (active_mode) {
     std::printf("compact_active_experts=%d\n", args.active_experts);
     std::printf("compact_rows_per_active=%d\n", args.rows_per_active);
+    std::printf("compact_launch_rows=%d\n", compact_launch_rows);
     std::printf("compact_expert_indptr:");
     for (int value : compact_indptr_host) std::printf(" %d", value);
     std::printf("\n");

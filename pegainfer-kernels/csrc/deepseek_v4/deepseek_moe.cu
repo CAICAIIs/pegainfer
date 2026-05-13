@@ -7,10 +7,6 @@ namespace {
 constexpr int kMaxMoeScratchDevices = 16;
 
 struct DeepseekMoeScratch {
-  float* x_f32 = nullptr;
-  size_t x_elems = 0;
-  float* gate_f32 = nullptr;
-  size_t gate_elems = 0;
   float* raw_scores = nullptr;
   size_t raw_score_elems = 0;
   cublasHandle_t handle = nullptr;
@@ -71,46 +67,6 @@ cudaError_t deepseek_ensure_moe_cublas_handle(DeepseekMoeScratch& scratch) {
 }
 
 }  // namespace
-
-__global__ void deepseek_swiglu_clamp_kernel(
-    const __nv_bfloat16 *__restrict__ gate,
-    const __nv_bfloat16 *__restrict__ up,
-    __nv_bfloat16 *__restrict__ out,
-    int n,
-    float limit) {
-  for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
-       idx < n;
-       idx += gridDim.x * blockDim.x) {
-    float gate_value = __bfloat162float(gate[idx]);
-    float up_value = __bfloat162float(up[idx]);
-
-    if (limit > 0.0f) {
-      gate_value = fminf(gate_value, limit);
-      up_value = fminf(fmaxf(up_value, -limit), limit);
-    }
-
-    float silu_gate = gate_value / (1.0f + expf(-gate_value));
-    out[idx] = __float2bfloat16(silu_gate * up_value);
-  }
-}
-
-extern "C" {
-
-cudaError_t deepseek_swiglu_clamp_cuda(
-    const __nv_bfloat16 *gate,
-    const __nv_bfloat16 *up,
-    __nv_bfloat16 *out,
-    int n,
-    float limit,
-    cudaStream_t stream) {
-  constexpr int threads = 256;
-  int blocks = (n + threads - 1) / threads;
-  deepseek_swiglu_clamp_kernel<<<blocks, threads, 0, stream>>>(
-      gate, up, out, n, limit);
-  return cudaGetLastError();
-}
-
-}  // extern "C"
 
 __global__ void deepseek_hash_gate_kernel(
     const __nv_bfloat16 *__restrict__ x,
@@ -238,6 +194,8 @@ __global__ void deepseek_score_gate_select_kernel(
   extern __shared__ float scratch[];
   float *original_scores = scratch;
   float *select_scores = scratch + n_experts;
+  float *reduce_scores = select_scores + n_experts;
+  int *reduce_indices = reinterpret_cast<int *>(reduce_scores + blockDim.x);
 
   if (expert < n_experts) {
     float dot = raw_scores[token * n_experts + expert];
@@ -252,32 +210,53 @@ __global__ void deepseek_score_gate_select_kernel(
   }
   __syncthreads();
 
-  if (expert == 0) {
-    float selected_sum = 0.0f;
-    for (int route = 0; route < topk; ++route) {
-      int best_idx = 0;
-      float best_score = -3.4028234663852886e38f;
-      for (int candidate = 0; candidate < n_experts; ++candidate) {
-        float score = select_scores[candidate];
-        if (score > best_score) {
-          best_score = score;
-          best_idx = candidate;
+  float selected_sum = 0.0f;
+  float w0 = 0.0f;
+  float w1 = 0.0f;
+  float w2 = 0.0f;
+  float w3 = 0.0f;
+  float w4 = 0.0f;
+  float w5 = 0.0f;
+  for (int route = 0; route < topk; ++route) {
+    reduce_scores[expert] = expert < n_experts ? select_scores[expert] : -3.4028234663852886e38f;
+    reduce_indices[expert] = expert < n_experts ? expert : 2147483647;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      if (expert < stride) {
+        float other_score = reduce_scores[expert + stride];
+        int other_idx = reduce_indices[expert + stride];
+        float self_score = reduce_scores[expert];
+        int self_idx = reduce_indices[expert];
+        if (other_score > self_score || (other_score == self_score && other_idx < self_idx)) {
+          reduce_scores[expert] = other_score;
+          reduce_indices[expert] = other_idx;
         }
       }
-      route_indices[token * topk + route] = best_idx;
-      float route_weight = original_scores[best_idx];
-      route_weights[token * topk + route] = route_weight;
-      selected_sum = __fadd_rn(selected_sum, route_weight);
-      select_scores[best_idx] = -3.4028234663852886e38f;
+      __syncthreads();
     }
 
+    if (expert == 0) {
+      int best_idx = reduce_indices[0];
+      route_indices[token * topk + route] = best_idx;
+      float route_weight = best_idx < n_experts ? original_scores[best_idx] : 0.0f;
+      route_weights[token * topk + route] = route_weight;
+      selected_sum = __fadd_rn(selected_sum, route_weight);
+      if (topk == 6) {
+        if (route == 0) w0 = route_weight;
+        if (route == 1) w1 = route_weight;
+        if (route == 2) w2 = route_weight;
+        if (route == 3) w3 = route_weight;
+        if (route == 4) w4 = route_weight;
+        if (route == 5) w5 = route_weight;
+      }
+      if (best_idx < n_experts) select_scores[best_idx] = -3.4028234663852886e38f;
+    }
+    __syncthreads();
+  }
+
+  if (expert == 0) {
     if (topk == 6) {
-      float w0 = route_weights[token * topk + 0];
-      float w1 = route_weights[token * topk + 1];
-      float w2 = route_weights[token * topk + 2];
-      float w3 = route_weights[token * topk + 3];
-      float w4 = route_weights[token * topk + 4];
-      float w5 = route_weights[token * topk + 5];
       float left = __fadd_rn(__fadd_rn(w0, w4), w2);
       float right = __fadd_rn(__fadd_rn(w1, w5), w3);
       selected_sum = __fadd_rn(left, right);
@@ -312,26 +291,7 @@ cudaError_t deepseek_score_gate_cuda(
   DeepseekMoeScratch& scratch = *scratch_ptr;
   std::lock_guard<std::mutex> lock(scratch.mutex);
   cuda_status = deepseek_ensure_f32_scratch(
-      &scratch.x_f32, &scratch.x_elems, (size_t)seq_len * hidden_dim);
-  if (cuda_status != cudaSuccess) return cuda_status;
-  cuda_status = deepseek_ensure_f32_scratch(
-      &scratch.gate_f32, &scratch.gate_elems, (size_t)n_experts * hidden_dim);
-  if (cuda_status != cudaSuccess) return cuda_status;
-  cuda_status = deepseek_ensure_f32_scratch(
       &scratch.raw_scores, &scratch.raw_score_elems, (size_t)seq_len * n_experts);
-  if (cuda_status != cudaSuccess) return cuda_status;
-
-  int x_total = seq_len * hidden_dim;
-  int x_blocks = (x_total + threads - 1) / threads;
-  deepseek_score_gate_bf16_to_f32_kernel<<<x_blocks, threads, 0, stream>>>(
-      x, scratch.x_f32, x_total);
-  cuda_status = cudaGetLastError();
-  if (cuda_status != cudaSuccess) return cuda_status;
-  int gate_total = n_experts * hidden_dim;
-  int gate_blocks = (gate_total + threads - 1) / threads;
-  deepseek_score_gate_bf16_to_f32_kernel<<<gate_blocks, threads, 0, stream>>>(
-      gate_weight, scratch.gate_f32, gate_total);
-  cuda_status = cudaGetLastError();
   if (cuda_status != cudaSuccess) return cuda_status;
 
   cuda_status = deepseek_ensure_moe_cublas_handle(scratch);
@@ -341,45 +301,29 @@ cudaError_t deepseek_score_gate_cuda(
 
   const float alpha = 1.0f;
   const float beta = 0.0f;
-  if (seq_len == 1) {
-    status = cublasSgemv(
-        scratch.handle,
-        CUBLAS_OP_T,
-        hidden_dim,
-        n_experts,
-        &alpha,
-        scratch.gate_f32,
-        hidden_dim,
-        scratch.x_f32,
-        1,
-        &beta,
-        scratch.raw_scores,
-        1);
-  } else {
-    status = cublasGemmEx(
-        scratch.handle,
-        CUBLAS_OP_T,
-        CUBLAS_OP_N,
-        n_experts,
-        seq_len,
-        hidden_dim,
-        &alpha,
-        scratch.gate_f32,
-        CUDA_R_32F,
-        hidden_dim,
-        scratch.x_f32,
-        CUDA_R_32F,
-        hidden_dim,
-        &beta,
-        scratch.raw_scores,
-        CUDA_R_32F,
-        n_experts,
-        CUBLAS_COMPUTE_32F_PEDANTIC,
-        CUBLAS_GEMM_DEFAULT);
-  }
+  status = cublasGemmEx(
+      scratch.handle,
+      CUBLAS_OP_T,
+      CUBLAS_OP_N,
+      n_experts,
+      seq_len,
+      hidden_dim,
+      &alpha,
+      gate_weight,
+      CUDA_R_16BF,
+      hidden_dim,
+      x,
+      CUDA_R_16BF,
+      hidden_dim,
+      &beta,
+      scratch.raw_scores,
+      CUDA_R_32F,
+      n_experts,
+      CUBLAS_COMPUTE_32F_PEDANTIC,
+      CUBLAS_GEMM_DEFAULT);
   if (status != CUBLAS_STATUS_SUCCESS) return cudaErrorUnknown;
 
-  size_t shared_bytes = 2 * n_experts * sizeof(float);
+  size_t shared_bytes = (2 * n_experts + threads) * sizeof(float) + threads * sizeof(int);
   deepseek_score_gate_select_kernel<<<seq_len, threads, shared_bytes, stream>>>(
       scratch.raw_scores, gate_bias, nullptr, nullptr, route_weights, route_indices,
       seq_len, n_experts, topk, route_scale);
@@ -499,7 +443,7 @@ cudaError_t deepseek_score_gate_debug_cuda(
     return cudaErrorUnknown;
   }
 
-  size_t shared_bytes = 2 * n_experts * sizeof(float);
+  size_t shared_bytes = (2 * n_experts + threads) * sizeof(float) + threads * sizeof(int);
   deepseek_score_gate_select_kernel<<<seq_len, threads, shared_bytes, stream>>>(
       raw_scores, gate_bias, original_scores, select_scores, route_weights, route_indices,
       seq_len, n_experts, topk, route_scale);
@@ -545,13 +489,6 @@ __global__ void deepseek_moe_clear_mapping_kernel(
   }
   if (idx == 0) {
     local_count[0] = 0;
-  }
-}
-
-__global__ void deepseek_moe_clear_bf16_kernel(__nv_bfloat16* data, int n) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx < n) {
-    data[idx] = __float2bfloat16(0.0f);
   }
 }
 
@@ -728,18 +665,6 @@ __global__ void deepseek_moe_reduce_fused_f32_kernel(
   out[idx] = acc;
 }
 
-__global__ void deepseek_moe_accumulate_weighted_bf16_to_f32_kernel(
-    const __nv_bfloat16 *__restrict__ expert_out,
-    const float *__restrict__ route_weights,
-    int route,
-    float *__restrict__ out,
-    int hidden_dim) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx >= hidden_dim) return;
-  float weight = route_weights[route];
-  out[idx] = __fadd_rn(out[idx], __bfloat162float(expert_out[idx]) * weight);
-}
-
 extern "C" {
 
 cudaError_t deepseek_moe_local_mapping_cuda(
@@ -806,16 +731,6 @@ cudaError_t deepseek_moe_expand_to_fused_cuda(
   return cudaGetLastError();
 }
 
-cudaError_t deepseek_moe_clear_bf16_cuda(
-    __nv_bfloat16 *data,
-    int n,
-    cudaStream_t stream) {
-  constexpr int threads = 256;
-  int blocks = (n + threads - 1) / threads;
-  deepseek_moe_clear_bf16_kernel<<<blocks, threads, 0, stream>>>(data, n);
-  return cudaGetLastError();
-}
-
 cudaError_t deepseek_moe_reduce_fused_f32_cuda(
     const __nv_bfloat16 *expanded,
     const float *route_weights,
@@ -830,20 +745,6 @@ cudaError_t deepseek_moe_reduce_fused_f32_cuda(
   int blocks = (total + threads - 1) / threads;
   deepseek_moe_reduce_fused_f32_kernel<<<blocks, threads, 0, stream>>>(
       expanded, route_weights, token_topk_to_pos, out, seq_len, hidden_dim, topk);
-  return cudaGetLastError();
-}
-
-cudaError_t deepseek_moe_accumulate_weighted_bf16_to_f32_cuda(
-    const __nv_bfloat16 *expert_out,
-    const float *route_weights,
-    int route,
-    float *out,
-    int hidden_dim,
-    cudaStream_t stream) {
-  constexpr int threads = 256;
-  int blocks = (hidden_dim + threads - 1) / threads;
-  deepseek_moe_accumulate_weighted_bf16_to_f32_kernel<<<blocks, threads, 0, stream>>>(
-      expert_out, route_weights, route, out, hidden_dim);
   return cudaGetLastError();
 }
 
