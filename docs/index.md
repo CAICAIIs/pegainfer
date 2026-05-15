@@ -3,6 +3,7 @@
 | Path | TL;DR |
 | --- | --- |
 | `projects/batch-optimization.md` | Realistic benchmark: within 2% of vLLM throughput, TTFT −16%, TPOT −1.6%. Decode TPOT beats vLLM at all concurrencies. Dynamic KV cache (85% free VRAM). Remaining: ITL p99 tail (chunked prefill). |
+| `projects/qwen3-kv-pressure-hang.md` | Complete: issue #85 Qwen3-4B KV pressure hang fixed by full-lifetime scheduler KV admission, waiting-queue deferral, cleanup on disconnect/error, impossible-request errors, refreshed Qwen3 golden, exact e2e, and real `vllm bench serve` QPS=2 `500/500` pass with post-pressure completion healthy. |
 | `projects/bs1-4k64-vllm-pegainfer.md` | RTX 5090 single-concurrency probe: `input_len=4096`, `output_len=64`, no vLLM prefix cache. PegaInfer TTFT median `177ms` vs vLLM `198ms`; TPOT median `6.47ms` vs `6.36ms`; corrected output throughput `+6%` for PegaInfer. |
 | `projects/continuous-batching.md` | Phase 1-2 done. Scheduler thread with prefill-priority, batch decode, channel-based streaming. Next: multi-request throughput testing |
 | `projects/vllm-frontend-rs-integration.md` | vLLM frontend replacement complete: pegainfer serves through vllm-server with a local engine-core bridge; old HTTP/tokenizer modules are removed; Qwen3 release build/e2e and vLLM models/completions/chat validation pass on 5090 |

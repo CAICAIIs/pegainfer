@@ -343,7 +343,7 @@ async fn run_request_stream(
                 let _ = send_terminal_output(
                     &output_tx,
                     request_id,
-                    EngineCoreFinishReason::Stop,
+                    EngineCoreFinishReason::Error,
                     Some(StopReason::Text(message)),
                 );
                 return;
@@ -605,6 +605,41 @@ pub fn shutdown_token_from_ctrl_c() -> CancellationToken {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn rejected_request_is_reported_as_error() {
+        let (token_tx, token_rx) = mpsc::unbounded_channel();
+        let (output_tx, mut output_rx) = mpsc::unbounded_channel();
+
+        token_tx
+            .send(TokenEvent::Rejected {
+                message: "request is too large for KV cache".to_string(),
+                prompt_tokens: 16,
+                completion_tokens: 0,
+            })
+            .expect("send rejected event");
+        drop(token_tx);
+
+        run_request_stream("req-1".to_string(), token_rx, output_tx).await;
+
+        let outputs = output_rx.recv().await.expect("terminal output");
+        assert!(
+            outputs
+                .finished_requests
+                .as_ref()
+                .is_some_and(|requests| requests.contains("req-1"))
+        );
+        assert_eq!(outputs.outputs.len(), 1);
+        let output = &outputs.outputs[0];
+        assert_eq!(output.request_id, "req-1");
+        assert_eq!(output.finish_reason, Some(EngineCoreFinishReason::Error));
+        assert_eq!(
+            output.stop_reason,
+            Some(StopReason::Text(
+                "request is too large for KV cache".to_string()
+            ))
+        );
+    }
 
     #[test]
     fn to_wire_logprobs_returns_none_when_input_is_none() {
