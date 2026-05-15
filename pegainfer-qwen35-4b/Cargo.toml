@@ -20,6 +20,7 @@ tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
 criterion = { workspace = true }
+pegainfer-vllm-support = { workspace = true }
 vllm-text = { workspace = true }
 
 [lints]

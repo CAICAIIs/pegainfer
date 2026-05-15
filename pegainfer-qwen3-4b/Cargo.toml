@@ -27,6 +27,7 @@ toml = { workspace = true, optional = true }
 kernel-report = ["dep:clap", "dep:hex", "dep:pegainfer-cupti", "dep:sha2", "dep:toml"]
 
 [dev-dependencies]
+pegainfer-vllm-support = { workspace = true }
 vllm-text = { workspace = true }
 
 [[bin]]

@@ -13,7 +13,6 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::{IsTerminal, stdout};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
@@ -27,11 +26,12 @@ use pegainfer::sampler::SamplingParams;
 use pegainfer::scheduler::{SchedulerHandle, SchedulerRequest, TokenEvent};
 use pegainfer::server_engine::{ModelType, detect_model_type};
 use pegainfer_core::engine::EngineLoadOptions;
+use pegainfer_vllm_support::load_tokenizer as load_vllm_tokenizer;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use vllm_text::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
+use vllm_text::tokenizer::DynTokenizer;
 
 const SNAPSHOT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../bench_snapshots");
 const SNAPSHOT_PREFILL_OUTPUT_LEN: usize = 1;
@@ -760,11 +760,6 @@ fn truncate_preview(text: &str, limit: usize) -> String {
 
 fn synthetic_prompt_tokens(len: usize) -> Vec<u32> {
     (0..len).map(|i| ((i % 1000) + 100) as u32).collect()
-}
-
-fn load_vllm_tokenizer(model_path: &str) -> Result<DynTokenizer> {
-    let tokenizer_path = Path::new(model_path).join("tokenizer.json");
-    Ok(Arc::new(HuggingFaceTokenizer::new(&tokenizer_path)?))
 }
 
 #[derive(Debug, Clone)]

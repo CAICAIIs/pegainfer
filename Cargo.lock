@@ -3607,6 +3607,7 @@ dependencies = [
  "pegainfer-core",
  "pegainfer-cupti",
  "pegainfer-kernels",
+ "pegainfer-vllm-support",
  "rand 0.10.1",
  "serde",
  "serde_json",
@@ -3628,6 +3629,7 @@ dependencies = [
  "log",
  "pegainfer-core",
  "pegainfer-kernels",
+ "pegainfer-vllm-support",
  "rand 0.10.1",
  "safetensors",
  "serde",
@@ -3654,6 +3656,7 @@ dependencies = [
  "pegainfer-deepseek-v4",
  "pegainfer-qwen3-4b",
  "pegainfer-qwen35-4b",
+ "pegainfer-vllm-support",
  "rand 0.10.1",
  "rmp-serde",
  "rmpv",
@@ -3666,6 +3669,14 @@ dependencies = [
  "vllm-server",
  "vllm-text",
  "zeromq",
+]
+
+[[package]]
+name = "pegainfer-vllm-support"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+ "vllm-text",
 ]
 
 [[package]]

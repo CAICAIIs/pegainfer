@@ -1,12 +1,6 @@
-use std::path::Path;
-use std::sync::Arc;
-
-use vllm_text::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
+use vllm_text::tokenizer::DynTokenizer;
 
 pub(crate) fn load_tokenizer(model_path: &str) -> DynTokenizer {
-    let tokenizer_path = Path::new(model_path).join("tokenizer.json");
-    Arc::new(
-        HuggingFaceTokenizer::new(&tokenizer_path)
-            .unwrap_or_else(|e| panic!("Failed to load {}: {e}", tokenizer_path.display())),
-    )
+    pegainfer_vllm_support::load_tokenizer(model_path)
+        .unwrap_or_else(|err| panic!("Failed to load tokenizer for {model_path}: {err}"))
 }

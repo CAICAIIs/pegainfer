@@ -1,0 +1,11 @@
+[package]
+name = "pegainfer-vllm-support"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { workspace = true, features = ["net", "rt", "time"] }
+vllm-text = { workspace = true }
+
+[lints]
+workspace = true
