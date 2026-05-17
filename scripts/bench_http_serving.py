@@ -19,6 +19,7 @@ import statistics
 import time
 import urllib.parse
 from dataclasses import asdict, dataclass
+from itertools import product
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,8 @@ DEFAULT_PROMPT_WORDS = (
 class RequestResult:
     index: int
     request_id: str
+    prompt_words: int
+    max_tokens: int
     ok: bool
     status: int | None
     error: str | None
@@ -115,6 +118,29 @@ def make_prompt(index: int, prompt_words: int) -> str:
     return " ".join(words)
 
 
+def parse_int_list(raw: str) -> list[int]:
+    values = []
+    for part in raw.split(","):
+        value = part.strip()
+        if not value:
+            continue
+        parsed = int(value)
+        if parsed <= 0:
+            raise argparse.ArgumentTypeError("values must be positive integers")
+        values.append(parsed)
+    if not values:
+        raise argparse.ArgumentTypeError("expected at least one integer")
+    return values
+
+
+def single_or_list(values: list[int]) -> int | list[int]:
+    return values[0] if len(values) == 1 else values
+
+
+def workload_shapes(prompt_words: list[int], max_tokens: list[int]) -> list[tuple[int, int]]:
+    return list(product(prompt_words, max_tokens))
+
+
 def parse_sse_text(payload: dict[str, Any]) -> str:
     choices = payload.get("choices") or []
     if not choices:
@@ -131,6 +157,7 @@ def request_once(
     request_id: str,
     url: urllib.parse.ParseResult,
     model: str,
+    prompt_words: int,
     prompt: str,
     max_tokens: int,
     temperature: float,
@@ -209,6 +236,8 @@ def request_once(
         return RequestResult(
             index=index,
             request_id=request_id,
+            prompt_words=prompt_words,
+            max_tokens=max_tokens,
             ok=True,
             status=status,
             error=None,
@@ -230,15 +259,39 @@ def request_once(
         )
     except (TimeoutError, socket.timeout) as exc:
         end = time.perf_counter()
-        return failed_result(index, request_id, status, start, start_wall, end, str(exc), timed_out=True)
+        return failed_result(
+            index,
+            request_id,
+            prompt_words,
+            max_tokens,
+            status,
+            start,
+            start_wall,
+            end,
+            str(exc),
+            timed_out=True,
+        )
     except Exception as exc:  # noqa: BLE001 - benchmark reports the error string.
         end = time.perf_counter()
-        return failed_result(index, request_id, status, start, start_wall, end, str(exc), timed_out=False)
+        return failed_result(
+            index,
+            request_id,
+            prompt_words,
+            max_tokens,
+            status,
+            start,
+            start_wall,
+            end,
+            str(exc),
+            timed_out=False,
+        )
 
 
 def failed_result(
     index: int,
     request_id: str,
+    prompt_words: int,
+    max_tokens: int,
     status: int | None,
     start: float,
     start_wall: float,
@@ -250,6 +303,8 @@ def failed_result(
     return RequestResult(
         index=index,
         request_id=request_id,
+        prompt_words=prompt_words,
+        max_tokens=max_tokens,
         ok=False,
         status=status,
         error=error,
@@ -345,7 +400,11 @@ def run_batch(args: argparse.Namespace, measured: bool) -> tuple[list[RequestRes
     offset = args.warmup if measured else 0
     count = args.num_requests if measured else args.warmup
     label = "measured" if measured else "warmup"
-    prompts = [make_prompt(offset + idx, args.prompt_words) for idx in range(count)]
+    shapes = workload_shapes(args.prompt_words, args.max_tokens)
+    workloads = []
+    for idx in range(count):
+        prompt_words, max_tokens = shapes[(offset + idx) % len(shapes)]
+        workloads.append((prompt_words, max_tokens, make_prompt(offset + idx, prompt_words)))
     started = time.perf_counter()
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as pool:
         futures = [
@@ -355,13 +414,14 @@ def run_batch(args: argparse.Namespace, measured: bool) -> tuple[list[RequestRes
                 f"pegainfer-bench-{label}-{offset + idx}",
                 url,
                 args.model,
+                prompt_words,
                 prompt,
-                args.max_tokens,
+                max_tokens,
                 args.temperature,
                 args.timeout,
                 args.ignore_eos,
             )
-            for idx, prompt in enumerate(prompts)
+            for idx, (prompt_words, max_tokens, prompt) in enumerate(workloads)
         ]
         results = [future.result() for future in concurrent.futures.as_completed(futures)]
     ended = time.perf_counter()
@@ -379,6 +439,22 @@ def build_report(args: argparse.Namespace, measured: list[RequestResult], wall_s
     output_chunks = [result.output_chunks for result in successes]
     output_chars = [result.output_chars for result in successes]
     hashes = [result.output_hash for result in successes]
+    input_tokens = [
+        int(result.server_trace["prompt_tokens"])
+        if result.server_trace is not None and isinstance(result.server_trace.get("prompt_tokens"), int)
+        else result.prompt_words
+        for result in successes
+    ]
+    output_tokens = [
+        int(result.server_trace["completion_tokens"])
+        if result.server_trace is not None and isinstance(result.server_trace.get("completion_tokens"), int)
+        else (result.max_tokens if args.ignore_eos else result.output_chunks)
+        for result in successes
+    ]
+    shape_counts: dict[str, int] = {}
+    for result in measured:
+        key = f"prompt_words={result.prompt_words},max_tokens={result.max_tokens}"
+        shape_counts[key] = shape_counts.get(key, 0) + 1
 
     for result in successes:
         itls.extend(result.itl_ms)
@@ -392,8 +468,9 @@ def build_report(args: argparse.Namespace, measured: list[RequestResult], wall_s
             "num_requests": args.num_requests,
             "concurrency": args.concurrency,
             "warmup": args.warmup,
-            "prompt_words": args.prompt_words,
-            "max_tokens": args.max_tokens,
+            "prompt_words": single_or_list(args.prompt_words),
+            "max_tokens": single_or_list(args.max_tokens),
+            "mixed_shapes": shape_counts,
             "temperature": args.temperature,
             "ignore_eos": args.ignore_eos,
             "timeout_s": args.timeout,
@@ -404,6 +481,10 @@ def build_report(args: argparse.Namespace, measured: list[RequestResult], wall_s
             "failed": len(failures),
             "timeouts": sum(1 for result in failures if result.timed_out),
             "qps": len(successes) / wall_s if wall_s > 0 else 0.0,
+            "input_tokens_total": sum(input_tokens),
+            "output_tokens_total": sum(output_tokens),
+            "input_tokens_per_s": sum(input_tokens) / wall_s if wall_s > 0 else 0.0,
+            "output_tokens_per_s": sum(output_tokens) / wall_s if wall_s > 0 else 0.0,
             "error_rate": len(failures) / args.num_requests if args.num_requests else 0.0,
             "timeout_rate": (
                 sum(1 for result in failures if result.timed_out) / args.num_requests
@@ -433,8 +514,18 @@ def main() -> None:
     parser.add_argument("--num-requests", type=int, default=8)
     parser.add_argument("--concurrency", type=int, default=2)
     parser.add_argument("--warmup", type=int, default=1)
-    parser.add_argument("--prompt-words", type=int, default=16)
-    parser.add_argument("--max-tokens", type=int, default=16)
+    parser.add_argument(
+        "--prompt-words",
+        type=parse_int_list,
+        default=[16],
+        help="Prompt word count, or comma-separated counts for a mixed workload.",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=parse_int_list,
+        default=[16],
+        help="Completion token count, or comma-separated counts for a mixed workload.",
+    )
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--ignore-eos", action=argparse.BooleanOptionalAction, default=True)

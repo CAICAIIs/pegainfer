@@ -51,6 +51,7 @@ class BenchHttpServingTests(unittest.TestCase):
             request_id="req-empty",
             url=self.url,
             model="fake-model",
+            prompt_words=1,
             prompt="hello",
             max_tokens=1,
             temperature=0.0,
@@ -67,6 +68,8 @@ class BenchHttpServingTests(unittest.TestCase):
         result = bench_http_serving.RequestResult(
             index=0,
             request_id="bench-1",
+            prompt_words=16,
+            max_tokens=2,
             ok=True,
             status=200,
             error=None,
@@ -103,6 +106,136 @@ class BenchHttpServingTests(unittest.TestCase):
         self.assertAlmostEqual(result.server_trace["admission_queue_ms"], 20.0, places=3)
         self.assertAlmostEqual(result.server_trace["stream_flush_ms"], 50.0, places=3)
         self.assertAlmostEqual(result.server_trace["frontend_to_queue_ms"], 10.0, places=3)
+
+    def test_mixed_workload_report_records_input_and_output_tokens(self) -> None:
+        results = [
+            bench_http_serving.RequestResult(
+                index=0,
+                request_id="bench-0",
+                prompt_words=16,
+                max_tokens=4,
+                ok=True,
+                status=200,
+                error=None,
+                timed_out=False,
+                start_s=0.0,
+                start_wall_s=0.0,
+                first_token_s=0.1,
+                first_token_wall_s=0.1,
+                end_s=0.2,
+                end_wall_s=0.2,
+                latency_ms=200.0,
+                ttft_ms=100.0,
+                tpot_ms=30.0,
+                itl_ms=[30.0, 30.0, 30.0],
+                output_chunks=4,
+                output_chars=8,
+                output_hash="aaaa",
+                text_prefix="text",
+                server_trace={"prompt_tokens": 22, "completion_tokens": 4},
+            ),
+            bench_http_serving.RequestResult(
+                index=1,
+                request_id="bench-1",
+                prompt_words=128,
+                max_tokens=8,
+                ok=True,
+                status=200,
+                error=None,
+                timed_out=False,
+                start_s=0.0,
+                start_wall_s=0.0,
+                first_token_s=0.2,
+                first_token_wall_s=0.2,
+                end_s=0.4,
+                end_wall_s=0.4,
+                latency_ms=400.0,
+                ttft_ms=200.0,
+                tpot_ms=25.0,
+                itl_ms=[25.0] * 7,
+                output_chunks=8,
+                output_chars=16,
+                output_hash="bbbb",
+                text_prefix="more",
+                server_trace={"prompt_tokens": 165, "completion_tokens": 8},
+            ),
+        ]
+        args = type(
+            "Args",
+            (),
+            {
+                "base_url": "http://127.0.0.1:8000",
+                "model": "fake-model",
+                "num_requests": 2,
+                "concurrency": 2,
+                "warmup": 0,
+                "prompt_words": [16, 128],
+                "max_tokens": [4, 8],
+                "temperature": 0.0,
+                "ignore_eos": True,
+                "timeout": 5.0,
+            },
+        )()
+        report = bench_http_serving.build_report(args, results, wall_s=2.0)
+
+        self.assertEqual(report["summary"]["input_tokens_total"], 187)
+        self.assertEqual(report["summary"]["output_tokens_total"], 12)
+        self.assertAlmostEqual(report["summary"]["input_tokens_per_s"], 93.5)
+        self.assertAlmostEqual(report["summary"]["output_tokens_per_s"], 6.0)
+        self.assertEqual(
+            report["workload"]["mixed_shapes"],
+            {
+                "prompt_words=16,max_tokens=4": 1,
+                "prompt_words=128,max_tokens=8": 1,
+            },
+        )
+
+    def test_ignore_eos_output_token_fallback_uses_requested_max_tokens(self) -> None:
+        result = bench_http_serving.RequestResult(
+            index=0,
+            request_id="bench-0",
+            prompt_words=16,
+            max_tokens=16,
+            ok=True,
+            status=200,
+            error=None,
+            timed_out=False,
+            start_s=0.0,
+            start_wall_s=0.0,
+            first_token_s=0.1,
+            first_token_wall_s=0.1,
+            end_s=0.2,
+            end_wall_s=0.2,
+            latency_ms=200.0,
+            ttft_ms=100.0,
+            tpot_ms=None,
+            itl_ms=[],
+            output_chunks=1,
+            output_chars=80,
+            output_hash="aaaa",
+            text_prefix="text",
+            server_trace=None,
+        )
+        args = type(
+            "Args",
+            (),
+            {
+                "base_url": "http://127.0.0.1:8000",
+                "model": "fake-model",
+                "num_requests": 1,
+                "concurrency": 1,
+                "warmup": 0,
+                "prompt_words": [16],
+                "max_tokens": [16],
+                "temperature": 0.0,
+                "ignore_eos": True,
+                "timeout": 5.0,
+            },
+        )()
+        report = bench_http_serving.build_report(args, [result], wall_s=2.0)
+
+        self.assertEqual(report["summary"]["output_tokens_total"], 16)
+        self.assertAlmostEqual(report["summary"]["output_tokens_per_s"], 8.0)
 
 
 if __name__ == "__main__":

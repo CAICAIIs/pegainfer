@@ -98,6 +98,12 @@ def build_summary(args: argparse.Namespace, reports: list[dict[str, Any]]) -> di
                     report["summary"]["combined_output_hash"] for report in cell_reports
                 ],
                 "qps": [report["summary"]["qps"] for report in cell_reports],
+                "input_tokens_per_s": [
+                    report["summary"]["input_tokens_per_s"] for report in cell_reports
+                ],
+                "output_tokens_per_s": [
+                    report["summary"]["output_tokens_per_s"] for report in cell_reports
+                ],
                 "ttft_avg_ms": [report["metrics"]["ttft"]["avg_ms"] for report in cell_reports],
                 "tpot_avg_ms": [report["metrics"]["tpot"]["avg_ms"] for report in cell_reports],
                 "itl_avg_ms": [report["metrics"]["itl"]["avg_ms"] for report in cell_reports],
