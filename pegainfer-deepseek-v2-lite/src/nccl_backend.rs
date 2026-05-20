@@ -1,5 +1,5 @@
 use std::{
-    ffi::{CStr, c_char, c_void},
+    ffi::{CStr, c_char, c_int, c_void},
     ptr,
     sync::Arc,
 };
@@ -15,11 +15,10 @@ use pegainfer_core::tensor::{DeviceContext, HiddenStates};
 
 use crate::device::activate;
 
-type NcclCommInitAll = unsafe extern "C" fn(
-    *mut ncclComm_t,
-    ::core::ffi::c_int,
-    *const ::core::ffi::c_int,
-) -> ncclResult_t;
+type NcclCommInitAll = unsafe extern "C" fn(*mut ncclComm_t, c_int, *const c_int) -> ncclResult_t;
+type NcclCommCount = unsafe extern "C" fn(ncclComm_t, *mut c_int) -> ncclResult_t;
+type NcclCommCuDevice = unsafe extern "C" fn(ncclComm_t, *mut c_int) -> ncclResult_t;
+type NcclCommDestroy = unsafe extern "C" fn(ncclComm_t) -> ncclResult_t;
 type NcclCommAbort = unsafe extern "C" fn(ncclComm_t) -> ncclResult_t;
 type NcclGroupStart = unsafe extern "C" fn() -> ncclResult_t;
 type NcclGroupEnd = unsafe extern "C" fn() -> ncclResult_t;
@@ -42,6 +41,9 @@ pub(crate) struct NaiveNcclEp2Backend {
 struct RawNcclLib {
     _library: Library,
     comm_init_all: NcclCommInitAll,
+    comm_count: NcclCommCount,
+    comm_cu_device: NcclCommCuDevice,
+    comm_destroy: NcclCommDestroy,
     comm_abort: NcclCommAbort,
     group_start: NcclGroupStart,
     group_end: NcclGroupEnd,
@@ -72,10 +74,13 @@ impl NaiveNcclEp2Backend {
             comms.iter().all(|comm| !comm.is_null()),
             "DeepSeek-V2-Lite NCCL EP=2 communicator initialization returned a null communicator"
         );
-        Ok(Self { lib, comms })
+        let backend = Self { lib, comms };
+        backend.validate_communicators(&ordinals)?;
+        backend.smoke_all_reduce_f32(rank0, rank1)?;
+        Ok(backend)
     }
 
-    pub(crate) fn dispatch_rank0_hidden_to_rank1(
+    pub(crate) fn dense_all_reduce_rank0_hidden_to_rank1(
         &self,
         rank0: &DeviceContext,
         rank1: &DeviceContext,
@@ -83,7 +88,7 @@ impl NaiveNcclEp2Backend {
     ) -> Result<HiddenStates> {
         ensure!(
             input.hidden_dim > 0 && input.seq_len > 0,
-            "DeepSeek-V2-Lite NCCL dispatch requires non-empty hidden states"
+            "DeepSeek-V2-Lite NCCL dense hidden exchange requires non-empty hidden states"
         );
         activate(rank0)?;
         let mut rank0_recv = HiddenStates::zeros(rank0, input.hidden_dim, input.seq_len)?;
@@ -91,8 +96,11 @@ impl NaiveNcclEp2Backend {
         let rank1_send = HiddenStates::zeros(rank1, input.hidden_dim, input.seq_len)?;
         let mut rank1_recv = HiddenStates::zeros(rank1, input.hidden_dim, input.seq_len)?;
 
+        // Correctness-first dense exchange: rank0 contributes the hidden state
+        // and rank1 contributes zeros. This makes rank0 hidden visible on rank1
+        // without pretending to be sparse routed dispatch.
         let count = input.hidden_dim * input.seq_len;
-        self.grouped("DeepSeek-V2-Lite NCCL dispatch all-reduce", || {
+        self.grouped("DeepSeek-V2-Lite NCCL dense hidden all-reduce", || {
             activate(rank0)?;
             self.all_reduce_bf16(
                 0,
@@ -100,7 +108,7 @@ impl NaiveNcclEp2Backend {
                 &mut rank0_recv.data,
                 count,
                 rank0.stream.cu_stream(),
-                "DeepSeek-V2-Lite NCCL dispatch rank0 all-reduce",
+                "DeepSeek-V2-Lite NCCL dense hidden rank0 all-reduce",
             )?;
             activate(rank1)?;
             self.all_reduce_bf16(
@@ -109,7 +117,7 @@ impl NaiveNcclEp2Backend {
                 &mut rank1_recv.data,
                 count,
                 rank1.stream.cu_stream(),
-                "DeepSeek-V2-Lite NCCL dispatch rank1 all-reduce",
+                "DeepSeek-V2-Lite NCCL dense hidden rank1 all-reduce",
             )?;
             Ok(())
         })?;
@@ -169,6 +177,75 @@ impl NaiveNcclEp2Backend {
         let combined = rank0.stream.clone_dtoh(&rank0_recv)?;
         rank0.sync()?;
         Ok(combined)
+    }
+
+    fn smoke_all_reduce_f32(&self, rank0: &DeviceContext, rank1: &DeviceContext) -> Result<()> {
+        activate(rank0)?;
+        let rank0_send = rank0.stream.clone_htod(&[1.0f32])?;
+        let mut rank0_recv = rank0.stream.alloc_zeros::<f32>(1)?;
+        activate(rank1)?;
+        let rank1_send = rank1.stream.clone_htod(&[2.0f32])?;
+        let mut rank1_recv = rank1.stream.alloc_zeros::<f32>(1)?;
+
+        self.grouped("DeepSeek-V2-Lite NCCL EP=2 init smoke all-reduce", || {
+            activate(rank0)?;
+            self.all_reduce_f32(
+                0,
+                &rank0_send,
+                &mut rank0_recv,
+                1,
+                rank0.stream.cu_stream(),
+                "DeepSeek-V2-Lite NCCL init smoke rank0 all-reduce",
+            )?;
+            activate(rank1)?;
+            self.all_reduce_f32(
+                1,
+                &rank1_send,
+                &mut rank1_recv,
+                1,
+                rank1.stream.cu_stream(),
+                "DeepSeek-V2-Lite NCCL init smoke rank1 all-reduce",
+            )?;
+            Ok(())
+        })?;
+        rank0.sync()?;
+        rank1.sync()?;
+
+        activate(rank0)?;
+        let rank0_value = rank0.stream.clone_dtoh(&rank0_recv)?;
+        rank0.sync()?;
+        activate(rank1)?;
+        let rank1_value = rank1.stream.clone_dtoh(&rank1_recv)?;
+        rank1.sync()?;
+        ensure!(
+            rank0_value == [3.0] && rank1_value == [3.0],
+            "DeepSeek-V2-Lite NCCL EP=2 init smoke all-reduce returned rank0={rank0_value:?}, rank1={rank1_value:?}, expected [3.0]"
+        );
+        Ok(())
+    }
+
+    fn validate_communicators(&self, expected_ordinals: &[c_int; 2]) -> Result<()> {
+        for (rank, expected_ordinal) in expected_ordinals.iter().copied().enumerate() {
+            let comm = self.comm(rank)?;
+            let count = self.lib.query_comm_count(
+                comm,
+                &format!("DeepSeek-V2-Lite NCCL communicator rank {rank} world-size query"),
+            )?;
+            ensure!(
+                count == self.comms.len() as c_int,
+                "DeepSeek-V2-Lite NCCL communicator rank {rank} world size mismatch: got {count}, expected {}",
+                self.comms.len()
+            );
+            let device = self.lib.query_comm_cu_device(
+                comm,
+                &format!("DeepSeek-V2-Lite NCCL communicator rank {rank} device query"),
+            )?;
+            ensure!(
+                device == expected_ordinal,
+                "DeepSeek-V2-Lite NCCL communicator rank {rank} CUDA device mismatch: got {device}, expected {expected_ordinal}"
+            );
+        }
+        Ok(())
     }
 
     fn all_reduce_bf16(
@@ -276,11 +353,18 @@ impl Drop for NaiveNcclEp2Backend {
     fn drop(&mut self) {
         for comm in &mut self.comms {
             if !comm.is_null() {
-                let _ = unsafe {
-                    // SAFETY: Best-effort teardown for communicator handles
-                    // returned by `ncclCommInitAll`.
-                    (self.lib.comm_abort)(*comm)
+                let destroy_status = unsafe {
+                    // SAFETY: Best-effort clean teardown for communicator
+                    // handles returned by `ncclCommInitAll`.
+                    (self.lib.comm_destroy)(*comm)
                 };
+                if destroy_status != ncclResult_t::ncclSuccess {
+                    let _ = unsafe {
+                        // SAFETY: Abort is the fallback when clean destroy
+                        // reports an error during best-effort Drop.
+                        (self.lib.comm_abort)(*comm)
+                    };
+                }
                 *comm = ptr::null_mut();
             }
         }
@@ -316,6 +400,9 @@ impl RawNcclLib {
     unsafe fn from_library(library: Library) -> Result<Self> {
         Ok(Self {
             comm_init_all: unsafe { load_symbol(&library, b"ncclCommInitAll\0")? },
+            comm_count: unsafe { load_symbol(&library, b"ncclCommCount\0")? },
+            comm_cu_device: unsafe { load_symbol(&library, b"ncclCommCuDevice\0")? },
+            comm_destroy: unsafe { load_symbol(&library, b"ncclCommDestroy\0")? },
             comm_abort: unsafe { load_symbol(&library, b"ncclCommAbort\0")? },
             group_start: unsafe { load_symbol(&library, b"ncclGroupStart\0")? },
             group_end: unsafe { load_symbol(&library, b"ncclGroupEnd\0")? },
@@ -340,6 +427,28 @@ impl RawNcclLib {
             }
         };
         bail!("{context} failed: {message} ({status:?})")
+    }
+
+    fn query_comm_count(&self, comm: ncclComm_t, context: &str) -> Result<c_int> {
+        let mut count = 0;
+        let status = unsafe {
+            // SAFETY: `count` is a valid out pointer and `comm` was validated
+            // by the caller as a non-null communicator handle.
+            (self.comm_count)(comm, &mut count)
+        };
+        self.check(status, context)?;
+        Ok(count)
+    }
+
+    fn query_comm_cu_device(&self, comm: ncclComm_t, context: &str) -> Result<c_int> {
+        let mut device = -1;
+        let status = unsafe {
+            // SAFETY: `device` is a valid out pointer and `comm` was validated
+            // by the caller as a non-null communicator handle.
+            (self.comm_cu_device)(comm, &mut device)
+        };
+        self.check(status, context)?;
+        Ok(device)
     }
 }
 

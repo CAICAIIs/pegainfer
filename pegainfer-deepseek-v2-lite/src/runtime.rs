@@ -43,6 +43,10 @@ pub struct GenerationStats {
     pub nccl_dispatch_local_routes: usize,
     pub nccl_dispatch_remote_routes: usize,
     pub nccl_combine_routes: usize,
+    pub nccl_dense_exchange_calls: usize,
+    pub nccl_combine_calls: usize,
+    pub nccl_dense_exchange_elements: usize,
+    pub nccl_combine_elements: usize,
     pub output_token_sha256: String,
 }
 
@@ -135,6 +139,14 @@ impl GenerationStats {
                 self.nccl_combine_routes += local_routes + remote_routes;
             }
         }
+    }
+
+    fn record_nccl_moe_collectives(&mut self, hidden_dim: usize, seq_len: usize) {
+        let elements = hidden_dim * seq_len;
+        self.nccl_dense_exchange_calls += 1;
+        self.nccl_combine_calls += 1;
+        self.nccl_dense_exchange_elements += elements;
+        self.nccl_combine_elements += elements;
     }
 }
 
@@ -335,7 +347,13 @@ impl DeepSeekV2LiteEp2Generator {
             MlpWeights::Dense(dense) => {
                 (dense_mlp_forward(&self.rank0.ctx, dense, &ffn_norm)?, 0, 0)
             }
-            MlpWeights::Moe(moe) => self.moe_forward(layer_idx, &ffn_norm, moe)?,
+            MlpWeights::Moe(moe) => {
+                let out = self.moe_forward(layer_idx, &ffn_norm, moe)?;
+                if self.backend.kind() == EpBackendKind::Nccl {
+                    stats.record_nccl_moe_collectives(ffn_norm.hidden_dim, ffn_norm.seq_len);
+                }
+                out
+            }
         };
         stats.record_routes(self.backend.kind(), local_routes, remote_routes);
         ops::add_batch(&self.rank0.ctx, &after_attn, &ffn_out)
@@ -476,8 +494,11 @@ impl DeepSeekV2LiteEp2Generator {
         let shared = dense_mlp_forward(&self.rank0.ctx, &moe.shared, input)?;
         let mut rank0_contrib = hidden_to_f32(&self.rank0.ctx, &shared)?;
         let mut rank1_contrib = vec![0.0f32; rank0_contrib.len()];
+        // NCCL covers only the dense hidden exchange and final contribution
+        // sum in this first gate. Route iteration and expert-output
+        // accumulation stay host-side so host-staged remains a simple oracle.
         let rank1_input =
-            nccl.dispatch_rank0_hidden_to_rank1(&self.rank0.ctx, &self.rank1.ctx, input)?;
+            nccl.dense_all_reduce_rank0_hidden_to_rank1(&self.rank0.ctx, &self.rank1.ctx, input)?;
         let mut local_routes = 0usize;
         let mut remote_routes = 0usize;
 
