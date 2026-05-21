@@ -53,6 +53,12 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | `models/deepseek-v4/pplx-ep-integration.md` | DeepSeek V4 PPLX EP integration: pplx-garden decode MoE path, EP8 bootstrap, common NUMA rank-slice placement, and H200 steady TPOT p50 `66.65ms`. |
 | `models/deepseek-v4/kernel-paths.md` | DeepSeek V4 CUDA sources, TileLang generator path, and `pegainfer-kernels/KERNELS.md` routing index are organized. |
 
+## models / deepseek-v2-lite
+
+| Path | TL;DR |
+| --- | --- |
+| `models/deepseek-v2-lite/hf-accuracy-gate.md` | DeepSeek-V2-Lite EP2 HF accuracy gate after PR #149/#150: HF incremental greedy, host-staged EP2, and NCCL EP2 are token/text exact for `Hello`, output_len=16. |
+
 ## subsystems / runtime
 
 | Path | TL;DR |

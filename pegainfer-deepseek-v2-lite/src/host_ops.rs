@@ -41,6 +41,8 @@ pub(crate) fn normalize_compressed_kv(
     norm_weight: &[f32],
     seq_len: usize,
 ) -> Vec<bf16> {
+    assert_eq!(kv_a_host.len(), config.kv_a_proj_rows() * seq_len);
+    assert_eq!(norm_weight.len(), config.kv_lora_rank);
     let mut out = vec![bf16::ZERO; config.kv_lora_rank * seq_len];
     for token in 0..seq_len {
         let src = &kv_a_host[token * config.kv_a_proj_rows()
@@ -51,12 +53,36 @@ pub(crate) fn normalize_compressed_kv(
     out
 }
 
-fn rms_norm_host(input: &[f32], weight: &[f32], eps: f32, out: &mut [bf16]) {
+pub(crate) fn rms_norm_host(input: &[f32], weight: &[f32], eps: f32, out: &mut [bf16]) {
+    assert_eq!(input.len(), weight.len());
+    assert_eq!(out.len(), input.len());
     let sum_sq = input.iter().map(|value| value * value).sum::<f32>();
     let inv_rms = (sum_sq / input.len() as f32 + eps).sqrt().recip();
     for ((dst, value), scale) in out.iter_mut().zip(input).zip(weight) {
-        *dst = bf16::from_f32(value * inv_rms * scale);
+        let normalized = bf16::from_f32(value * inv_rms).to_f32();
+        *dst = bf16::from_f32(normalized * scale);
     }
+}
+
+pub(crate) fn rms_norm_hidden_host(
+    config: &Config,
+    input: &[f32],
+    weight: &[f32],
+    seq_len: usize,
+) -> Vec<bf16> {
+    assert_eq!(input.len(), config.hidden_size * seq_len);
+    assert_eq!(weight.len(), config.hidden_size);
+    let mut out = vec![bf16::ZERO; config.hidden_size * seq_len];
+    for token in 0..seq_len {
+        let offset = token * config.hidden_size;
+        rms_norm_host(
+            &input[offset..offset + config.hidden_size],
+            weight,
+            config.rms_norm_eps,
+            &mut out[offset..offset + config.hidden_size],
+        );
+    }
+    out
 }
 
 pub(crate) fn append_kv_and_build_queries(
@@ -72,24 +98,33 @@ pub(crate) fn append_kv_and_build_queries(
     let num_heads = config.num_attention_heads;
     let q_head_dim = config.query_head_dim();
     let kv_b_stride = config.qk_nope_head_dim + config.v_head_dim;
+    assert_eq!(q_host.len(), config.q_proj_rows() * seq_len);
+    assert_eq!(kv_a_host.len(), config.kv_a_proj_rows() * seq_len);
+    assert_eq!(kv_b_host.len(), config.kv_b_proj_rows() * seq_len);
+    assert_eq!(queries.len(), num_heads * q_head_dim * seq_len);
     let mut key = vec![0.0f32; q_head_dim];
+    let rope_inv_freq: Vec<_> = (0..config.qk_rope_head_dim / 2)
+        .map(|pair| rope_inv_freq(config, pair))
+        .collect();
+    let rope_mscale = rope_cache_mscale(config);
 
     for token in 0..seq_len {
         let pos = start_pos + token;
         let k_pe_raw = &kv_a_host[token * config.kv_a_proj_rows() + config.kv_lora_rank
             ..token * config.kv_a_proj_rows() + config.kv_lora_rank + config.qk_rope_head_dim];
-        let k_pe = apply_rope(k_pe_raw, pos, config.qk_rope_head_dim, config.rope_theta);
+        let k_pe = apply_deepseek_v2_rope(k_pe_raw, pos, config, &rope_inv_freq, rope_mscale);
 
         for head in 0..num_heads {
             let q_base = token * config.q_proj_rows() + head * q_head_dim;
             let query_base = (token * num_heads + head) * q_head_dim;
             queries[query_base..query_base + config.qk_nope_head_dim]
                 .copy_from_slice(&q_host[q_base..q_base + config.qk_nope_head_dim]);
-            let q_pe = apply_rope(
+            let q_pe = apply_deepseek_v2_rope(
                 &q_host[q_base + config.qk_nope_head_dim..q_base + q_head_dim],
                 pos,
-                config.qk_rope_head_dim,
-                config.rope_theta,
+                config,
+                &rope_inv_freq,
+                rope_mscale,
             );
             queries[query_base + config.qk_nope_head_dim..query_base + q_head_dim]
                 .copy_from_slice(&q_pe);
@@ -107,20 +142,86 @@ pub(crate) fn append_kv_and_build_queries(
     }
 }
 
-fn apply_rope(input: &[f32], pos: usize, dim: usize, theta: f32) -> Vec<f32> {
+fn apply_deepseek_v2_rope(
+    input: &[f32],
+    pos: usize,
+    config: &Config,
+    inv_freq: &[f32],
+    mscale: f32,
+) -> Vec<f32> {
+    let dim = config.qk_rope_head_dim;
     let half = dim / 2;
     let mut out = vec![0.0f32; dim];
-    for i in 0..half {
-        let inv_freq = 1.0f32 / theta.powf((2 * i) as f32 / dim as f32);
-        let angle = pos as f32 * inv_freq;
-        let cos = angle.cos();
-        let sin = angle.sin();
-        let x1 = input[i];
-        let x2 = input[i + half];
-        out[i] = x1 * cos - x2 * sin;
-        out[i + half] = x2 * cos + x1 * sin;
+    assert_eq!(input.len(), dim);
+    assert_eq!(inv_freq.len(), half);
+    assert_eq!(dim % 2, 0);
+    for pair in 0..half {
+        let angle = pos as f32 * inv_freq[pair];
+        let cos = bf16::from_f32(angle.cos() * mscale).to_f32();
+        let sin = bf16::from_f32(angle.sin() * mscale).to_f32();
+        let x0 = input[2 * pair];
+        let x1 = input[2 * pair + 1];
+        let x0_cos = bf16::from_f32(x0 * cos).to_f32();
+        let neg_x1_sin = bf16::from_f32(-x1 * sin).to_f32();
+        let x1_cos = bf16::from_f32(x1 * cos).to_f32();
+        let x0_sin = bf16::from_f32(x0 * sin).to_f32();
+        out[pair] = bf16::from_f32(x0_cos + neg_x1_sin).to_f32();
+        out[pair + half] = bf16::from_f32(x1_cos + x0_sin).to_f32();
     }
     out
+}
+
+fn rope_cache_mscale(config: &Config) -> f32 {
+    let Some(rope_scaling) = &config.rope_scaling else {
+        return 1.0;
+    };
+    yarn_get_mscale(rope_scaling.factor, rope_scaling.mscale)
+        / yarn_get_mscale(rope_scaling.factor, rope_scaling.mscale_all_dim)
+}
+
+fn rope_inv_freq(config: &Config, pair: usize) -> f32 {
+    let dim = config.qk_rope_head_dim;
+    let base = config.rope_theta;
+    let freq_extra = 1.0 / base.powf((2 * pair) as f32 / dim as f32);
+    let Some(rope_scaling) = &config.rope_scaling else {
+        return freq_extra;
+    };
+
+    let freq_inter = freq_extra / rope_scaling.factor;
+    let low = yarn_find_correction_dim(rope_scaling.beta_fast as f32, dim, base, rope_scaling)
+        .floor()
+        .max(0.0);
+    let high = yarn_find_correction_dim(rope_scaling.beta_slow as f32, dim, base, rope_scaling)
+        .ceil()
+        .min((dim - 1) as f32);
+    let ramp = if (high - low).abs() < f32::EPSILON {
+        if (pair as f32) <= low { 0.0 } else { 1.0 }
+    } else {
+        ((pair as f32 - low) / (high - low)).clamp(0.0, 1.0)
+    };
+    let inv_freq_mask = 1.0 - ramp;
+    freq_inter * (1.0 - inv_freq_mask) + freq_extra * inv_freq_mask
+}
+
+fn yarn_find_correction_dim(
+    num_rotations: f32,
+    dim: usize,
+    base: f32,
+    rope_scaling: &crate::config::RopeScaling,
+) -> f32 {
+    dim as f32
+        * (rope_scaling.original_max_position_embeddings as f32
+            / (num_rotations * 2.0 * std::f32::consts::PI))
+            .ln()
+        / (2.0 * base.ln())
+}
+
+fn yarn_get_mscale(scale: f32, mscale: f32) -> f32 {
+    if scale <= 1.0 {
+        1.0
+    } else {
+        0.1 * mscale * scale.ln() + 1.0
+    }
 }
 
 pub(crate) fn compute_attention_host(
@@ -133,7 +234,8 @@ pub(crate) fn compute_attention_host(
     let num_heads = config.num_attention_heads;
     let q_head_dim = config.query_head_dim();
     let value_dim = config.v_head_dim;
-    let scale = (q_head_dim as f32).sqrt().recip();
+    let scale = attention_softmax_scale(config);
+    assert_eq!(queries.len(), seq_len * num_heads * q_head_dim);
     let mut out = vec![0.0f32; seq_len * config.o_proj_cols()];
 
     for token in 0..seq_len {
@@ -145,11 +247,13 @@ pub(crate) fn compute_attention_host(
             for (pos, score) in scores.iter_mut().enumerate() {
                 let k_base = (pos * num_heads + head) * q_head_dim;
                 let key = &cache.keys[k_base..k_base + q_head_dim];
-                *score = dot(query, key) * scale;
+                let raw_score = bf16::from_f32(dot(query, key)).to_f32();
+                *score = bf16::from_f32(raw_score * scale).to_f32();
             }
             let probs = softmax(&scores);
             let out_base = token * config.o_proj_cols() + head * value_dim;
             for (pos, prob) in probs.iter().enumerate() {
+                let prob = bf16::from_f32(*prob).to_f32();
                 let v_base = (pos * num_heads + head) * value_dim;
                 let value = &cache.values[v_base..v_base + value_dim];
                 for dim in 0..value_dim {
@@ -162,11 +266,23 @@ pub(crate) fn compute_attention_host(
     out
 }
 
+fn attention_softmax_scale(config: &Config) -> f32 {
+    let mut scale = (config.query_head_dim() as f32).sqrt().recip();
+    if let Some(rope_scaling) = &config.rope_scaling
+        && rope_scaling.mscale_all_dim > 0.0
+    {
+        let mscale = yarn_get_mscale(rope_scaling.factor, rope_scaling.mscale_all_dim);
+        scale *= mscale * mscale;
+    }
+    scale
+}
+
 pub(crate) fn topk_softmax_routes(
     config: &Config,
     logits: &[f32],
     seq_len: usize,
 ) -> Vec<Vec<(usize, f32)>> {
+    assert_eq!(logits.len(), seq_len * config.n_routed_experts);
     let mut routes = Vec::with_capacity(seq_len);
     for token in 0..seq_len {
         let scores =
@@ -179,9 +295,32 @@ pub(crate) fn topk_softmax_routes(
                 .then_with(|| lhs_idx.cmp(rhs_idx))
         });
         indexed.truncate(config.num_experts_per_token);
+        // Avoid adding an extra probability-sorted accumulation order on top of
+        // HF's unsorted top-k gate path.
+        indexed.sort_by_key(|(idx, _)| *idx);
         routes.push(indexed);
     }
     routes
+}
+
+pub(crate) fn gate_logits_host(config: &Config, input: &[bf16], gate_weight: &[f32]) -> Vec<f32> {
+    assert_eq!(input.len() % config.hidden_size, 0);
+    assert_eq!(
+        gate_weight.len(),
+        config.n_routed_experts * config.hidden_size
+    );
+    let mut logits = vec![0.0f32; (input.len() / config.hidden_size) * config.n_routed_experts];
+    for (token, token_input) in input.chunks_exact(config.hidden_size).enumerate() {
+        for expert in 0..config.n_routed_experts {
+            let weight_base = expert * config.hidden_size;
+            let mut acc = 0.0f32;
+            for dim in 0..config.hidden_size {
+                acc += token_input[dim].to_f32() * gate_weight[weight_base + dim];
+            }
+            logits[token * config.n_routed_experts + expert] = acc;
+        }
+    }
+    logits
 }
 
 fn softmax(scores: &[f32]) -> Vec<f32> {
@@ -245,4 +384,75 @@ pub(crate) fn hidden_from_f32_host(
 ) -> Result<HiddenStates> {
     let bf16_data: Vec<_> = data.iter().copied().map(bf16::from_f32).collect();
     hidden_from_bf16_host(ctx, &bf16_data, hidden_dim, seq_len)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::test_lite_config;
+
+    #[test]
+    fn deepseek_v2_rope_matches_hf_pair_permutation_at_position_zero() {
+        let config = test_lite_config();
+        let input: Vec<_> = (0..config.qk_rope_head_dim)
+            .map(|value| value as f32)
+            .collect();
+        let inv_freq: Vec<_> = (0..config.qk_rope_head_dim / 2)
+            .map(|pair| rope_inv_freq(&config, pair))
+            .collect();
+
+        let out = apply_deepseek_v2_rope(&input, 0, &config, &inv_freq, rope_cache_mscale(&config));
+
+        let half = config.qk_rope_head_dim / 2;
+        for pair in 0..half {
+            assert_eq!(out[pair], input[2 * pair]);
+            assert_eq!(out[pair + half], input[2 * pair + 1]);
+        }
+    }
+
+    #[test]
+    fn yarn_attention_scale_uses_mscale_all_dim() {
+        let config = test_lite_config();
+        let rope_scaling = config.rope_scaling.as_ref().unwrap();
+        let mscale = yarn_get_mscale(rope_scaling.factor, rope_scaling.mscale_all_dim);
+        let expected = (config.query_head_dim() as f32).sqrt().recip() * mscale * mscale;
+
+        assert_eq!(attention_softmax_scale(&config), expected);
+    }
+
+    #[test]
+    fn rms_norm_host_rounds_normalized_hidden_before_weight() {
+        let input = [3.0f32, 4.0];
+        let weight = [3.0f32, 0.5];
+        let eps = 0.0;
+        let mut out = [bf16::ZERO; 2];
+
+        rms_norm_host(&input, &weight, eps, &mut out);
+
+        let inv_rms = ((3.0f32 * 3.0 + 4.0 * 4.0) / 2.0).sqrt().recip();
+        let expected0 = bf16::from_f32(bf16::from_f32(3.0 * inv_rms).to_f32() * 3.0);
+        let expected1 = bf16::from_f32(bf16::from_f32(4.0 * inv_rms).to_f32() * 0.5);
+        assert_eq!(out, [expected0, expected1]);
+    }
+
+    #[test]
+    fn topk_softmax_routes_accumulates_selected_experts_by_id() {
+        let config = test_lite_config();
+        let mut logits = vec![-10.0f32; config.n_routed_experts];
+        for (expert, logit) in [
+            (20, 6.0),
+            (7, 5.0),
+            (10, 4.0),
+            (41, 3.0),
+            (54, 2.0),
+            (58, 1.0),
+        ] {
+            logits[expert] = logit;
+        }
+
+        let routes = topk_softmax_routes(&config, &logits, 1);
+        let experts: Vec<_> = routes[0].iter().map(|(expert, _)| *expert).collect();
+
+        assert_eq!(experts, vec![7, 10, 20, 41, 54, 58]);
+    }
 }

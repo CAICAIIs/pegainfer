@@ -5,7 +5,10 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use half::bf16;
-use pegainfer_core::{ops, tensor::HiddenStates};
+use pegainfer_core::{
+    ops,
+    tensor::{DeviceVec, HiddenStates},
+};
 use pegainfer_engine::engine::{EngineLoadOptions, FinishReason};
 use sha2::{Digest, Sha256};
 
@@ -15,8 +18,9 @@ use crate::{
     ep::ExpertParallelConfig,
     host_ops::{
         DecodeCache, LayerCache, append_kv_and_build_queries, compute_attention_host,
-        hidden_from_bf16_host, hidden_from_f32_host, hidden_to_bf16, hidden_to_f32,
-        normalize_compressed_kv, topk_softmax_routes,
+        gate_logits_host, hidden_from_bf16_host, hidden_from_f32_host, hidden_to_bf16,
+        hidden_to_f32, normalize_compressed_kv, rms_norm_hidden_host, rms_norm_host,
+        topk_softmax_routes,
     },
     model::{
         AttentionWeights, DriverRankModel, ExpertMlp, ExpertRankModel, MlpWeights, MoeMlp,
@@ -318,30 +322,14 @@ impl DeepSeekV2LiteEp2Generator {
         activate(&self.rank0.ctx)?;
 
         let layer = &self.rank0.layers[layer_idx];
-        let mut normed =
-            HiddenStates::zeros(&self.rank0.ctx, self.config.hidden_size, hidden.seq_len)?;
-        ops::rms_norm_batch_into(
-            &self.rank0.ctx,
-            hidden,
-            &layer.input_layernorm,
-            self.config.rms_norm_eps,
-            &mut normed,
-        );
+        let normed = self.rms_norm_hidden(hidden, &layer.input_layernorm_host)?;
 
         let attn = self.attention_forward(&normed, &layer.attention, start_pos, cache)?;
         activate(&self.rank0.ctx)?;
         let attn_projected = ops::gemm(&self.rank0.ctx, &layer.attention.o_proj, &attn)?;
         let after_attn = ops::add_batch(&self.rank0.ctx, hidden, &attn_projected)?;
 
-        let mut ffn_norm =
-            HiddenStates::zeros(&self.rank0.ctx, self.config.hidden_size, after_attn.seq_len)?;
-        ops::rms_norm_batch_into(
-            &self.rank0.ctx,
-            &after_attn,
-            &layer.post_attention_layernorm,
-            self.config.rms_norm_eps,
-            &mut ffn_norm,
-        );
+        let ffn_norm = self.rms_norm_hidden(&after_attn, &layer.post_attention_layernorm_host)?;
 
         let (ffn_out, local_routes, remote_routes) = match &layer.mlp {
             MlpWeights::Dense(dense) => {
@@ -439,13 +427,12 @@ impl DeepSeekV2LiteEp2Generator {
         moe: &MoeMlp,
     ) -> Result<(HiddenStates, usize, usize)> {
         activate(&self.rank0.ctx)?;
-        let route_logits = ops::gemm(&self.rank0.ctx, &moe.gate, input)?;
-        let route_logits_host = hidden_to_f32(&self.rank0.ctx, &route_logits)?;
+        let input_host = hidden_to_bf16(&self.rank0.ctx, input)?;
+        let route_logits_host = gate_logits_host(&self.config, &input_host, &moe.gate_host);
         let routes = topk_softmax_routes(&self.config, &route_logits_host, input.seq_len);
 
         let shared = dense_mlp_forward(&self.rank0.ctx, &moe.shared, input)?;
-        let mut accum = hidden_to_f32(&self.rank0.ctx, &shared)?;
-        let input_host = hidden_to_bf16(&self.rank0.ctx, input)?;
+        let mut routed_accum = vec![0.0f32; input.seq_len * self.config.hidden_size];
         let mut local_routes = 0usize;
         let mut remote_routes = 0usize;
 
@@ -461,7 +448,7 @@ impl DeepSeekV2LiteEp2Generator {
                     local_routes += 1;
                 }
                 let offset = token * self.config.hidden_size;
-                for (dst, value) in accum[offset..offset + self.config.hidden_size]
+                for (dst, value) in routed_accum[offset..offset + self.config.hidden_size]
                     .iter_mut()
                     .zip(out)
                 {
@@ -470,12 +457,14 @@ impl DeepSeekV2LiteEp2Generator {
             }
         }
 
-        let hidden = hidden_from_f32_host(
+        let routed = hidden_from_f32_host(
             &self.rank0.ctx,
-            &accum,
+            &routed_accum,
             self.config.hidden_size,
             input.seq_len,
         )?;
+        activate(&self.rank0.ctx)?;
+        let hidden = ops::add_batch(&self.rank0.ctx, &routed, &shared)?;
         Ok((hidden, local_routes, remote_routes))
     }
 
@@ -487,12 +476,12 @@ impl DeepSeekV2LiteEp2Generator {
         moe: &MoeMlp,
     ) -> Result<(HiddenStates, usize, usize)> {
         activate(&self.rank0.ctx)?;
-        let route_logits = ops::gemm(&self.rank0.ctx, &moe.gate, input)?;
-        let route_logits_host = hidden_to_f32(&self.rank0.ctx, &route_logits)?;
+        let input_host = hidden_to_bf16(&self.rank0.ctx, input)?;
+        let route_logits_host = gate_logits_host(&self.config, &input_host, &moe.gate_host);
         let routes = topk_softmax_routes(&self.config, &route_logits_host, input.seq_len);
 
         let shared = dense_mlp_forward(&self.rank0.ctx, &moe.shared, input)?;
-        let mut rank0_contrib = hidden_to_f32(&self.rank0.ctx, &shared)?;
+        let mut rank0_contrib = vec![0.0f32; input.seq_len * self.config.hidden_size];
         let mut rank1_contrib = vec![0.0f32; rank0_contrib.len()];
         // NCCL covers only the dense hidden exchange and final contribution
         // sum in this first gate. Route iteration and expert-output
@@ -542,12 +531,14 @@ impl DeepSeekV2LiteEp2Generator {
             &rank0_contrib,
             &rank1_contrib,
         )?;
-        let hidden = hidden_from_f32_host(
+        let routed = hidden_from_f32_host(
             &self.rank0.ctx,
             &combined,
             self.config.hidden_size,
             input.seq_len,
         )?;
+        activate(&self.rank0.ctx)?;
+        let hidden = ops::add_batch(&self.rank0.ctx, &routed, &shared)?;
         Ok((hidden, local_routes, remote_routes))
     }
 
@@ -578,14 +569,29 @@ impl DeepSeekV2LiteEp2Generator {
     fn sample_last_token(&self, hidden: &HiddenStates) -> Result<u32> {
         activate(&self.rank0.ctx)?;
         let last = ops::extract_vec(&self.rank0.ctx, hidden, hidden.seq_len - 1)?;
-        let normed = ops::rms_norm(
-            &self.rank0.ctx,
-            &last,
-            &self.rank0.norm,
-            self.config.rms_norm_eps,
-        )?;
+        let normed = self.rms_norm_vec(&last, &self.rank0.norm_host)?;
         let logits = ops::linear(&self.rank0.ctx, &normed, &self.rank0.lm_head)?;
         ops::argmax(&self.rank0.ctx, &logits)
+    }
+
+    fn rms_norm_hidden(&self, hidden: &HiddenStates, weight: &[f32]) -> Result<HiddenStates> {
+        activate(&self.rank0.ctx)?;
+        let input_host = hidden_to_f32(&self.rank0.ctx, hidden)?;
+        let out = rms_norm_hidden_host(&self.config, &input_host, weight, hidden.seq_len);
+        hidden_from_bf16_host(
+            &self.rank0.ctx,
+            &out,
+            self.config.hidden_size,
+            hidden.seq_len,
+        )
+    }
+
+    fn rms_norm_vec(&self, input: &DeviceVec, weight: &[f32]) -> Result<DeviceVec> {
+        activate(&self.rank0.ctx)?;
+        let input_host = input.to_host(&self.rank0.ctx)?;
+        let mut out = vec![bf16::ZERO; input.len];
+        rms_norm_host(&input_host, weight, self.config.rms_norm_eps, &mut out);
+        DeviceVec::from_host(&self.rank0.ctx, &out)
     }
 }
 

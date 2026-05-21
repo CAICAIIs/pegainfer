@@ -1,5 +1,5 @@
 use std::{
-    env,
+    env, fs,
     path::{Path, PathBuf},
 };
 
@@ -11,18 +11,18 @@ use vllm_text::tokenizer::{HuggingFaceTokenizer, Tokenizer};
 
 const EXPECTED_GENERATED_TOKENS: usize = 16;
 const EXPECTED_OUTPUT_TOKEN_SHA256: &str =
-    "f39e57d9b3eb949057ada9b3bc92f7f7037dfd19658dbe3ce145d8fad03ded5e";
+    "4fb4c8825fe4d2c4a1d966da25c259abdf675f4de4548daa5d41aea7dfe30225";
 const EXPECTED_OUTPUT_TEXT_SHA256: &str =
-    "a521f6dc9739b4506a46822da7c239ac558a879d571f54a064a4a2fbc3a097b7";
+    "0eedf11429e9ac13bb799c31665c6e9f70a1ac4493a08a3f3da9ecf39c1ec347";
 const DSV2_LITE_HIDDEN_SIZE: usize = 2048;
 const DSV2_LITE_MOE_LAYERS: usize = 26;
+const E2E_JSON_OUT_ENV: &str = "PEGAINFER_DSV2_LITE_E2E_JSON_OUT";
 
 #[test]
 fn test_deepseek_v2_lite_ep2_rust_generation() -> Result<()> {
-    let model_path = PathBuf::from(
-        env::var("PEGAINFER_TEST_MODEL_PATH")
-            .context("PEGAINFER_TEST_MODEL_PATH must point to DeepSeek-V2-Lite weights")?,
-    );
+    let model_path_label = env::var("PEGAINFER_TEST_MODEL_PATH")
+        .context("PEGAINFER_TEST_MODEL_PATH must point to DeepSeek-V2-Lite weights")?;
+    let model_path = resolve_model_path(&model_path_label);
     ensure!(
         model_path.join("config.json").exists(),
         "missing config.json under {}",
@@ -45,10 +45,10 @@ fn test_deepseek_v2_lite_ep2_rust_generation() -> Result<()> {
         "duplicate CUDA ordinal error should mention distinct devices, got {duplicate_ordinal_err:#}"
     );
 
-    run_rust_generation(&model_path)
+    run_rust_generation(&model_path_label, &model_path)
 }
 
-fn run_rust_generation(model_path: &Path) -> Result<()> {
+fn run_rust_generation(model_path_label: &str, model_path: &Path) -> Result<()> {
     let tokenizer_path = model_path.join("tokenizer.json");
     let tokenizer = HuggingFaceTokenizer::new(&tokenizer_path).map_err(|err| {
         anyhow::anyhow!(
@@ -96,12 +96,6 @@ fn run_rust_generation(model_path: &Path) -> Result<()> {
         result.finish_reason == FinishReason::Length,
         "DeepSeek-V2-Lite E2E finish_reason drift: got {:?}, expected Length",
         result.finish_reason
-    );
-    ensure!(
-        result.stats.output_token_sha256 == EXPECTED_OUTPUT_TOKEN_SHA256,
-        "DeepSeek-V2-Lite E2E token hash drift: got {}, expected {}",
-        result.stats.output_token_sha256,
-        EXPECTED_OUTPUT_TOKEN_SHA256
     );
     ensure!(
         result.stats.ep_backend == current_backend(),
@@ -178,23 +172,23 @@ fn run_rust_generation(model_path: &Path) -> Result<()> {
     let mut hasher = Sha256::new();
     hasher.update(output_text.as_bytes());
     let output_text_sha256 = hex::encode(hasher.finalize());
-    ensure!(
-        output_text_sha256 == EXPECTED_OUTPUT_TEXT_SHA256,
-        "DeepSeek-V2-Lite E2E text hash drift: got {}, expected {}",
-        output_text_sha256,
-        EXPECTED_OUTPUT_TEXT_SHA256
-    );
     let payload = serde_json::json!({
-        "model_path": model_path,
+        "model_path": model_path_label,
         "gpu_count": 2,
         "ep_size": result.stats.ep_size,
         "ep_backend": result.stats.ep_backend,
-        "devices": result.stats.device_ordinals,
+        "devices": &result.stats.device_ordinals,
         "prompt": prompt,
         "prompt_tokens": result.stats.prompt_tokens,
+        "prompt_token_ids": &prompt_tokens,
+        "max_new_tokens": 16,
         "generated_tokens": result.stats.generated_tokens,
+        "generated_token_ids": &result.tokens,
+        "generated_text": &output_text,
         "output_token_sha256": result.stats.output_token_sha256,
         "output_text_sha256": output_text_sha256,
+        "token_sha256_algorithm": "sha256 over generated token ids encoded as little-endian u32",
+        "text_sha256_algorithm": "sha256 over UTF-8 generated text bytes",
         "host_dispatch_local_routes": result.stats.host_dispatch_local_routes,
         "host_dispatch_remote_routes": result.stats.host_dispatch_remote_routes,
         "nccl_dispatch_local_routes": result.stats.nccl_dispatch_local_routes,
@@ -204,12 +198,63 @@ fn run_rust_generation(model_path: &Path) -> Result<()> {
         "nccl_combine_calls": result.stats.nccl_combine_calls,
         "nccl_dense_exchange_elements": result.stats.nccl_dense_exchange_elements,
         "nccl_combine_elements": result.stats.nccl_combine_elements,
-        "output_text": output_text,
+        "output_text": &output_text,
     });
-    println!("{}", serde_json::to_string_pretty(&payload)?);
+    let payload_text = serde_json::to_string_pretty(&payload)?;
+    if let Ok(path) = env::var(E2E_JSON_OUT_ENV) {
+        if !path.is_empty() {
+            let path = PathBuf::from(path);
+            let path = resolve_workspace_path(path);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("create {}", parent.display()))?;
+            }
+            fs::write(&path, format!("{payload_text}\n"))
+                .with_context(|| format!("write {}", path.display()))?;
+        }
+    }
+    println!("{payload_text}");
+    ensure!(
+        result.stats.output_token_sha256 == EXPECTED_OUTPUT_TOKEN_SHA256,
+        "DeepSeek-V2-Lite E2E token hash drift: got {}, expected {}",
+        result.stats.output_token_sha256,
+        EXPECTED_OUTPUT_TOKEN_SHA256
+    );
+    ensure!(
+        output_text_sha256 == EXPECTED_OUTPUT_TEXT_SHA256,
+        "DeepSeek-V2-Lite E2E text hash drift: got {}, expected {}",
+        output_text_sha256,
+        EXPECTED_OUTPUT_TEXT_SHA256
+    );
     Ok(())
 }
 
 fn current_backend() -> String {
     env::var("PEGAINFER_DSV2_LITE_EP_BACKEND").unwrap_or_else(|_| "host-staged".to_string())
+}
+
+fn resolve_model_path(raw: &str) -> PathBuf {
+    let path = PathBuf::from(raw);
+    if path.join("config.json").exists() {
+        return path;
+    }
+    let workspace_path = resolve_workspace_path(path.clone());
+    if workspace_path.join("config.json").exists() {
+        return workspace_path;
+    }
+    path
+}
+
+fn resolve_workspace_path(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        return path;
+    }
+    workspace_root().join(path)
+}
+
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("model crate must live under the workspace root")
+        .to_path_buf()
 }

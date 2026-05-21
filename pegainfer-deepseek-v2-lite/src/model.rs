@@ -1,13 +1,13 @@
 use std::{collections::HashMap, path::Path};
 
 use anyhow::{Result, bail, ensure};
+use half::bf16;
 use pegainfer_core::{
     ops,
-    tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates},
-    weight_loader::{
-        deserialize_shards, load_shard_info, load_tensor_1d, load_tensor_2d, mmap_shards,
-    },
+    tensor::{DeviceContext, DeviceMatrix, HiddenStates},
+    weight_loader::{deserialize_shards, load_shard_info, load_tensor_2d, mmap_shards},
 };
+use safetensors::Dtype;
 
 use crate::{Config, device::activate, ep::ExpertParallelLayout};
 
@@ -16,7 +16,7 @@ pub(crate) struct DriverRankModel {
     pub(crate) layout: ExpertParallelLayout,
     pub(crate) embed_tokens: DeviceMatrix,
     pub(crate) lm_head: DeviceMatrix,
-    pub(crate) norm: DeviceVec,
+    pub(crate) norm_host: Vec<f32>,
     pub(crate) layers: Vec<LayerWeights>,
 }
 
@@ -27,8 +27,8 @@ pub(crate) struct ExpertRankModel {
 }
 
 pub(crate) struct LayerWeights {
-    pub(crate) input_layernorm: DeviceVec,
-    pub(crate) post_attention_layernorm: DeviceVec,
+    pub(crate) input_layernorm_host: Vec<f32>,
+    pub(crate) post_attention_layernorm_host: Vec<f32>,
     pub(crate) attention: AttentionWeights,
     pub(crate) mlp: MlpWeights,
 }
@@ -52,7 +52,7 @@ pub(crate) struct DenseMlp {
 }
 
 pub(crate) struct MoeMlp {
-    pub(crate) gate: DeviceMatrix,
+    pub(crate) gate_host: Vec<f32>,
     pub(crate) shared: DenseMlp,
     pub(crate) experts: Vec<ExpertMlp>,
 }
@@ -80,31 +80,27 @@ impl DriverRankModel {
                 "DeepSeek-V2-Lite first gate expects untied lm_head"
             );
             let lm_head = load_tensor_2d(&ctx, shards, weight_map, "lm_head.weight")?;
-            let norm = load_tensor_1d(&ctx, shards, weight_map, "model.norm.weight")?;
+            let norm_host = load_tensor_1d_host(shards, weight_map, "model.norm.weight")?;
 
             let mut layers = Vec::with_capacity(config.num_hidden_layers);
             for layer_idx in 0..config.num_hidden_layers {
                 let prefix = format!("model.layers.{layer_idx}");
-                let input_layernorm = load_tensor_1d(
-                    &ctx,
+                let input_layernorm_host = load_tensor_1d_host(
                     shards,
                     weight_map,
                     &format!("{prefix}.input_layernorm.weight"),
                 )?;
-                let post_attention_layernorm = load_tensor_1d(
-                    &ctx,
+                let post_attention_layernorm_host = load_tensor_1d_host(
                     shards,
                     weight_map,
                     &format!("{prefix}.post_attention_layernorm.weight"),
                 )?;
                 let attn = format!("{prefix}.self_attn");
-                let kv_a_norm = load_tensor_1d(
-                    &ctx,
+                let kv_a_norm_host = load_tensor_1d_host(
                     shards,
                     weight_map,
                     &format!("{attn}.kv_a_layernorm.weight"),
                 )?;
-                let kv_a_norm_host = kv_a_norm.to_host(&ctx)?;
                 let attention = AttentionWeights {
                     q_proj: load_tensor_2d(
                         &ctx,
@@ -146,8 +142,8 @@ impl DriverRankModel {
                     MlpWeights::Dense(load_dense_mlp(&ctx, shards, weight_map, &mlp_prefix)?)
                 };
                 layers.push(LayerWeights {
-                    input_layernorm,
-                    post_attention_layernorm,
+                    input_layernorm_host,
+                    post_attention_layernorm_host,
                     attention,
                     mlp,
                 });
@@ -158,7 +154,7 @@ impl DriverRankModel {
                 layout,
                 embed_tokens,
                 lm_head,
-                norm,
+                norm_host,
                 layers,
             })
         })
@@ -298,14 +294,82 @@ fn load_moe_mlp(
     layout: &ExpertParallelLayout,
     prefix: &str,
 ) -> Result<MoeMlp> {
-    let gate = load_tensor_2d(ctx, shards, weight_map, &format!("{prefix}.gate.weight"))?;
+    let gate_host = load_tensor_2d_host(shards, weight_map, &format!("{prefix}.gate.weight"))?;
     let shared = load_dense_mlp(ctx, shards, weight_map, &format!("{prefix}.shared_experts"))?;
     let experts = load_owned_experts(ctx, shards, weight_map, config, layout, prefix)?;
     Ok(MoeMlp {
-        gate,
+        gate_host,
         shared,
         experts,
     })
+}
+
+fn load_tensor_1d_host(
+    shards: &[safetensors::SafeTensors<'_>],
+    weight_map: &HashMap<String, usize>,
+    name: &str,
+) -> Result<Vec<f32>> {
+    load_bf16_tensor_host(shards, weight_map, name, 1)
+}
+
+fn load_tensor_2d_host(
+    shards: &[safetensors::SafeTensors<'_>],
+    weight_map: &HashMap<String, usize>,
+    name: &str,
+) -> Result<Vec<f32>> {
+    load_bf16_tensor_host(shards, weight_map, name, 2)
+}
+
+fn load_bf16_tensor_host(
+    shards: &[safetensors::SafeTensors<'_>],
+    weight_map: &HashMap<String, usize>,
+    name: &str,
+    expected_rank: usize,
+) -> Result<Vec<f32>> {
+    let tensor = find_tensor(shards, weight_map, name)?;
+    let shape = tensor.shape();
+    ensure!(
+        tensor.dtype() == Dtype::BF16,
+        "tensor {name} expected BF16, got {:?}",
+        tensor.dtype()
+    );
+    ensure!(
+        shape.len() == expected_rank,
+        "tensor {name} expected {expected_rank}D, got {shape:?}"
+    );
+    let elem_count = shape.iter().product::<usize>();
+    let expected_bytes = elem_count * std::mem::size_of::<bf16>();
+    ensure!(
+        tensor.data().len() == expected_bytes,
+        "tensor {name} expected {expected_bytes} bf16 bytes, got {}",
+        tensor.data().len()
+    );
+    Ok(tensor
+        .data()
+        .chunks_exact(std::mem::size_of::<bf16>())
+        .map(|bytes| {
+            let bits = u16::from_le_bytes([bytes[0], bytes[1]]);
+            bf16::from_bits(bits).to_f32()
+        })
+        .collect())
+}
+
+fn find_tensor<'a>(
+    shards: &'a [safetensors::SafeTensors<'a>],
+    weight_map: &HashMap<String, usize>,
+    name: &str,
+) -> Result<safetensors::tensor::TensorView<'a>> {
+    if let Some(&idx) = weight_map.get(name) {
+        return shards[idx]
+            .tensor(name)
+            .map_err(|err| anyhow::anyhow!("failed to load tensor {name}: {err}"));
+    }
+    for shard in shards {
+        if let Ok(tensor) = shard.tensor(name) {
+            return Ok(tensor);
+        }
+    }
+    bail!("tensor {name} not found in any shard")
 }
 
 fn load_owned_experts(

@@ -38,7 +38,7 @@ __global__ void deinterleave_qkv_kernel(
 // Column-major: token j at offset j * 2*I.
 //   gate = combined[j * 2*I + i]     for i in [0, I)
 //   up   = combined[j * 2*I + I + i] for i in [0, I)
-//   out[j * I + i] = silu(gate) * up
+//   out[j * I + i] = bf16(silu(gate)) * up, rounded to bf16
 // ============================================================================
 
 __global__ void silu_mul_fused_kernel(
@@ -58,7 +58,8 @@ __global__ void silu_mul_fused_kernel(
     float u = __bfloat162float(gate_up[src_offset + intermediate_size + row]);
 
     float silu_g = g / (1.0f + expf(-g));
-    out[idx] = __float2bfloat16(silu_g * u);
+    float silu_bf16 = __bfloat162float(__float2bfloat16(silu_g));
+    out[idx] = __float2bfloat16(silu_bf16 * u);
   }
 }
 

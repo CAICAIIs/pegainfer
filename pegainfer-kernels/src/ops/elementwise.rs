@@ -161,3 +161,75 @@ pub fn write_vec_into(
         .map_err(|e| anyhow!("Device copy failed: {}", e))?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use half::bf16;
+
+    fn hidden_from_host(
+        ctx: &DeviceContext,
+        data: &[bf16],
+        hidden_dim: usize,
+        seq_len: usize,
+    ) -> Result<HiddenStates> {
+        Ok(HiddenStates {
+            data: ctx.stream.clone_htod(data)?,
+            hidden_dim,
+            seq_len,
+        })
+    }
+
+    fn hidden_to_host(ctx: &DeviceContext, hidden: &HiddenStates) -> Result<Vec<bf16>> {
+        let host = ctx.stream.clone_dtoh(&hidden.data)?;
+        ctx.sync()?;
+        Ok(host)
+    }
+
+    #[test]
+    fn silu_mul_fused_matches_split_bf16_rounding() -> Result<()> {
+        let ctx = DeviceContext::new()?;
+        let hidden_dim = 4;
+        let seq_len = 3;
+        let gate: Vec<_> = [
+            -3.0, -1.5, 0.0, 2.0, 0.25, 1.0, 3.5, -0.75, 8.0, -8.0, 0.125, -0.5,
+        ]
+        .into_iter()
+        .map(bf16::from_f32)
+        .collect();
+        let up: Vec<_> = [
+            0.5, -2.0, 4.0, 1.25, -1.0, 0.75, 2.5, -3.0, 0.25, 1.5, -0.625, 5.0,
+        ]
+        .into_iter()
+        .map(bf16::from_f32)
+        .collect();
+        let mut gate_up = Vec::with_capacity(2 * hidden_dim * seq_len);
+        for token in 0..seq_len {
+            let offset = token * hidden_dim;
+            gate_up.extend_from_slice(&gate[offset..offset + hidden_dim]);
+            gate_up.extend_from_slice(&up[offset..offset + hidden_dim]);
+        }
+
+        let gate_hidden = hidden_from_host(&ctx, &gate, hidden_dim, seq_len)?;
+        let up_hidden = hidden_from_host(&ctx, &up, hidden_dim, seq_len)?;
+        let gate_up_hidden = hidden_from_host(&ctx, &gate_up, 2 * hidden_dim, seq_len)?;
+        let split = silu_mul_batch(&ctx, &gate_hidden, &up_hidden)?;
+        let mut fused = HiddenStates::zeros(&ctx, hidden_dim, seq_len)?;
+
+        silu_mul_fused_batch_into(&ctx, &gate_up_hidden, &mut fused);
+
+        let split_host = hidden_to_host(&ctx, &split)?;
+        let fused_host = hidden_to_host(&ctx, &fused)?;
+        assert_eq!(split_host.len(), fused_host.len());
+        for (idx, (split_value, fused_value)) in
+            split_host.iter().zip(fused_host.iter()).enumerate()
+        {
+            assert_eq!(
+                split_value.to_bits(),
+                fused_value.to_bits(),
+                "fused/split silu_mul mismatch at index {idx}"
+            );
+        }
+        Ok(())
+    }
+}
