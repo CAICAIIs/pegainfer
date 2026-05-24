@@ -73,6 +73,8 @@ fn main() -> Result<()> {
     );
 
     let by_section = attribution.by_section();
+    let by_gpu_section = attribution.by_gpu_section();
+    let by_gpu_call_site = attribution.by_gpu_call_site();
     let by_op: Vec<Value> = by_section
         .iter()
         .map(|row| {
@@ -129,14 +131,24 @@ fn main() -> Result<()> {
             "per_token_decode_us": attribution.per_token_decode_us(),
             "per_token_decode_stats": latency_stats(attribution.per_token_decode_us()),
         },
-        "attribution_source": "DeepSeekV2LiteEp2Generator::generate_greedy_with_attribution; GPU/NCCL work is timed from the host and synchronized only where the existing runtime already synchronizes.",
+        "attribution_source": "DeepSeekV2LiteEp2Generator::generate_greedy_with_attribution; CPU sections use host wall-clock timers, and selected GPU/NCCL sections also carry CUDA event timing plus optional NVTX ranges.",
+        "gpu_timing": {
+            "source": "CUDA event timing around selected DeepSeek-V2-Lite EP2 GPU/NCCL stream sections in the explicit attribution path",
+            "sample_count": attribution.gpu_sample_count(),
+            "failure_count": attribution.gpu_timing_failure_count(),
+            "nvtx_enabled": attribution.nvtx_enabled(),
+            "nvtx_range_count": attribution.nvtx_range_count(),
+            "scope": "selected GPU/NCCL sections only; host routing, host accumulation, and the mixed attention_host_path remain CPU-side attribution rows; GPU timing failures do not replace the token/text hash oracle; NVTX range wall time is only a profiler correlation marker and may include host/event overhead",
+        },
         "schedule_source": "fixed DeepSeek-V2-Lite EP2 greedy gate: prompt=Hello, output_len=16, cuda_graph=false, device_ordinals=[0,1]",
         "by_section": by_section,
         "by_op": by_op,
         "by_call_site": attribution.by_call_site(),
-        "coverage": coverage_rows(&result.stats.ep_backend),
+        "by_gpu_section": by_gpu_section,
+        "by_gpu_call_site": by_gpu_call_site,
+        "coverage": coverage_rows(&result.stats.ep_backend, &attribution),
         "ep": ep_report(&result.stats),
-        "claim_boundary": "Attribution only for the covered EP2 Hello/16 decode gate. CPU-side section timing and route/collective counts are not a throughput, GPU-kernel-event, sparse-dispatch, multi-node, or production EP readiness claim.",
+        "claim_boundary": "Attribution only for the covered EP2 Hello/16 decode gate. CPU-side section timing, selected CUDA event timing, NVTX ranges, and route/collective counts are not a throughput, sparse-dispatch, multi-node, or production EP readiness claim.",
     });
 
     let text = serde_json::to_string_pretty(&report)?;
@@ -214,7 +226,10 @@ fn ep_report(stats: &pegainfer_deepseek_v2_lite::GenerationStats) -> Value {
     })
 }
 
-fn coverage_rows(backend: &str) -> Vec<Value> {
+fn coverage_rows(
+    backend: &str,
+    attribution: &pegainfer_deepseek_v2_lite::DecodeAttributionProfile,
+) -> Vec<Value> {
     vec![
         json!({
             "item": "accuracy.token_text_hash",
@@ -233,8 +248,13 @@ fn coverage_rows(backend: &str) -> Vec<Value> {
         }),
         json!({
             "item": "gpu_event_timing",
-            "status": "not_covered",
-            "source": "first gate intentionally avoids intrusive CUDA event timing in the DeepSeek runtime",
+            "status": gpu_timing_status(attribution),
+            "source": "CUDA event timing around selected GPU/NCCL stream sections; pure host sections and mixed attention_host_path are not represented as GPU event rows; failures are counted separately from the accuracy oracle",
+        }),
+        json!({
+            "item": "nvtx_ranges",
+            "status": if attribution.nvtx_enabled() { "emitted" } else { "available_when_enabled" },
+            "source": "set PEGAINFER_DSV2_LITE_NVTX=1 to emit NVTX ranges for the same selected GPU/NCCL attribution sections",
         }),
         json!({
             "item": "throughput_or_production_ep_readiness",
@@ -242,6 +262,18 @@ fn coverage_rows(backend: &str) -> Vec<Value> {
             "source": "single batch=1 prompt=Hello output_len=16 diagnostic gate only",
         }),
     ]
+}
+
+fn gpu_timing_status(attribution: &pegainfer_deepseek_v2_lite::DecodeAttributionProfile) -> &str {
+    match (
+        attribution.gpu_sample_count(),
+        attribution.gpu_timing_failure_count(),
+    ) {
+        (0, 0) => "not_covered",
+        (0, _) => "timing_failed",
+        (_, 0) => "measured",
+        (_, _) => "measured_with_failures",
+    }
 }
 
 fn latency_stats(samples: &[u64]) -> Value {

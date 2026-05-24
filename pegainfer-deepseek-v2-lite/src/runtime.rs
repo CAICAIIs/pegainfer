@@ -444,7 +444,8 @@ impl DeepSeekV2LiteEp2Generator {
             || self.attention_forward(&normed, &layer.attention, start_pos, cache),
         )?;
         activate(&self.rank0.ctx)?;
-        let attn_projected = attribution.record_result(
+        let attn_projected = attribution.record_gpu_result(
+            &self.rank0.ctx,
             phase,
             "gpu_o_proj_enqueue",
             || format!("layer.{layer_idx}.attention_o_proj"),
@@ -452,7 +453,8 @@ impl DeepSeekV2LiteEp2Generator {
             token_index,
             || ops::gemm(&self.rank0.ctx, &layer.attention.o_proj, &attn),
         )?;
-        let after_attn = attribution.record_result(
+        let after_attn = attribution.record_gpu_result(
+            &self.rank0.ctx,
             phase,
             "gpu_residual_add_enqueue",
             || format!("layer.{layer_idx}.attention_residual_add"),
@@ -472,7 +474,8 @@ impl DeepSeekV2LiteEp2Generator {
 
         let (ffn_out, local_routes, remote_routes) = match &layer.mlp {
             MlpWeights::Dense(dense) => (
-                attribution.record_result(
+                attribution.record_gpu_result(
+                    &self.rank0.ctx,
                     phase,
                     "dense_mlp_enqueue",
                     || format!("layer.{layer_idx}.dense_mlp"),
@@ -501,7 +504,8 @@ impl DeepSeekV2LiteEp2Generator {
             }
         };
         stats.record_routes(self.backend.kind(), local_routes, remote_routes);
-        attribution.record_result(
+        attribution.record_gpu_result(
+            &self.rank0.ctx,
             phase,
             "gpu_residual_add_enqueue",
             || format!("layer.{layer_idx}.ffn_residual_add"),
@@ -615,7 +619,8 @@ impl DeepSeekV2LiteEp2Generator {
             },
         )?;
 
-        let shared = attribution.record_result(
+        let shared = attribution.record_gpu_result(
+            &self.rank0.ctx,
             phase,
             "shared_expert_enqueue",
             || format!("layer.{layer_idx}.shared_expert"),
@@ -637,7 +642,13 @@ impl DeepSeekV2LiteEp2Generator {
                 } else {
                     "host_staged_remote_dispatch"
                 };
-                let (out, is_remote) = attribution.record_result(
+                let expert_ctx = if owner_rank == 0 {
+                    &self.rank0.ctx
+                } else {
+                    &self.rank1.ctx
+                };
+                let (out, is_remote) = attribution.record_gpu_result(
+                    expert_ctx,
                     phase,
                     section,
                     || format!("layer.{layer_idx}.{section}"),
@@ -670,7 +681,8 @@ impl DeepSeekV2LiteEp2Generator {
             }
         }
 
-        let routed = attribution.record_result(
+        let routed = attribution.record_gpu_result(
+            &self.rank0.ctx,
             phase,
             "host_staged_combine_to_device",
             || format!("layer.{layer_idx}.host_staged.combine_to_device"),
@@ -686,7 +698,8 @@ impl DeepSeekV2LiteEp2Generator {
             },
         )?;
         activate(&self.rank0.ctx)?;
-        let hidden = attribution.record_result(
+        let hidden = attribution.record_gpu_result(
+            &self.rank0.ctx,
             phase,
             "shared_plus_routed_enqueue",
             || format!("layer.{layer_idx}.shared_plus_routed"),
@@ -725,7 +738,8 @@ impl DeepSeekV2LiteEp2Generator {
             },
         )?;
 
-        let shared = attribution.record_result(
+        let shared = attribution.record_gpu_result(
+            &self.rank0.ctx,
             phase,
             "shared_expert_enqueue",
             || format!("layer.{layer_idx}.shared_expert"),
@@ -738,7 +752,9 @@ impl DeepSeekV2LiteEp2Generator {
         // NCCL covers only the dense hidden exchange and final contribution
         // sum in this first gate. Route iteration and expert-output
         // accumulation stay host-side so host-staged remains a simple oracle.
-        let rank1_input = attribution.record_result(
+        let rank1_input = attribution.record_gpu_pair_result(
+            &self.rank0.ctx,
+            &self.rank1.ctx,
             phase,
             "nccl_dense_exchange",
             || format!("layer.{layer_idx}.nccl.dense_exchange"),
@@ -757,7 +773,8 @@ impl DeepSeekV2LiteEp2Generator {
                         local_routes += 1;
                         let expert = self.rank0.routed_expert(layer_idx, global_expert)?;
                         (
-                            attribution.record_result(
+                            attribution.record_gpu_result(
+                                &self.rank0.ctx,
                                 phase,
                                 "nccl_local_expert",
                                 || format!("layer.{layer_idx}.nccl.local_expert"),
@@ -772,7 +789,8 @@ impl DeepSeekV2LiteEp2Generator {
                         remote_routes += 1;
                         let expert = self.rank1.routed_expert(layer_idx, global_expert)?;
                         (
-                            attribution.record_result(
+                            attribution.record_gpu_result(
+                                &self.rank1.ctx,
                                 phase,
                                 "nccl_remote_expert",
                                 || format!("layer.{layer_idx}.nccl.remote_expert"),
@@ -814,7 +832,9 @@ impl DeepSeekV2LiteEp2Generator {
             }
         }
 
-        let combined = attribution.record_result(
+        let combined = attribution.record_gpu_pair_result(
+            &self.rank0.ctx,
+            &self.rank1.ctx,
             phase,
             "nccl_combine",
             || format!("layer.{layer_idx}.nccl.combine"),
@@ -829,7 +849,8 @@ impl DeepSeekV2LiteEp2Generator {
                 )
             },
         )?;
-        let routed = attribution.record_result(
+        let routed = attribution.record_gpu_result(
+            &self.rank0.ctx,
             phase,
             "nccl_combine_to_device",
             || format!("layer.{layer_idx}.nccl.combine_to_device"),
@@ -845,7 +866,8 @@ impl DeepSeekV2LiteEp2Generator {
             },
         )?;
         activate(&self.rank0.ctx)?;
-        let hidden = attribution.record_result(
+        let hidden = attribution.record_gpu_result(
+            &self.rank0.ctx,
             phase,
             "shared_plus_routed_enqueue",
             || format!("layer.{layer_idx}.shared_plus_routed"),

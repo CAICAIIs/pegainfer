@@ -17,6 +17,7 @@ half = { workspace = true }
 hex = { workspace = true }
 libloading = "0.9"
 memmap2 = { workspace = true }
+nvtx = { workspace = true }
 pegainfer-core = { workspace = true }
 pegainfer-engine = { workspace = true }
 safetensors = { workspace = true }
