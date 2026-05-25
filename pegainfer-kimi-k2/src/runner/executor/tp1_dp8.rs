@@ -49,11 +49,8 @@ impl ForwardExecutor for Tp1Dp8ForwardExecutor {
                 slots.len()
             );
         }
-        let mut reports = Vec::with_capacity(token_ids.len());
-        for (&token_id, &slot) in token_ids.iter().zip(slots.iter()) {
-            reports.push(self.forward_prefill(&[token_id], slot, decode_batch_size, 0)?);
-        }
-        Ok(reports)
+        let append_positions = vec![0; token_ids.len()];
+        self.forward_decode_batch(token_ids, &append_positions, slots, decode_batch_size)
     }
 
     fn forward_decode_batch(

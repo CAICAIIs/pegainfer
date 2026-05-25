@@ -307,11 +307,7 @@ impl DpCoordinator {
                             "Kimi-K2 DP rank {r} returned decode result during prefill"
                         ));
                     }
-                    Err(_) => {
-                        padding_errors.push(format!(
-                            "Kimi-K2 DP rank {r} dropped prefill result channel"
-                        ));
-                    }
+                    Err(_) => abort_dropped_result_channel(r, "prefill"),
                 }
             }
         }
@@ -327,7 +323,18 @@ impl DpCoordinator {
                 });
                 return;
             }
-            _ => return,
+            Ok(StepResult::Decode(_)) => {
+                let message =
+                    format!("Kimi-K2 DP rank {dp_rank} returned decode result during prefill");
+                eprintln!("kimi-k2: {message}");
+                let _ = req.token_tx.send(TokenEvent::Error {
+                    message,
+                    prompt_tokens: prompt_len,
+                    completion_tokens: 0,
+                });
+                return;
+            }
+            Err(_) => abort_dropped_result_channel(dp_rank, "prefill"),
         };
 
         if !padding_errors.is_empty() {
@@ -411,8 +418,15 @@ impl DpCoordinator {
         for (dp_rank, rows) in rows_by_rank.into_iter().enumerate() {
             let result = match self.result_rxs[dp_rank].recv() {
                 Ok(StepResult::Decode(result)) => result,
-                Ok(StepResult::Prefill(_)) => continue,
-                Err(_) => continue,
+                Ok(StepResult::Prefill(_)) => {
+                    let message = format!(
+                        "Kimi-K2 DP rank {dp_rank} returned prefill result during prompt_len1 decode"
+                    );
+                    eprintln!("kimi-k2: {message}");
+                    self.fail_prompt_len1_rows(dp_rank, rows, message);
+                    continue;
+                }
+                Err(_) => abort_dropped_result_channel(dp_rank, "prompt_len1 decode"),
             };
 
             if rows.is_empty() {
@@ -566,7 +580,15 @@ impl DpCoordinator {
                     self.ranks[dp_rank].fail_all_active(&err);
                     continue;
                 }
-                _ => continue,
+                Ok(StepResult::Prefill(_)) => {
+                    let err = anyhow::anyhow!(
+                        "Kimi-K2 DP rank {dp_rank} returned prefill result during decode"
+                    );
+                    eprintln!("kimi-k2: {err:#}");
+                    self.ranks[dp_rank].fail_all_active(&err);
+                    continue;
+                }
+                Err(_) => abort_dropped_result_channel(dp_rank, "decode"),
             };
 
             self.ranks[dp_rank].process_decode_results(result);
@@ -737,6 +759,11 @@ fn send_step_command(
         eprintln!("kimi-k2: fatal: DP rank {dp_rank} forward thread dropped before {phase}");
         std::process::abort();
     }
+}
+
+fn abort_dropped_result_channel(dp_rank: usize, phase: &str) -> ! {
+    eprintln!("kimi-k2: fatal: DP rank {dp_rank} forward thread dropped during {phase}");
+    std::process::abort();
 }
 
 fn rank_forward_loop(

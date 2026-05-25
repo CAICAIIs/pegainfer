@@ -247,6 +247,9 @@ Correctness:
 - Smoke generated all 5 tokens for every request without PPLX collective mismatch or slot-state failure.
 - bs8/o8 deterministic smoke generated `8/8` full traces with one hash,
   `/tmp/kimi-tp1dp8/prompt1_decode_admission_bs8_o8_correctness.json`.
+- Scope: this proves scheduler/collective/slot safety for the prompt_len1 decode-admission path.
+  It is not a full TP1 DP8 token-parity gate against vLLM or TP8 DP1; that reference trace still
+  needs explicit mismatch counts before this shape becomes an accuracy baseline.
 - Local coordinator tests cover sparse logical slots, prompt_len1 admission mixed with active rows,
   padding decode arena capacity, and ordinary prefill padding slot selection:
 
@@ -311,8 +314,9 @@ Mechanism:
   8 and local batch `9` uses bucket 16.
 - DP coordination pads every rank to the maximum padded size when CUDA Graph is
   active (`vllm/v1/worker/dp_utils.py:78-88,148-160`;
-  `gpu_model_runner.py:3616-3637`). One rank at 9 therefore makes the whole DP group
-  execute bucket 16.
+  `gpu_model_runner.py:3616-3637`, verified on h20-100
+  `/root/develop/xingming/vllm_test/.venv/lib/python3.10/site-packages/vllm/v1/worker/gpu_model_runner.py`).
+  One rank at 9 therefore makes the whole DP group execute bucket 16.
 
 Decision for vLLM interpretation: the surprising 2x TPOT is a DPLB plus DP CUDA
 Graph padding cliff. Out-of-box sustained serving is correctly reported as
@@ -322,10 +326,11 @@ benchmarks.
 
 Decision:
 
-- Keep. O1 moves prompt_len=1 onto the correct decode shape and clears the current H20
-  vLLM bs64 TPOT/output gate. Follow-up profiles should focus on lowering pegainfer service
-  TPOT from `47ms` toward the H200-reported 30ms-class expectation if that target is confirmed
-  on comparable hardware.
+- Keep as the current H20 bs64 performance baseline. O1 moves prompt_len=1 onto the decode
+  shape and clears the vLLM bs64 TPOT/output gate; full token-parity correctness remains a
+  separate reference gate before using TP1 DP8 as an accuracy baseline. Follow-up profiles should
+  focus on lowering pegainfer service TPOT from `47ms` toward the H200-reported 30ms-class
+  expectation if that target is confirmed on comparable hardware.
 
 ## Open Questions
 
@@ -333,6 +338,8 @@ Decision:
   DPLB/CUDA-graph bucket cliff above. The remembered 30ms-class TPOT is still not
   reproduced on H20; it may have been measured on H200 or with a different vLLM
   build/version/runtime flag set.
+- TP1 DP8 prompt_len1 still needs a full reference token-parity run with mismatch counts.
+  The current evidence is scheduler safety plus deterministic smoke.
 - `vllm bench serve` can report `max_concurrent_requests=128` while the command uses
   `--max-concurrency 64`. Source inspection shows the client semaphore is real, but
   `max_concurrent_requests` is computed from one-second buckets and counts both
