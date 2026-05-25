@@ -274,6 +274,20 @@ impl EpBackend {
             .map_err(Error::from_anyhow)
     }
 
+    /// Step 2 metadata-only variant for callers that do not consume the
+    /// dispatched token payload. It preserves the all-to-all protocol and
+    /// populates the local per-expert token counts, but skips copying
+    /// received hidden states into an output tensor.
+    pub fn dispatch_recv_counts(
+        &mut self,
+        out_num_tokens_ptr: *mut i32,
+        stream: u64,
+    ) -> Result<()> {
+        self.inner
+            .dispatch_recv_counts(out_num_tokens_ptr, stream)
+            .map_err(Error::from_anyhow)
+    }
+
     /// Step 3 (combine): scatter expert outputs back onto the fabric.
     pub fn combine_send(
         &mut self,

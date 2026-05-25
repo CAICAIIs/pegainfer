@@ -103,6 +103,22 @@ mod ffi {
             stream: u64,
         ) -> i32;
 
+        unsafe fn a2a_dispatch_recv_counts(
+            num_experts: usize,
+            rank: usize,
+            node_size: usize,
+            world_size: usize,
+            out_num_tokens_ptr: *mut i32,
+            tokens_per_expert: *mut u32,
+            num_recv_tokens_flag: *mut u8,
+            dispatch_recv_flag: *mut u8,
+            dispatch_recv_done: *mut u8,
+            grid_counter: *mut u32,
+            sync_counter: *mut u32,
+            sync_ptrs: *mut *mut u32,
+            stream: u64,
+        ) -> i32;
+
         unsafe fn a2a_combine_send(
             num_blocks: usize,
             hidden_dim: usize,
@@ -161,5 +177,5 @@ mod ffi {
 
 pub use ffi::{
     ScalarType, a2a_combine_recv, a2a_combine_send, a2a_dispatch_recv,
-    a2a_dispatch_send,
+    a2a_dispatch_recv_counts, a2a_dispatch_send,
 };

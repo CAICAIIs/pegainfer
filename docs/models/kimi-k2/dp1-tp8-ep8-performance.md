@@ -189,6 +189,7 @@ PEGAINFER_KIMI_PARALLEL=tp8dp1 \
 | O2 | 2026-05-25 | this commit | scheduler / MLA prefill | Replace prompt_len=1 first-token MLA attention with the exact single-token V path; keep microbatch at 1 because seq_len>1 drifted | `/tmp/kimi_pplx_tp8_c1fast_mb1_o5.json` vs `/tmp/kimi_nccl_tp8_active64_o5_final.json`: 0 mismatches; hash counter `32x 7c4c5d83355198fd`, `32x 9eecc1ca6fb3409d` | `/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_fastmb1_candidate.json`: output `414.28 tok/s`, TPOT p50/p95/p99 `133.36/147.74/149.42ms`, TTFT p50/p99 `2.76/6.90s`, 256/256 success | Keep as an incremental first-token optimization; still below vLLM, next work must make batch>1 prompt_len=1 prefill correct or reduce PPLX TPOT |
 | O3 | 2026-05-25 | this commit | scheduler / prompt_len=1 prefill | Reuse prompt_len=1 dense/shared/router/Marlin scratch for the single-row prefill path, and widen the fixed admission coalesce window to `100ms` so bs64 pressure is admitted as one wave | `/tmp/kimi_pplx_tp8_o3_scratch_coalesce_o5.json` vs `/tmp/kimi_nccl_tp8_active64_o5_final.json`: 0 mismatches; hash counter `32x 7c4c5d83355198fd`, `32x 9eecc1ca6fb3409d` | `/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_o3_scratch_coalesce_candidate.json`: output `492.34 tok/s`, TPOT p50/p95/p99 `121.05/124.99/125.58ms`, TTFT p50/p99 `0.67/3.96s`, 256/256 success | Keep as a measured bs64 improvement; still below vLLM, next work should attack service TPOT/ITL and PPLX steady decode |
 | O5 | 2026-05-25 | this commit | PPLX / MoE stream overlap | Start the PPLX decode router on the aux stream immediately after RMSNorm, matching the NCCL decode overlap window instead of waiting for shared expert/all-reduce | `/tmp/kimi_pplx_tp8_o5_router_overlap_o5.json` vs `/tmp/kimi_nccl_tp8_active64_o5_final.json`: 0 mismatches; hash counter `32x 7c4c5d83355198fd`, `32x 9eecc1ca6fb3409d` | `/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_o5_router_overlap_candidate.json`: output `509.89 tok/s`, TPOT p50/p95/p99 `116.53/120.45/121.44ms`, TTFT p50/p99 `0.67/3.95s`, 256/256 success | Keep as a measured PPLX decode improvement; still below vLLM, next work should remove PPLX TP8 dispatch/copy overhead |
+| O7 | 2026-05-25 | this commit | PPLX / dispatch recv | Add a metadata/counts-only `dispatch_recv` path for TP8 decode, where local experts no longer consume the dispatched hidden payload | `/tmp/kimi_pplx_tp8_counts_recv_short_v2.json` vs `/tmp/kimi_nccl_tp8_active64_o5_final.json`: 0 mismatches; hash counter `32x 7c4c5d83355198fd`, `32x 9eecc1ca6fb3409d` | `/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_counts_recv_v2.json`: output `511.78 tok/s`, TPOT p50/p95/p99 `115.83/120.26/121.26ms`, TTFT p50/p99 `0.67/4.07s`, 256/256 success; in-process bs64/o128 reached `589.98 tok/s`, TPOT p50 `101.58ms` | Keep as a measured PPLX decode improvement; still below vLLM service target, next work should remove dispatch-send payload or compact scatter |
 
 ### B1 Profile Notes
 
@@ -783,13 +784,149 @@ competition cost more than the overlap buys. Keep O5's router-only overlap and
 focus next on removing PPLX dispatch/copy work or compact scatter rather than
 moving the whole routed path to a separate stream.
 
+### O7 PPLX Decode Counts-Only Dispatch Recv
+
+Profile:
+
+```text
+/tmp/kimi-profile/0ba76a6-counts-recv/pplx_a2a_normal_tok64.log
+/tmp/kimi-profile/0ba76a6-counts-recv/pplx_a2a_counts_only_tok64.log
+/tmp/kimi-profile/0ba76a6-counts-recv-v2/pplx_a2a_normal_tok64_canon.log
+/tmp/kimi-profile/0ba76a6-counts-recv-v2/pplx_a2a_counts_only_tok64_canon.log
+/tmp/kimi-profile/f779a66/nsys_o5_bs64_o128/cuda_gpu_kern_sum.txt
+```
+
+Observed:
+
+- O5 nsys and `pplx_a2a_bench` both show decode still spends time in
+  `dispatch_recv` even though the TP8 correctness path computes local experts
+  from NCCL-layout `scratch.mla.normed`, not from `pplx_recv_hidden`.
+- The normal Kimi tok64 A2A probe measured `dispatch_recv_us` p50/p95/p99
+  `22.14/29.31/35.39us` and `max_rank_split_us` p50/p95/p99
+  `163.0/174.7/181.2us`.
+- The final v2 A2A probe uses `canonicalize_duplicate_sources=true`, matching
+  the Kimi TP8 production PPLX bootstrap.
+
+Motivation / expected gain:
+
+For `comm.is_some()` TP8 decode, PPLX dispatch is still needed to build and
+exchange routing metadata (`num_routed`, worker offsets, `padded_index`,
+`combine_send_offset`) and to keep the protocol state machine intact. The
+received hidden payload and dispatch weight buffer are not consumed on this
+path. A counts-only `dispatch_recv` should preserve protocol flags and local
+expert counts while skipping the unused hidden copy. Expected gain: about
+`10us` on the A2A split and a sub-millisecond but measurable bs64 TPOT win.
+
+Microbench:
+
+This is an isolated A2A timing shape with `max_private_tokens=64`, not the full
+production bootstrap sizing (`max_num_tokens=2048`, derived private capacity).
+It isolates the copied payload cost; protocol equivalence is accepted by the
+TP8 NCCL/PPLX token-trace gate below.
+
+Normal:
+
+```bash
+cd /root/develop/xingming/pegainfer
+CUDA_HOME=/usr/local/cuda \
+NVCC=/usr/local/cuda/bin/nvcc \
+LD_LIBRARY_PATH=/tmp/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
+PEGAINFER_CUDA_SM=90a \
+PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer/.triton-venv/bin/python \
+target/release/pplx_a2a_bench \
+  --n-experts 384 --topk 8 --hidden-dim 7168 --world-size 8 \
+  --max-num-tokens 64 --expert-padding 8 --warmup 20 --repeats 100 \
+  --canonicalize-duplicate-sources
+```
+
+Counts-only:
+
+```bash
+cd /root/develop/xingming/pegainfer
+CUDA_HOME=/usr/local/cuda \
+NVCC=/usr/local/cuda/bin/nvcc \
+LD_LIBRARY_PATH=/tmp/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
+PEGAINFER_CUDA_SM=90a \
+PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer/.triton-venv/bin/python \
+target/release/pplx_a2a_bench \
+  --n-experts 384 --topk 8 --hidden-dim 7168 --world-size 8 \
+  --max-num-tokens 64 --expert-padding 8 --warmup 20 --repeats 100 \
+  --canonicalize-duplicate-sources \
+  --dispatch-recv-counts-only
+```
+
+Result:
+
+- Normal `dispatch_recv_us` p50/p95/p99: `22.14/29.50/43.42us`.
+- Counts-only `dispatch_recv_us` p50/p95/p99: `11.07/18.14/24.29us`.
+- Normal `split_sum_us` p50/p95/p99: `154.11/171.81/190.34us`.
+- Counts-only `split_sum_us` p50/p95/p99: `141.92/159.07/167.04us`.
+- Normal `max_rank_split_us` p50/p95/p99: `164.7/181.7/201.2us`.
+- Counts-only `max_rank_split_us` p50/p95/p99: `151.0/167.0/177.1us`.
+
+Correctness gate:
+
+```text
+/tmp/kimi_pplx_tp8_counts_recv_short_v2.json
+/tmp/kimi_nccl_tp8_active64_o5_final.json
+```
+
+Observed:
+
+- Per-index generated-token trace mismatches: `0/64`.
+- Hash counter on both files: `32x 7c4c5d83355198fd`,
+  `32x 9eecc1ca6fb3409d`.
+- Short-probe steady TPOT p50: `104.19ms`.
+
+Performance gate:
+
+Supporting in-process probe:
+
+```text
+/tmp/kimi_pplx_tp8_counts_recv_micro_bs64_o128_warm1_v2.json
+```
+
+Observed:
+
+- In-process wall throughput: `589.98 tok/s`
+  (`64 * 128 / 13.885239306s`) vs O5 `582.89 tok/s`.
+- TTFT p50/p95/p99: `501.68/920.89/950.53ms`.
+- First-decode p50/p95/p99: `586.66/1009.15/1039.25ms`.
+- Steady TPOT p50/p95/p99: `101.58/102.58/103.92ms` vs O5
+  `102.84/104.09/105.48ms`.
+
+Canonical bs64 service result:
+
+```text
+/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_counts_recv_v2.log
+/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_counts_recv_v2.json
+```
+
+Observed:
+
+- Successful requests: `256/256`.
+- Output throughput: `511.78 tok/s` vs O5 `509.89 tok/s`.
+- Peak output throughput: `706.00 tok/s`.
+- TTFT p50/p95/p99: `0.67/3.92/4.07s`.
+- TPOT p50/p95/p99: `115.83/120.26/121.26ms`.
+- ITL p50/p95/p99: `111.24/115.38/118.36ms`.
+
+Decision:
+
+Keep. The optimization is TP8-specific, uses the same NVLink sync-slot
+orientation as the full `dispatch_recv`, and has positive A2A, in-process, and
+canonical service deltas without changing token traces.
+Revert this change if canonical bs64 output falls below O5's `509.89 tok/s`, if
+in-process steady TPOT p50 regresses above O5's `102.84ms`, or if the TP8
+NCCL/PPLX short-trace gate shows any mismatch.
+
 ## Candidate Queue
 
 | Priority | Area | Hypothesis | Correctness risk |
 | --- | --- | --- | --- |
 | P0 | scheduler / prefill | Implement an exact batched `prompt_len=1` first-token path instead of 64 serial `prefill_request` calls. It must preserve the C1 TP8 NCCL token trace, unlike the rejected decode-substitution probe. | High: first-token KV state affects all following tokens. |
-| P0 | PPLX / MoE | TP8 PPLX correctness currently computes local experts in NCCL layout and uses PPLX mainly for combine, but still runs full dispatch payload movement. Prototype route-only dispatch metadata and measure `pplx_a2a_bench` / nsys before changing model code. | High: dispatch still builds `token_offset`, `expert_offsets`, `padded_index`, and `combine_send_offset`; compare these hashes plus token trace. |
-| P0 | PPLX / MoE | TP8 PPLX scatters Marlin output into a compact PPLX buffer before `combine_send`. Profile `kimi_scatter_marlin_routes_to_compact` and consider a combine path that reads NCCL-layout rows directly. | High: duplicate-source canonicalization and BF16 row order must remain trace-exact. |
+| P0 | PPLX / MoE | O7 removed the unused TP8 `dispatch_recv` hidden copy, but `dispatch_send` still moves a full hidden payload only to build metadata. Prototype route-only dispatch send and measure `pplx_a2a_bench` / nsys before changing model code. | High: dispatch still builds `token_offset`, `expert_offsets`, `padded_index`, and `combine_send_offset`; compare these hashes plus token trace. |
+| P0 | PPLX / MoE | TP8 PPLX scatters Marlin output into a compact PPLX buffer before `combine_send`. Add an indexed combine-send path that reads NCCL-layout rows through `routing.sorted_token_ids`, then verify that `kimi_scatter_marlin_routes_to_compact_kernel` disappears in nsys. | High: duplicate-source canonicalization and BF16 row order must remain trace-exact. |
 | P1 | CUDA Graph | Reduce bs64 first-step graph capture/replay and metadata overhead after kernel profile identifies host or graph-node cost. | Medium: graph replay must preserve per-row metadata and PPLX participation. |
 | P1 | frontend | Measure HTTP/streaming overhead separately from in-process TPOT. | Low for model math, medium for serving semantics. |
 | P1 | collectives | Profile TP all-reduce and routed combine tail at bs64. | Medium: BF16/F32 collective boundary is correctness-sensitive. |

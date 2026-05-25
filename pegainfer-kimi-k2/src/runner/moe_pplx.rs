@@ -258,23 +258,6 @@ pub(super) fn forward_moe_layer_decode_pplx(
         .with_context(|| format!("pplx dispatch_send layer {layer_idx}"))?;
     }
 
-    // ---- 5. dispatch_recv ----
-    {
-        let (out_num_ptr, _g0) = pplx.recv_tokens_per_expert.device_ptr_mut(&ctx.stream);
-        let (out_x_ptr, _g1) = pplx.pplx_recv_hidden.data.device_ptr_mut(&ctx.stream);
-        let (out_w_ptr, _g2) = pplx.pplx_recv_topk_weight.device_ptr_mut(&ctx.stream);
-        ep.dispatch_recv(
-            out_num_ptr as *mut i32,
-            out_x_ptr as *mut c_void,
-            KIMI_K2_HIDDEN * std::mem::size_of::<u16>(),
-            out_w_ptr as *mut c_void,
-            1,
-            1,
-            stream_raw,
-        )
-        .with_context(|| format!("pplx dispatch_recv layer {layer_idx}"))?;
-    }
-
     let layer_weights = expert_kernels
         .layers
         .iter()
@@ -289,6 +272,12 @@ pub(super) fn forward_moe_layer_decode_pplx(
         // rank, so compute local experts with the NCCL Marlin routing and use
         // PPLX only for the combine transfer. This preserves NCCL's route-slot
         // layout and BF16 rounding behavior.
+        {
+            let (out_num_ptr, _g0) = pplx.recv_tokens_per_expert.device_ptr_mut(&ctx.stream);
+            ep.dispatch_recv_counts(out_num_ptr as *mut i32, stream_raw)
+                .with_context(|| format!("pplx dispatch_recv_counts layer {layer_idx}"))?;
+        }
+
         let routing = kimi_moe_marlin_align_block_size(
             ctx,
             &mut scratch.marlin_route_workspace,
@@ -332,6 +321,23 @@ pub(super) fn forward_moe_layer_decode_pplx(
             &mut pplx.pplx_expert_output,
         )?;
     } else {
+        // ---- 5. dispatch_recv ----
+        {
+            let (out_num_ptr, _g0) = pplx.recv_tokens_per_expert.device_ptr_mut(&ctx.stream);
+            let (out_x_ptr, _g1) = pplx.pplx_recv_hidden.data.device_ptr_mut(&ctx.stream);
+            let (out_w_ptr, _g2) = pplx.pplx_recv_topk_weight.device_ptr_mut(&ctx.stream);
+            ep.dispatch_recv(
+                out_num_ptr as *mut i32,
+                out_x_ptr as *mut c_void,
+                KIMI_K2_HIDDEN * std::mem::size_of::<u16>(),
+                out_w_ptr as *mut c_void,
+                1,
+                1,
+                stream_raw,
+            )
+            .with_context(|| format!("pplx dispatch_recv layer {layer_idx}"))?;
+        }
+
         // ---- 6. Build Marlin routing ----
         let routing = kimi_pplx_build_marlin_routing_on_stream(
             ctx,

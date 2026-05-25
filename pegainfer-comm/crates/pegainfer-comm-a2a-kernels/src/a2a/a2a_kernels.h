@@ -83,6 +83,22 @@ int a2a_dispatch_recv(
     uint64_t stream
 );
 
+int a2a_dispatch_recv_counts(
+    size_t num_experts,
+    size_t rank,
+    size_t node_size,
+    size_t world_size,
+    int32_t *out_num_tokens_ptr,
+    uint32_t *tokens_per_expert,
+    uint8_t *num_recv_tokens_flag,
+    uint8_t *dispatch_recv_flag,
+    uint8_t *dispatch_recv_done,
+    uint32_t *grid_counter,
+    uint32_t *sync_counter,
+    uint32_t **sync_ptrs,
+    uint64_t stream
+);
+
 int a2a_combine_send(
     size_t num_blocks,
     size_t hidden_dim,

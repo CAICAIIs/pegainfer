@@ -41,6 +41,15 @@ struct Args {
     /// Overrides --n-experts/--topk/--hidden-dim/--max-num-tokens.
     #[arg(long)]
     sweep: bool,
+
+    /// Use metadata-only dispatch recv; useful when the model path ignores
+    /// dispatched hidden payloads but still needs PPLX routing metadata.
+    #[arg(long)]
+    dispatch_recv_counts_only: bool,
+
+    /// Canonicalize duplicate source routes, matching Kimi TP8 production EP.
+    #[arg(long)]
+    canonicalize_duplicate_sources: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -54,6 +63,8 @@ struct BenchConfig {
     nets_per_gpu: u8,
     warmup: usize,
     repeats: usize,
+    dispatch_recv_counts_only: bool,
+    canonicalize_duplicate_sources: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -131,6 +142,8 @@ fn sweep_configs(args: &Args) -> Vec<BenchConfig> {
                 nets_per_gpu: args.nets_per_gpu,
                 warmup: args.warmup,
                 repeats: args.repeats,
+                dispatch_recv_counts_only: args.dispatch_recv_counts_only,
+                canonicalize_duplicate_sources: args.canonicalize_duplicate_sources,
             });
         }
     }
@@ -165,6 +178,16 @@ fn run_sweep(args: &Args) -> Result<()> {
                 "--repeats",
                 &config.repeats.to_string(),
             ])
+            .args(
+                config
+                    .dispatch_recv_counts_only
+                    .then_some("--dispatch-recv-counts-only"),
+            )
+            .args(
+                config
+                    .canonicalize_duplicate_sources
+                    .then_some("--canonicalize-duplicate-sources"),
+            )
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
             .spawn()
@@ -223,6 +246,8 @@ fn main() -> Result<()> {
             nets_per_gpu: args.nets_per_gpu,
             warmup: args.warmup,
             repeats: args.repeats,
+            dispatch_recv_counts_only: args.dispatch_recv_counts_only,
+            canonicalize_duplicate_sources: args.canonicalize_duplicate_sources,
         };
         let rank_results = run_config(&config)?;
         print_report(&rank_results);
@@ -239,17 +264,18 @@ fn run_config(config: &BenchConfig) -> Result<Vec<Vec<IterTimes>>> {
         out_dtype: ScalarType::BF16,
         nets_per_gpu: config.nets_per_gpu,
         imm_base: 0x8a2a_0000,
-        canonicalize_duplicate_sources: false,
+        canonicalize_duplicate_sources: config.canonicalize_duplicate_sources,
     };
 
     eprintln!(
-        "[{}] bootstrap: world={} max_tokens={} experts={} topk={} hidden={}",
+        "[{}] bootstrap: world={} max_tokens={} experts={} topk={} hidden={} canonicalize={}",
         config.label,
         config.world_size,
         config.max_num_tokens,
         config.shape.n_routed_experts,
         config.shape.n_activated_experts,
         config.shape.hidden_dim,
+        config.canonicalize_duplicate_sources,
     );
     let (backends, _resources) =
         build_intra_node_backends_for_devices(config.shape, &devices, params)?;
@@ -341,13 +367,21 @@ fn run_rank(
             )
         })?;
         times.dispatch_recv_us = time_stage(&gpu, record, || {
-            dispatch_recv(
-                &mut backend,
-                hidden,
-                &mut recv_tokens_per_expert,
-                &mut out_x,
-                &gpu,
-            )
+            if config.dispatch_recv_counts_only {
+                dispatch_recv_counts_only(
+                    &mut backend,
+                    &mut recv_tokens_per_expert,
+                    &gpu,
+                )
+            } else {
+                dispatch_recv(
+                    &mut backend,
+                    hidden,
+                    &mut recv_tokens_per_expert,
+                    &mut out_x,
+                    &gpu,
+                )
+            }
         })?;
         times.combine_send_us = time_stage(&gpu, record, || {
             combine_send(&mut backend, hidden, &expert_y, &gpu)
@@ -426,6 +460,18 @@ fn dispatch_recv(
             0,
             stream,
         )
+        .map_err(anyhow::Error::from)
+}
+
+fn dispatch_recv_counts_only(
+    backend: &mut pegainfer_comm::EpBackend,
+    recv_tokens_per_expert: &mut CudaSlice<i32>,
+    gpu: &GpuContext,
+) -> Result<()> {
+    let stream = gpu.stream.cu_stream() as u64;
+    let (out_num_ptr, _g0) = recv_tokens_per_expert.device_ptr_mut(&gpu.stream);
+    backend
+        .dispatch_recv_counts(out_num_ptr as *mut i32, stream)
         .map_err(anyhow::Error::from)
 }
 

@@ -393,6 +393,35 @@ impl AllToAllContext {
         Ok(())
     }
 
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn dispatch_recv_counts(
+        &mut self,
+        out_num_tokens_ptr: *mut i32,
+        stream: u64,
+    ) -> Result<()> {
+        cuda_check!(a2a_kernels::a2a_dispatch_recv_counts(
+            self.num_experts,
+            self.rank,
+            self.node_size,
+            self.world_size,
+            out_num_tokens_ptr,
+            self.worker.tokens_per_expert.get_device_ptr(),
+            self.worker.num_recv_tokens_flag.get_device_ptr(),
+            self.worker.dispatch_recv_flag.get_device_ptr(),
+            self.worker.dispatch_recv_done.get_device_ptr(),
+            self.workspace.grid_counter.get_mut_ptr(),
+            self.workspace.sync_counter.get_mut_ptr(),
+            self.workspace.get_sync_ptr(),
+            stream,
+        ))?;
+
+        if self.worker.failed() {
+            return Err(anyhow!("fabric-lib transfer error"));
+        }
+
+        Ok(())
+    }
+
     #[allow(
         unused_variables,
         clippy::too_many_arguments,

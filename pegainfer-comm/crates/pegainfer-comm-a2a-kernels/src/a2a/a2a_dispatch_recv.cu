@@ -260,6 +260,86 @@ void a2a_dispatch_recv_kernel(
     }
 }
 
+template<unsigned NUM_WARPS, unsigned NODE_SIZE>
+__global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1)
+void a2a_dispatch_recv_counts_kernel(
+    size_t num_experts,
+    size_t rank,
+    size_t world_size,
+    int32_t * __restrict__ out_num_tokens_ptr,
+    uint32_t * __restrict__ tokens_per_expert,
+    uint8_t * __restrict__ num_recv_tokens_flag,
+    uint8_t * __restrict__ dispatch_recv_flag,
+    uint8_t * __restrict__ dispatch_recv_done,
+    uint32_t * __restrict__ grid_counter,
+    uint32_t * __restrict__ sync_counter,
+    uint32_t ** __restrict__ sync_ptrs
+) {
+    const unsigned warp_id = threadIdx.x / WARP_SIZE;
+    const unsigned lane_id = get_lane_id();
+    const size_t experts_per_rank = ceil_div<size_t>(num_experts, world_size);
+    const size_t first_expert = rank * experts_per_rank;
+    const size_t last_expert = min<size_t>(first_expert + experts_per_rank, num_experts);
+    const size_t num_local_experts = last_expert - first_expert;
+
+    __shared__ uint32_t shared_counter;
+
+    if (warp_id == 0) {
+        if (elect_one_sync()) {
+            while (ld_mmio_b8(num_recv_tokens_flag) == 0);
+            shared_counter = *sync_counter;
+        }
+    }
+    __syncthreads();
+    fence_acquire_system();
+    __syncthreads();
+
+    const uint32_t counter = shared_counter;
+    if constexpr (NODE_SIZE > 1) {
+        auto local_rank = rank % NODE_SIZE;
+        if (warp_id == 1 && lane_id < NODE_SIZE) {
+            auto *flag_ptr = &sync_ptrs[local_rank][lane_id + NODE_SIZE];
+            while (ld_acquire_u32(flag_ptr) != counter);
+        }
+    }
+    __syncthreads();
+    fence_acquire_system();
+    __syncthreads();
+
+    for (size_t expert = threadIdx.x; expert < num_local_experts; expert += blockDim.x) {
+        out_num_tokens_ptr[expert] = tokens_per_expert[expert];
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        *sync_counter = counter + 1;
+    }
+    if constexpr (NODE_SIZE > 1) {
+        __syncthreads();
+        auto local_rank = rank % NODE_SIZE;
+        for (unsigned peer = threadIdx.x; peer < NODE_SIZE; peer += blockDim.x) {
+            st_volatile_u32(&sync_ptrs[peer][local_rank], counter + 1);
+        }
+    }
+
+    if (warp_id == 0) {
+        if (elect_one_sync()) {
+            while (ld_mmio_b8(dispatch_recv_flag) == 0);
+        }
+    }
+    __syncthreads();
+    fence_acquire_system();
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        *num_recv_tokens_flag = 0;
+        *dispatch_recv_flag = 0;
+        *grid_counter = 0;
+        fence_release_system();
+        st_mmio_b8(dispatch_recv_done, 1);
+    }
+}
+
 
 int a2a_kernels::a2a_dispatch_recv(
     size_t num_blocks,
@@ -353,6 +433,56 @@ int a2a_kernels::a2a_dispatch_recv(
                 );
             });
         });
+    });
+    nvtxRangePop();
+    return status;
+}
+
+int a2a_kernels::a2a_dispatch_recv_counts(
+    size_t num_experts,
+    size_t rank,
+    size_t node_size,
+    size_t world_size,
+    int32_t *out_num_tokens_ptr,
+    uint32_t *tokens_per_expert,
+    uint8_t *num_recv_tokens_flag,
+    uint8_t *dispatch_recv_flag,
+    uint8_t *dispatch_recv_done,
+    uint32_t *grid_counter,
+    uint32_t *sync_counter,
+    uint32_t **sync_ptrs,
+    uint64_t stream
+) {
+    if (num_experts == 0 || world_size == 0 || rank >= world_size ||
+        out_num_tokens_ptr == nullptr || tokens_per_expert == nullptr ||
+        num_recv_tokens_flag == nullptr || dispatch_recv_flag == nullptr ||
+        dispatch_recv_done == nullptr || grid_counter == nullptr ||
+        sync_counter == nullptr || (node_size > 1 && sync_ptrs == nullptr)) {
+        return cudaErrorInvalidValue;
+    }
+
+    constexpr size_t NUM_WARPS = 16;
+    constexpr size_t WARP_SIZE = 32;
+    dim3 dimGrid(1, 1, 1);
+    dim3 dimBlock(NUM_WARPS * WARP_SIZE, 1, 1);
+
+    nvtxRangePush("dispatch_recv_counts");
+    cudaError_t status;
+    LAUNCH_WORLD_SIZE(node_size, NODE_SIZE, {
+        a2a_dispatch_recv_counts_kernel<NUM_WARPS, NODE_SIZE>
+            <<<dimGrid, dimBlock, 0, (cudaStream_t)stream>>>(
+                num_experts,
+                rank,
+                world_size,
+                out_num_tokens_ptr,
+                tokens_per_expert,
+                num_recv_tokens_flag,
+                dispatch_recv_flag,
+                dispatch_recv_done,
+                grid_counter,
+                sync_counter,
+                sync_ptrs);
+        status = cudaPeekAtLastError();
     });
     nvtxRangePop();
     return status;
