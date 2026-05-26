@@ -18,7 +18,9 @@ pub use attribution::{CallSiteRollup, DecodeAttributionProfile, SectionRollup, S
 pub use config::Config;
 use config::SUPPORTED_HIDDEN_SIZE;
 use ep::SUPPORTED_ROUTED_EXPERTS;
-pub use runtime::{DeepSeekV2LiteEp2Generator, GenerationResult, GenerationStats};
+pub use runtime::{
+    BatchedGenerationResult, DeepSeekV2LiteEp2Generator, GenerationResult, GenerationStats,
+};
 
 pub fn probe_config_json(json: &serde_json::Value) -> Result<bool> {
     let Some(model_type) = json.get("model_type").and_then(serde_json::Value::as_str) else {

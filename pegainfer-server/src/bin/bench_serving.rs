@@ -853,6 +853,8 @@ struct GenTimings {
     total: Duration,
     emitted_tokens: usize,
     generated_tokens: Vec<u32>,
+    decode_tokens_for_rate: usize,
+    decode_time_for_rate: Duration,
 }
 
 trait BenchModel {
@@ -910,12 +912,16 @@ where
 
     let total = start.elapsed();
     let ttft = first_at.map_or(total, |t| t - start);
+    let decode_tokens_for_rate = emitted_tokens.saturating_sub(1);
+    let decode_time_for_rate = tbt.iter().copied().sum();
     GenTimings {
         ttft,
         tbt,
         total,
         emitted_tokens,
         generated_tokens,
+        decode_tokens_for_rate,
+        decode_time_for_rate,
     }
 }
 
@@ -1050,9 +1056,8 @@ struct DeepSeekV2LiteBenchModel {
 impl BenchModel for DeepSeekV2LiteBenchModel {
     fn validate_concurrency(&self, concurrency: usize) -> Result<()> {
         ensure!(
-            concurrency == 1,
-            "DeepSeek-V2-Lite direct attribution benchmark supports --concurrency 1 only; \
-             the current EP2 first gate does not expose a true batched serving path"
+            concurrency > 0 && concurrency <= 8,
+            "DeepSeek-V2-Lite direct benchmark supports --concurrency 1..=8 through the narrow same-prompt lockstep batch path, got {concurrency}"
         );
         Ok(())
     }
@@ -1076,6 +1081,31 @@ impl BenchModel for DeepSeekV2LiteBenchModel {
             attribution.prefill_next_token_us(),
             attribution.per_token_decode_us(),
         )
+    }
+
+    fn timed_generation_batch(
+        &mut self,
+        prompt_tokens: &[u32],
+        max_new_tokens: usize,
+        sampling: &SamplingParams,
+        _rng: &mut StdRng,
+        concurrency: usize,
+    ) -> Vec<GenTimings> {
+        assert_dsv2_lite_sampling_contract(sampling);
+        if concurrency == 1 {
+            return vec![self.timed_generation(prompt_tokens, max_new_tokens, sampling, _rng)];
+        }
+
+        let result = self
+            .generator
+            .generate_greedy_batch_same_prompt_with_timings(
+                prompt_tokens,
+                concurrency,
+                max_new_tokens,
+                sampling.ignore_eos,
+            )
+            .expect("DeepSeek-V2-Lite batched generation failed");
+        timings_from_dsv2_lite_batched_generation(result, max_new_tokens)
     }
 }
 
@@ -1135,16 +1165,95 @@ fn timings_from_dsv2_lite_attribution(
             "DeepSeek-V2-Lite decode timing contains a zero-duration sample; refusing to report TPOT"
         );
     }
+    let tbt: Vec<_> = per_token_decode_us
+        .iter()
+        .map(|us| Duration::from_micros(*us))
+        .collect();
+    let decode_time_for_rate = tbt.iter().copied().sum();
     GenTimings {
         ttft: Duration::from_micros(prefill_next_token_us.unwrap_or(total_generation_us)),
-        tbt: per_token_decode_us
-            .iter()
-            .map(|us| Duration::from_micros(*us))
-            .collect(),
+        tbt,
         total: Duration::from_micros(total_generation_us),
         emitted_tokens,
         generated_tokens: generated_token_ids,
+        decode_tokens_for_rate: emitted_tokens.saturating_sub(1),
+        decode_time_for_rate,
     }
+}
+
+#[cfg(feature = "deepseek-v2-lite")]
+fn timings_from_dsv2_lite_batched_generation(
+    result: pegainfer_deepseek_v2_lite::BatchedGenerationResult,
+    expected_generated_tokens: usize,
+) -> Vec<GenTimings> {
+    let batch_size = result.tokens.len();
+    assert!(
+        batch_size > 0,
+        "DeepSeek-V2-Lite batch result must contain at least one row"
+    );
+    assert_eq!(
+        result.prefill_next_token_us.len(),
+        batch_size,
+        "DeepSeek-V2-Lite batch result TTFT count mismatch"
+    );
+    assert!(
+        result.total_generation_us > 0,
+        "DeepSeek-V2-Lite batch total generation timing is zero; refusing to report TPOT"
+    );
+    assert!(
+        result.prefill_next_token_us.iter().all(|us| *us > 0),
+        "DeepSeek-V2-Lite batch TTFT timing contains a zero-duration sample; refusing to report TPOT"
+    );
+    let expected_decode_steps = expected_generated_tokens.saturating_sub(1);
+    assert_eq!(
+        result.per_token_decode_us.len(),
+        expected_decode_steps,
+        "DeepSeek-V2-Lite batch timing count mismatch: got {} decode samples for {} generated tokens",
+        result.per_token_decode_us.len(),
+        expected_generated_tokens
+    );
+    if expected_decode_steps > 0 {
+        assert!(
+            result.per_token_decode_us.iter().all(|us| *us > 0),
+            "DeepSeek-V2-Lite batch decode timing contains a zero-duration sample; refusing to report TPOT"
+        );
+    }
+
+    let tbt: Vec<_> = result
+        .per_token_decode_us
+        .iter()
+        .map(|us| Duration::from_micros(*us))
+        .collect();
+    let decode_time_for_rate: Duration = tbt.iter().copied().sum();
+    let decode_tokens_for_rate = batch_size * expected_decode_steps;
+
+    result
+        .tokens
+        .into_iter()
+        .zip(result.prefill_next_token_us)
+        .enumerate()
+        .map(|(idx, (generated_token_ids, prefill_us))| {
+            let emitted_tokens = generated_token_ids.len();
+            assert_eq!(
+                emitted_tokens, expected_generated_tokens,
+                "DeepSeek-V2-Lite batch row {idx} generated token count mismatch: got {} tokens for requested output_len={}",
+                emitted_tokens, expected_generated_tokens
+            );
+            GenTimings {
+                ttft: Duration::from_micros(prefill_us),
+                tbt: tbt.clone(),
+                total: Duration::from_micros(result.total_generation_us),
+                emitted_tokens,
+                generated_tokens: generated_token_ids,
+                decode_tokens_for_rate: if idx == 0 { decode_tokens_for_rate } else { 0 },
+                decode_time_for_rate: if idx == 0 {
+                    decode_time_for_rate
+                } else {
+                    Duration::ZERO
+                },
+            }
+        })
+        .collect()
 }
 
 fn command_seed(cli: &Cli) -> u64 {
@@ -1243,11 +1352,8 @@ fn build_request_metrics(timings: &[GenTimings]) -> RequestMetrics {
 
     let total_emitted: usize = timings.iter().map(|t| t.emitted_tokens).sum();
     let total_request_time: Duration = timings.iter().map(|t| t.total).sum();
-    let total_decode_steps: usize = timings
-        .iter()
-        .map(|t| t.emitted_tokens.saturating_sub(1))
-        .sum();
-    let total_decode_time: Duration = timings.iter().flat_map(|t| t.tbt.iter()).copied().sum();
+    let total_decode_steps: usize = timings.iter().map(|t| t.decode_tokens_for_rate).sum();
+    let total_decode_time: Duration = timings.iter().map(|t| t.decode_time_for_rate).sum();
 
     RequestMetrics {
         ttft_ms: summarize_durations(&ttfts),
@@ -2112,6 +2218,37 @@ mod tests {
         assert_eq!(timings.total, Duration::from_micros(60_000));
         assert_eq!(timings.emitted_tokens, 3);
         assert_eq!(timings.generated_tokens, vec![11, 304, 608]);
+        assert_eq!(timings.decode_tokens_for_rate, 2);
+        assert_eq!(timings.decode_time_for_rate, Duration::from_micros(37_000));
+    }
+
+    #[test]
+    fn dsv2_lite_batched_timings_use_shared_decode_time_for_rate() {
+        let timings = timings_from_dsv2_lite_batched_generation(
+            pegainfer_deepseek_v2_lite::BatchedGenerationResult {
+                tokens: vec![vec![11, 304, 608], vec![11, 304, 608]],
+                prefill_next_token_us: vec![20_000, 21_000],
+                per_token_decode_us: vec![19_000, 18_000],
+                total_generation_us: 80_000,
+            },
+            3,
+        );
+
+        assert_eq!(timings.len(), 2);
+        assert_eq!(timings[0].decode_tokens_for_rate, 4);
+        assert_eq!(
+            timings[0].decode_time_for_rate,
+            Duration::from_micros(37_000)
+        );
+        assert_eq!(timings[1].decode_tokens_for_rate, 0);
+        assert_eq!(timings[1].decode_time_for_rate, Duration::ZERO);
+
+        let metrics = build_request_metrics(&timings);
+        assert_eq!(metrics.steady_tpot_ms.unwrap().p50_ms, 18.0);
+        assert!(
+            metrics.decode_tok_s.unwrap() > 100.0,
+            "batched decode tok/s should use one shared step duration instead of duplicating it per row"
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use std::{
     env,
     path::{Path, PathBuf},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -65,6 +65,14 @@ pub struct GenerationResult {
     pub tokens: Vec<u32>,
     pub finish_reason: FinishReason,
     pub stats: GenerationStats,
+}
+
+#[derive(Clone, Debug)]
+pub struct BatchedGenerationResult {
+    pub tokens: Vec<Vec<u32>>,
+    pub prefill_next_token_us: Vec<u64>,
+    pub per_token_decode_us: Vec<u64>,
+    pub total_generation_us: u64,
 }
 
 pub struct DeepSeekV2LiteEp2Generator {
@@ -233,6 +241,102 @@ impl DeepSeekV2LiteEp2Generator {
             &mut attribution,
         )?;
         Ok((result, attribution))
+    }
+
+    pub fn generate_greedy_batch_same_prompt_with_timings(
+        &mut self,
+        prompt_tokens: &[u32],
+        batch_size: usize,
+        max_new_tokens: usize,
+        ignore_eos: bool,
+    ) -> Result<BatchedGenerationResult> {
+        ensure!(!prompt_tokens.is_empty(), "prompt_tokens must not be empty");
+        ensure!(batch_size > 0, "batch_size must be positive");
+        ensure!(
+            batch_size <= 8,
+            "DeepSeek-V2-Lite batched decode benchmark supports batch_size <= 8, got {batch_size}"
+        );
+        ensure!(max_new_tokens > 0, "max_new_tokens must be positive");
+        ensure!(
+            ignore_eos,
+            "DeepSeek-V2-Lite batched decode benchmark requires ignore_eos=true so every row has the same output length"
+        );
+
+        let requested_context = prompt_tokens.len() + max_new_tokens;
+        let supported_context = self.config.supported_plain_rope_context();
+        ensure!(
+            requested_context <= supported_context,
+            "DeepSeek-V2-Lite EP=2 first gate supports plain RoPE context <= {supported_context} tokens; requested prompt_tokens={} max_new_tokens={} total={requested_context}. YaRN rope_scaling long context is not implemented yet.",
+            prompt_tokens.len(),
+            max_new_tokens
+        );
+
+        let generation_start = Instant::now();
+        let mut attribution = DecodeAttributionProfile::disabled();
+        let mut stats = GenerationStats {
+            model_path: self.model_path.clone(),
+            device_ordinals: self.device_ordinals.clone(),
+            ep_backend: self.backend.kind().as_str().to_string(),
+            ep_size: 2,
+            prompt_tokens: prompt_tokens.len() * batch_size,
+            ..GenerationStats::default()
+        };
+        let mut caches: Vec<_> = (0..batch_size)
+            .map(|_| DecodeCache::new(&self.config))
+            .collect();
+        let mut generated = vec![Vec::with_capacity(max_new_tokens); batch_size];
+        let mut prefill_next_token_us = Vec::with_capacity(batch_size);
+
+        for row in 0..batch_size {
+            let next = self.prefill_next_token(
+                prompt_tokens,
+                &mut caches[row],
+                &mut stats,
+                &mut attribution,
+            )?;
+            prefill_next_token_us.push(duration_micros(generation_start.elapsed()));
+            generated[row].push(next);
+        }
+
+        let mut per_token_decode_us = Vec::with_capacity(max_new_tokens.saturating_sub(1));
+        for token_index in 1..max_new_tokens {
+            let input_tokens: Vec<_> = generated
+                .iter()
+                .map(|tokens| {
+                    *tokens
+                        .last()
+                        .expect("batched decode rows are seeded by prefill")
+                })
+                .collect();
+            let position = prompt_tokens.len() + token_index - 1;
+            let decode_start = Instant::now();
+            // This is a correctness-first lockstep batch benchmark path. All
+            // rows advance under one batch decode step/timing sample, while the
+            // row forward reuses the already-gated single-row EP2 oracle until a
+            // fused batched DSV2-Lite forward has its own accuracy gate.
+            let mut next_tokens = Vec::with_capacity(batch_size);
+            for row in 0..batch_size {
+                next_tokens.push(self.decode_next_token(
+                    input_tokens[row],
+                    position,
+                    &mut caches[row],
+                    &mut stats,
+                    &mut attribution,
+                    token_index,
+                )?);
+            }
+            per_token_decode_us.push(duration_micros(decode_start.elapsed()));
+            for (row, token) in next_tokens.into_iter().enumerate() {
+                generated[row].push(token);
+            }
+        }
+
+        Ok(BatchedGenerationResult {
+            tokens: generated,
+            prefill_next_token_us,
+            per_token_decode_us,
+            total_generation_us: duration_micros(generation_start.elapsed()),
+        })
     }
 
     fn generate_greedy_inner(
@@ -968,6 +1072,10 @@ fn token_sha256(tokens: &[u32]) -> String {
         hasher.update(token.to_le_bytes());
     }
     hex::encode(hasher.finalize())
+}
+
+fn duration_micros(duration: Duration) -> u64 {
+    duration.as_micros().min(u128::from(u64::MAX)) as u64
 }
 
 fn append_generated_token(
