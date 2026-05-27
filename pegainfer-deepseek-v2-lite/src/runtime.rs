@@ -284,7 +284,9 @@ impl DeepSeekV2LiteEp2Generator {
         let mut caches: Vec<_> = (0..batch_size)
             .map(|_| DecodeCache::new(&self.config))
             .collect();
-        let mut generated = vec![Vec::with_capacity(max_new_tokens); batch_size];
+        let mut generated: Vec<Vec<u32>> = (0..batch_size)
+            .map(|_| Vec::with_capacity(max_new_tokens))
+            .collect();
         let mut prefill_next_token_us = Vec::with_capacity(batch_size);
 
         for row in 0..batch_size {
