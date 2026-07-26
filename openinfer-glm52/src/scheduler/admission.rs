@@ -171,7 +171,7 @@ pub(super) fn admit_from_queue(
     workers: &[Glm52Worker],
     mirrored: bool,
     prefix_cache_enabled: bool,
-    dspark_enabled: bool,
+    drafter_enabled: bool,
     _prefill_only: bool,
     pending_resets: &mut [Vec<usize>],
     slots_changed: &mut bool,
@@ -321,7 +321,7 @@ pub(super) fn admit_from_queue(
                 req.params.ignore_eos,
                 cached_tokens,
             );
-            if dspark_enabled {
+            if drafter_enabled {
                 pending_resets[rank].push(slot);
             }
             slots[rank][slot] = Some(ActiveRequest { req, state, kv });

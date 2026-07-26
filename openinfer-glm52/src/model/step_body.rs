@@ -4,7 +4,7 @@ use anyhow::Context as _;
 use anyhow::Result;
 use anyhow::ensure;
 use cudarc::driver::CudaSlice;
-use openinfer_kernels::ops::add_into;
+use openinfer_kernels::ops::add_scaled_bf16_into;
 use openinfer_kernels::ops::argmax_bf16_split_into;
 use openinfer_kernels::ops::copy_hidden_rows_raw_into;
 use openinfer_kernels::ops::glm52_vocab_parallel_pack_launch;
@@ -26,10 +26,12 @@ use crate::dense::glm52_dense_mlp_forward_into;
 use crate::layer::Glm52DecodeStep;
 use crate::layer::Glm52DecoderLayerWeights;
 use crate::layer::Glm52LayerCaches;
+use crate::layer::Glm52LayerIndexMode;
 use crate::layer::Glm52LayerMlp;
 use crate::layer::glm52_layer_attention_half;
 use crate::layer::glm52_layer_finish;
 use crate::layer::glm52_layer_finish_fused;
+use crate::moe_decode::run_ep_router_into;
 use crate::moe_decode::run_router_into;
 use crate::moe_ep_wo::Glm52MoeEpState;
 use crate::moe_ep8::Glm52MoeEp8LayerWeights;
@@ -104,6 +106,7 @@ pub(super) fn run_step_body(
             parity,
             layer == 0,
             tp_ar,
+            Glm52LayerIndexMode::Normal,
         )
         .with_context(|| format!("GLM5.2 layer {layer} attention half"))?;
         let mut tp_padded_mlp = false;
@@ -266,7 +269,7 @@ pub(super) fn run_step_body(
 /// DeepEP dispatch/expert-GEMM/combine, joined by the closing add into
 /// `mlp_out`. The events recorded here during capture become graph edges;
 /// replay keeps the parallel branches.
-fn glm52_moe_ep_layer(
+pub(super) fn glm52_moe_ep_layer(
     ctx: &DeviceContext,
     aux: &DeviceContext,
     ep8: &mut Glm52MoeEpState,
@@ -289,7 +292,7 @@ fn glm52_moe_ep_layer(
     )?;
     let shared_done = aux.stream.record_event(None)?;
 
-    run_router_into(ctx, &moe.router, s.layer.normed2.data(), &mut s.router)?;
+    run_ep_router_into(ctx, &moe.router, s.layer.normed2.data(), &mut s.router)?;
     let dispatched = ep8.routed_forward(
         ctx,
         &moe.bank,
@@ -302,9 +305,10 @@ fn glm52_moe_ep_layer(
     );
     // Join: the closing add consumes both branches.
     ctx.stream.wait(&shared_done)?;
-    add_into(
+    add_scaled_bf16_into(
         ctx,
         ep8.combined(),
+        crate::config::GLM52_ROUTED_SCALING_FACTOR as f32,
         s.layer.shared_out.data(),
         batch * GLM52_HIDDEN,
         s.layer.mlp_out.data_mut(),

@@ -112,7 +112,7 @@ fn main() -> Result<()> {
         openinfer_glm52::Glm52LaunchOptions {
             tp_size,
             dp_size,
-            dspark_draft_model_path: None,
+            drafter: openinfer_glm52::Glm52Drafter::None,
             max_model_len: cli.max_model_len,
             prefill_only: None,
             no_prefix_cache: false,

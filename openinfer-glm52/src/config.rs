@@ -9,6 +9,8 @@ use serde_json::Value;
 pub(crate) const GLM52_HIDDEN: usize = 6144;
 pub(crate) const GLM52_VOCAB: usize = 154_880;
 pub(crate) const GLM52_LAYERS: usize = 78;
+/// Checkpoint layer containing the native multi-token prediction decoder.
+pub(crate) const GLM52_MTP_LAYER: usize = GLM52_LAYERS;
 pub(crate) const GLM52_DENSE_LAYERS: usize = 3;
 /// The checkpoint's `max_position_embeddings` — `probe_config_json` pins the
 /// config to exactly this, so it doubles as the architecture ceiling any
@@ -41,7 +43,7 @@ pub(crate) const GLM52_EXPERT_INTERMEDIATE: usize = 2048;
 pub(crate) const GLM52_ROUTED_EXPERTS: usize = 256;
 pub(crate) const GLM52_TOPK: usize = 8;
 const GLM52_SHARED_EXPERTS: usize = 1;
-const GLM52_ROUTED_SCALING_FACTOR: f64 = 2.5;
+pub(crate) const GLM52_ROUTED_SCALING_FACTOR: f64 = 2.5;
 const GLM52_RMS_NORM_EPS: f64 = 1.0e-5;
 /// The f32 the GPU norm kernels consume (every RMSNorm in the model shares
 /// the one checkpoint eps that `probe_config_json` validates).

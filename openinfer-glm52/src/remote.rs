@@ -57,7 +57,7 @@ use crate::weights::Glm52WeightManifest;
 /// Bump on ANY wire-visible change. Both ends ship in one repo at one
 /// commit; the handshake check turns a mixed deploy into a clean reject
 /// instead of a bincode decode error mid-flight.
-const GLM52_WIRE_VERSION: u32 = 1;
+const GLM52_WIRE_VERSION: u32 = 2;
 
 /// Frames are small (a `Step` is < 100 KiB even at max table width); anything
 /// bigger than this is a corrupted length prefix, not a real frame.
@@ -130,7 +130,7 @@ enum WireRequest {
     BuildModel {
         max_model_len: usize,
         moe_topo: Glm52MoeTopo,
-        dspark_enabled: bool,
+        drafter: crate::Glm52Drafter,
     },
     SetupComm {
         unique_id: Vec<u8>,
@@ -476,7 +476,7 @@ impl Glm52RemoteRankWorker {
         &self,
         max_model_len: usize,
         moe_topo: Glm52MoeTopo,
-        dspark_enabled: bool,
+        drafter: crate::Glm52Drafter,
     ) -> Result<Receiver<Result<Vec<KvArena>>>> {
         let (tx, rx) = bounded(1);
         self.node.shared.submit(
@@ -484,7 +484,7 @@ impl Glm52RemoteRankWorker {
             WireRequest::BuildModel {
                 max_model_len,
                 moe_topo,
-                dspark_enabled,
+                drafter,
             },
             PendingResp::BuildModel(tx),
         )?;
@@ -776,7 +776,7 @@ fn serve_connection(stream: TcpStream) -> Result<()> {
 
 fn spawn_hosted_workers(hello: &WireHello) -> Result<Vec<Glm52RankWorker>> {
     let manifest = Glm52WeightManifest::from_model_dir(&hello.model_path)?;
-    let bundles = manifest.all_rank_load_bundles(hello.moe_topo)?;
+    let bundles = manifest.all_rank_load_bundles(hello.moe_topo, false)?;
     ensure!(
         hello.first_rank + hello.rank_count <= bundles.len(),
         "GLM5.2 rank-host asked for ranks {}..{} but {:?} has {} ranks",
@@ -834,11 +834,11 @@ fn host_demux_loop(
             WireRequest::BuildModel {
                 max_model_len,
                 moe_topo,
-                dspark_enabled,
+                drafter,
             } => HostPending::BuildModel(worker.build_model_async(
                 max_model_len,
                 moe_topo,
-                dspark_enabled,
+                drafter,
                 None,
             )?),
             WireRequest::SetupComm {
@@ -932,6 +932,35 @@ mod tests {
                 ensure!(kv.pages.len() == 8 * 16 && kv.slot_mapping == [9i64; 8]);
                 ensure!(sampling.len() == 1 && sampling[0].row == 2);
                 ensure!(seed == 0xDEAD_BEEF);
+            }
+            other => bail!("decoded wrong variant: {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn build_model_frame_roundtrip_preserves_drafter_path() -> Result<()> {
+        let mut buf = Vec::new();
+        let cmd = WireCmd {
+            worker: 5,
+            req: WireRequest::BuildModel {
+                max_model_len: 65_536,
+                moe_topo: Glm52MoeTopo::Ep8,
+                drafter: crate::Glm52Drafter::Dspark(PathBuf::from("/models/dspark")),
+            },
+        };
+        write_frame(&mut buf, &cmd)?;
+        let decoded: WireCmd = read_frame(&mut buf.as_slice())?;
+        ensure!(decoded.worker == 5);
+        match decoded.req {
+            WireRequest::BuildModel {
+                max_model_len,
+                moe_topo,
+                drafter,
+            } => {
+                ensure!(max_model_len == 65_536);
+                ensure!(moe_topo == Glm52MoeTopo::Ep8);
+                ensure!(drafter == crate::Glm52Drafter::Dspark(PathBuf::from("/models/dspark")));
             }
             other => bail!("decoded wrong variant: {other:?}"),
         }
