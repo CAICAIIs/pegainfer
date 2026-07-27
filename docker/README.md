@@ -10,16 +10,27 @@ Build it once:
 docker/dev.sh build
 ```
 
-Open a shell with the repository and persistent compiler caches mounted:
+Open a shell with the repository at its original absolute path and persistent
+compiler caches mounted:
 
 ```bash
 docker/dev.sh shell
 ```
 
+Linked Git worktrees are supported: the wrapper detects an external Git
+common directory and mounts it read-only so build scripts can inspect
+submodule state.
+
 Or run a one-off build:
 
 ```bash
 docker/dev.sh run cargo build --release
+```
+
+Mount model weights read-only at their existing absolute path:
+
+```bash
+OPENINFER_MODEL_DIR=/models/Qwen3-4B docker/dev.sh shell
 ```
 
 The default base is the pinned CUDA 13.2 development image, which is the

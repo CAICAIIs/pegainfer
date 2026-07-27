@@ -25,6 +25,7 @@ RUN apt-get update \
         libibverbs-dev \
         libnccl-dev \
         libnccl2 \
+        libprotobuf-dev \
         libssl-dev \
         ninja-build \
         pkg-config \

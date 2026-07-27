@@ -18,6 +18,7 @@ Environment:
   OPENINFER_DEV_IMAGE     Image tag (default: openinfer-dev:cu132).
   OPENINFER_DEV_CONTAINER Interactive container name (default: openinfer-dev).
   OPENINFER_DEV_CACHE     Persistent build-cache directory.
+  OPENINFER_MODEL_DIR     Read-only model directory mounted at the same path.
   EP_DISABLE_GIN          Forwarded when set; useful on trays without a GIN NIC.
 EOF
 }
@@ -39,15 +40,37 @@ docker_args=(
   --network host
   --ulimit memlock=-1
   --ulimit stack=67108864
-  --volume "$repo_root:/workspace/openinfer"
+  --volume "$repo_root:$repo_root"
   --volume "$cache_root/cargo-registry:/opt/cargo/registry"
   --volume "$cache_root/cargo-git:/opt/cargo/git"
-  --volume "$cache_root/target:/workspace/openinfer/target"
-  --workdir /workspace/openinfer
+  --volume "$cache_root/target:$repo_root/target"
+  --workdir "$repo_root"
 )
+
+# A linked worktree stores a .git file that points at the main checkout's
+# common git directory. Mount that directory at the same absolute path so
+# build.rs can inspect submodule state without making the whole parent tree
+# visible or writable.
+git_common_dir="$(git -C "$repo_root" rev-parse --path-format=absolute --git-common-dir)"
+case "$git_common_dir/" in
+  "$repo_root/"*) ;;
+  *) docker_args+=(--volume "$git_common_dir:$git_common_dir:ro") ;;
+esac
 
 if [[ -n "${EP_DISABLE_GIN:-}" ]]; then
   docker_args+=(--env "EP_DISABLE_GIN=$EP_DISABLE_GIN")
+fi
+
+if [[ -n "${OPENINFER_MODEL_DIR:-}" ]]; then
+  [[ "$OPENINFER_MODEL_DIR" = /* ]] || {
+    echo "OPENINFER_MODEL_DIR must be an absolute path" >&2
+    exit 2
+  }
+  [[ -d "$OPENINFER_MODEL_DIR" ]] || {
+    echo "OPENINFER_MODEL_DIR does not exist: $OPENINFER_MODEL_DIR" >&2
+    exit 2
+  }
+  docker_args+=(--volume "$OPENINFER_MODEL_DIR:$OPENINFER_MODEL_DIR:ro")
 fi
 
 case "${1:-}" in
