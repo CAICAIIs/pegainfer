@@ -61,3 +61,6 @@ image needs a more specific namespace.
 On a tray without a GIN-capable NIC, pass `EP_DISABLE_GIN=1` when starting
 the container. It is intentionally not baked into the image because networked
 deployments require GIN.
+
+On GB300 NVL72 hosts, the wrapper automatically forwards the IMEX channel
+device required by cross-tray LSA when that device exists.

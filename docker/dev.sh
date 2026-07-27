@@ -58,6 +58,13 @@ docker_args=(
   --workdir "$repo_root"
 )
 
+# GB300 NVL72 cross-tray LSA requires the IMEX channel in addition to the
+# devices exposed by --gpus. Single-node and non-IMEX hosts have no such path.
+imex_channel=/dev/nvidia-caps-imex-channels/channel0
+if [[ -e "$imex_channel" ]]; then
+  docker_args+=(--device "$imex_channel:$imex_channel")
+fi
+
 # A linked worktree stores a .git file that points at the main checkout's
 # common git directory. Mount that directory at the same absolute path so
 # build.rs can inspect and initialize submodules without making the whole
