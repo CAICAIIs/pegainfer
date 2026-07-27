@@ -1,13 +1,2 @@
-.git
-**/.git
-.venv
-**/.venv
-target
-**/target
-models
-datasets
-traces
-bench_results
-artifacts
-profile
-docs/private
+**
+!rust-toolchain.toml

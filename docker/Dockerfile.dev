@@ -92,7 +92,8 @@ RUN cd /tmp \
         "$(sed -n 's/^channel = "\(.*\)"/\1/p' /tmp/openinfer-rust-toolchain.toml)" \
         --component rustfmt \
         --component clippy \
-    && rm -f /tmp/openinfer-rust-toolchain.toml
+    && rm -f /tmp/openinfer-rust-toolchain.toml \
+    && chown -R "${DEV_UID}:${DEV_GID}" /opt/cargo
 
 USER ${DEV_USER}
 CMD ["/bin/bash"]
