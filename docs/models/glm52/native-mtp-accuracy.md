@@ -7,7 +7,9 @@
 > `23.44 ms` to `11.31 ms`. A subsequent three-run matched c1 measures OpenInfer at `7.749 ms`
 > versus official vLLM at `8.814 ms`; their proxy round costs are `30.04` and `30.72 ms`, so there
 > is no remaining c1 TPOT deficit. On the selected 251-token target trajectory, mean accepted
-> length changes from `1.000` to `5.795`.
+> length changes from `1.000` to `5.795`. Native MTP now also runs on single-node EP4/GB300:
+> layer 78 uses the launch topology's expert placement and EP-rank factor rather than hard-coded
+> EP8 assumptions; a tray04 greedy smoke and eight-concurrent gate passed.
 >
 > **Last touched:** 2026-07
 
@@ -107,6 +109,26 @@
     runs and report their spread rather than selecting the best number.
 
 ## Execution Log
+
+### EP4 / GB300 bring-up
+
+- Enabled `--glm52-native-mtp` for the single-node `--moe-topo ep4` topology at both the server
+  and model-engine validation boundaries. TP topologies and remote rank-hosts remain rejected.
+- Added an EP4 resident-weight-plan gate: rank 3 carries layer-78 experts `192..256`, alongside
+  the MTP non-expert tensors.
+- The first real request exposed a second EP8 assumption after successful weight load and graph
+  capture: layer 78 used `8 * rows` as `global_tokens`. At the bucket-8 shape this sent `64` into
+  the EP4 DeepEP protocol, whose cap is `4 ranks * 8 rows = 32`, and all four ranks failed closed.
+- `Glm52NativeMtp` now retains the launch topology's `ep_ranks`, builds layer 78 with that topology,
+  and passes `ep_ranks * rows` to the routed-expert collective.
+- Validation on tray04 (4×GB300, SM103), full `zai-org/GLM-5.2-FP8`, `max_model_len=4096`,
+  prefix cache disabled:
+  - cold release build and the targeted server/weight-plan unit gates passed;
+  - all four ranks loaded `31,077` tensors / `190.6 GiB`, including the MTP lane;
+  - one 32-token greedy completion passed with mean accepted length `2.455`;
+  - eight concurrent 64-token greedy completions returned HTTP 200, exercised both slot 0 and
+    slot 1 on every DP rank, and reported per-request mean accepted lengths `2.520..3.471`;
+  - no error or panic was logged after the topology fix.
 
 ### Native MTP forward and serving integration
 

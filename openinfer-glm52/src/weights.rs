@@ -819,6 +819,47 @@ mod tests {
     }
 
     #[test]
+    fn native_mtp_ep4_plan_adds_the_local_layer_78_partition() {
+        let manifest = Glm52WeightManifest {
+            weight_map: BTreeMap::new(),
+        };
+        let plain = manifest
+            .rank_resident_tensor_names(3, crate::Glm52MoeTopo::Ep4, false)
+            .unwrap();
+        let native_mtp = manifest
+            .rank_resident_tensor_names(3, crate::Glm52MoeTopo::Ep4, true)
+            .unwrap();
+        let mtp_prefix = format!("model.layers.{GLM52_MTP_LAYER}.");
+
+        assert!(plain.iter().all(|name| !name.starts_with(&mtp_prefix)));
+        assert!(
+            native_mtp
+                .iter()
+                .any(|name| name == &format!("{mtp_prefix}eh_proj.weight"))
+        );
+        assert!(
+            native_mtp
+                .iter()
+                .any(|name| name == &format!("{mtp_prefix}mlp.experts.192.gate_proj.weight"))
+        );
+        assert!(
+            native_mtp
+                .iter()
+                .any(|name| name == &format!("{mtp_prefix}mlp.experts.255.down_proj.weight"))
+        );
+        assert!(native_mtp.iter().all(|name| {
+            if !name.starts_with(&format!("{mtp_prefix}mlp.experts.")) {
+                return true;
+            }
+            name.split(".mlp.experts.")
+                .nth(1)
+                .and_then(|rest| rest.split('.').next())
+                .and_then(|expert| expert.parse::<usize>().ok())
+                .is_some_and(|expert| (192..256).contains(&expert))
+        }));
+    }
+
+    #[test]
     fn native_mtp_resident_plan_rejects_non_ep_topologies() {
         let manifest = Glm52WeightManifest {
             weight_map: BTreeMap::new(),

@@ -610,8 +610,13 @@ impl Args {
             if self.glm52_native_mtp && self.dflash_draft_model_path.is_some() {
                 bail!("--glm52-native-mtp and --dflash-draft-model-path are mutually exclusive");
             }
-            if self.glm52_native_mtp && !matches!(moe_topo, openinfer_glm52::Glm52MoeTopo::Ep8) {
-                bail!("--glm52-native-mtp currently requires --moe-topo=ep8");
+            if self.glm52_native_mtp
+                && !matches!(
+                    moe_topo,
+                    openinfer_glm52::Glm52MoeTopo::Ep4 | openinfer_glm52::Glm52MoeTopo::Ep8
+                )
+            {
+                bail!("--glm52-native-mtp currently requires --moe-topo=ep4 or ep8");
             }
         }
         Ok(())
@@ -989,6 +994,16 @@ mod tests {
 
     #[cfg(feature = "glm52")]
     #[test]
+    fn glm52_accepts_native_mtp_on_ep4() {
+        let (args, provided) =
+            parse_with_provided(&["openinfer", "--glm52-native-mtp", "--moe-topo", "ep4"]);
+        assert!(args.glm52_native_mtp);
+        args.validate(ModelType::Glm52, &provided)
+            .expect("native MTP should validate on EP4");
+    }
+
+    #[cfg(feature = "glm52")]
+    #[test]
     fn glm52_native_mtp_rejects_a_second_drafter() {
         let (args, provided) = parse_with_provided(&[
             "openinfer",
@@ -1004,13 +1019,16 @@ mod tests {
 
     #[cfg(feature = "glm52")]
     #[test]
-    fn glm52_native_mtp_rejects_non_ep8_topology() {
+    fn glm52_native_mtp_rejects_tp_topology() {
         let (args, provided) =
-            parse_with_provided(&["openinfer", "--glm52-native-mtp", "--moe-topo", "ep4"]);
+            parse_with_provided(&["openinfer", "--glm52-native-mtp", "--moe-topo", "tp4"]);
         let error = args
             .validate(ModelType::Glm52, &provided)
-            .expect_err("native MTP currently requires EP8");
-        assert!(error.to_string().contains("--moe-topo=ep8"), "{error}");
+            .expect_err("native MTP currently requires EP4 or EP8");
+        assert!(
+            error.to_string().contains("--moe-topo=ep4 or ep8"),
+            "{error}"
+        );
     }
 
     #[cfg(feature = "glm52")]

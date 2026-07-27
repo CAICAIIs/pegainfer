@@ -632,7 +632,7 @@ impl Glm52RankModel {
         }
         let mtp = drafter
             .is_mtp()
-            .then(|| Glm52NativeMtp::build(ctx, w, max_model_len))
+            .then(|| Glm52NativeMtp::build(ctx, w, max_model_len, moe_topo))
             .transpose()?;
 
         let embed_raw = w.take_tensor("model.embed_tokens.weight")?;
