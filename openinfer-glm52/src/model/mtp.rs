@@ -84,6 +84,7 @@ pub(super) struct Glm52NativeMtp {
     max_model_len: usize,
     table_width: usize,
     pages_per_slot: usize,
+    ep_ranks: usize,
     positions: CudaSlice<u32>,
     cos: CudaSlice<bf16>,
     sin: CudaSlice<bf16>,
@@ -99,6 +100,7 @@ impl Glm52NativeMtp {
         ctx: &DeviceContext,
         weights: &mut Glm52RankGpuWeights,
         max_model_len: usize,
+        moe_topo: crate::Glm52MoeTopo,
     ) -> Result<Self> {
         let prefix = format!("model.layers.{GLM52_MTP_LAYER}");
         let enorm = build::take_bf16_vec(
@@ -130,13 +132,7 @@ impl Glm52NativeMtp {
             GLM52_HIDDEN,
         )?;
         let bookend = Glm52MtpBookendWeights::new(enorm, hnorm, eh_proj, shared_norm)?;
-        let layer = build::build_decoder_layer(
-            ctx,
-            weights,
-            GLM52_MTP_LAYER,
-            crate::Glm52MoeTopo::Ep8,
-            None,
-        )?;
+        let layer = build::build_decoder_layer(ctx, weights, GLM52_MTP_LAYER, moe_topo, None)?;
 
         let num_blocks = glm52_pool_blocks(max_model_len, GLM52_MAX_BATCH_PER_RANK);
         let table_width = glm52_table_width(max_model_len);
@@ -213,6 +209,7 @@ impl Glm52NativeMtp {
             max_model_len,
             table_width,
             pages_per_slot: (max_model_len + 1).div_ceil(GLM52_FLASHMLA_SPARSE_PAGE_SIZE),
+            ep_ranks: moe_topo.expected_ep_size(),
             positions: ctx.stream.alloc_zeros(GLM52_MAX_BATCH_PER_RANK)?,
             cos: ctx
                 .stream
@@ -556,15 +553,7 @@ impl Glm52NativeMtp {
             let Glm52LayerMlp::MoeEp8(moe) = &self.layer.mlp else {
                 anyhow::bail!("GLM5.2 MTP layer 78 is not EP MoE")
             };
-            glm52_moe_ep_layer(
-                ctx,
-                aux,
-                ep,
-                moe,
-                scratch,
-                rows,
-                crate::weights::GLM52_EP_RANKS * rows,
-            )?;
+            glm52_moe_ep_layer(ctx, aux, ep, moe, scratch, rows, self.ep_ranks * rows)?;
             glm52_layer_finish(ctx, scratch, 0, false)?;
             glm52_mtp_recycle_into(
                 ctx,
