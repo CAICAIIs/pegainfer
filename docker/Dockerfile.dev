@@ -56,7 +56,7 @@ RUN multiarch="$(dpkg-architecture -qDEB_HOST_MULTIARCH)" \
 
 ENV CUDA_HOME=/usr/local/cuda
 ENV OPENINFER_NCCL_ROOT=/opt/nccl
-ENV LD_LIBRARY_PATH=/opt/nccl/lib:/usr/local/cuda/lib64
+ENV LD_LIBRARY_PATH=/opt/nccl/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
 ENV TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
 ENV UV_LINK_MODE=copy
 
