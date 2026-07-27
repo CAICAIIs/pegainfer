@@ -71,7 +71,12 @@ use crate::rows::Rows;
 use crate::runner::Glm52PrefillBatch;
 
 /// FlashMLA sparse attention sub-tile (query rows per launch).
-const PREFILL_ATTN_TILE_ROWS: usize = 512;
+///
+/// The SM100 sparse-prefill kernel accepts arbitrary positive query rows.
+/// Keeping 4K rows in the temporary 64-head buffers cuts a 16K coordinator
+/// chunk from 32 launches to 4 while staying inside the fixed
+/// prefill scratch reservation.
+const PREFILL_ATTN_TILE_ROWS: usize = 4096;
 /// Dense-MLP sub-tile: bounds the 12288-wide gate|up scratch.
 const PREFILL_DENSE_TILE_ROWS: usize = 2048;
 
