@@ -2,7 +2,7 @@
 
 The development image contains the native toolchain required to build
 OpenInfer: CUDA, the Rust nightly pinned by `rust-toolchain.toml`, Python 3,
-uv, Triton, clang, OpenSSL, protoc, and NCCL 2.30.4 or newer.
+uv, Triton, TileLang, clang, OpenSSL, protoc, and NCCL 2.30.4 or newer.
 
 Build it once:
 
@@ -31,6 +31,13 @@ Qwen3.5's build-time AOT compiler uses the image's pinned Triton environment:
 
 ```bash
 docker/dev.sh run cargo build --release --features qwen35
+```
+
+GLM5.2 builds targeting Hopper use the same environment's pinned TileLang:
+
+```bash
+OPENINFER_CUDA_SM=90 docker/dev.sh run \
+  cargo build --release --features glm52
 ```
 
 Mount model weights read-only at their existing absolute path:

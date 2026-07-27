@@ -20,6 +20,7 @@ Environment:
   OPENINFER_DEV_CACHE     Persistent build-cache directory.
   OPENINFER_DEV_CACHE_KEY Override the native build-cache namespace.
   OPENINFER_MODEL_DIR     Read-only model directory mounted at the same path.
+  OPENINFER_CUDA_SM       Forwarded CUDA SM target override.
   EP_DISABLE_GIN          Forwarded when set; useful on trays without a GIN NIC.
 EOF
 }
@@ -69,6 +70,10 @@ esac
 
 if [[ -n "${EP_DISABLE_GIN:-}" ]]; then
   docker_args+=(--env "EP_DISABLE_GIN=$EP_DISABLE_GIN")
+fi
+
+if [[ -n "${OPENINFER_CUDA_SM:-}" ]]; then
+  docker_args+=(--env "OPENINFER_CUDA_SM=$OPENINFER_CUDA_SM")
 fi
 
 if [[ -n "${OPENINFER_MODEL_DIR:-}" ]]; then
