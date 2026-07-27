@@ -18,6 +18,7 @@ Environment:
   OPENINFER_DEV_IMAGE     Image tag (default: openinfer-dev:cu132).
   OPENINFER_DEV_CONTAINER Interactive container name (default: openinfer-dev).
   OPENINFER_DEV_CACHE     Persistent build-cache directory.
+  OPENINFER_DEV_CACHE_KEY Override the native build-cache namespace.
   OPENINFER_MODEL_DIR     Read-only model directory mounted at the same path.
   EP_DISABLE_GIN          Forwarded when set; useful on trays without a GIN NIC.
 EOF
@@ -34,6 +35,15 @@ build_image() {
     "$repo_root"
 }
 
+toolkit_id="$(
+  docker image inspect \
+    --format '{{ index .Config.Labels "org.openinfer.cuda-image" }}' \
+    "$image" 2>/dev/null || true
+)"
+toolkit_id="${toolkit_id:-$image}"
+cache_key="${OPENINFER_DEV_CACHE_KEY:-$(printf '%s' "$toolkit_id" | sed 's/[^A-Za-z0-9_.-]/_/g')}"
+target_cache="$cache_root/target/$cache_key"
+
 docker_args=(
   --gpus all
   --ipc host
@@ -43,18 +53,18 @@ docker_args=(
   --volume "$repo_root:$repo_root"
   --volume "$cache_root/cargo-registry:/opt/cargo/registry"
   --volume "$cache_root/cargo-git:/opt/cargo/git"
-  --volume "$cache_root/target:$repo_root/target"
+  --volume "$target_cache:$repo_root/target"
   --workdir "$repo_root"
 )
 
 # A linked worktree stores a .git file that points at the main checkout's
 # common git directory. Mount that directory at the same absolute path so
-# build.rs can inspect submodule state without making the whole parent tree
-# visible or writable.
+# build.rs can inspect and initialize submodules without making the whole
+# parent tree visible.
 git_common_dir="$(git -C "$repo_root" rev-parse --path-format=absolute --git-common-dir)"
 case "$git_common_dir/" in
   "$repo_root/"*) ;;
-  *) docker_args+=(--volume "$git_common_dir:$git_common_dir:ro") ;;
+  *) docker_args+=(--volume "$git_common_dir:$git_common_dir") ;;
 esac
 
 if [[ -n "${EP_DISABLE_GIN:-}" ]]; then
@@ -79,7 +89,7 @@ case "${1:-}" in
     ;;
   shell)
     shift
-    mkdir -p "$cache_root"/{cargo-registry,cargo-git,target}
+    mkdir -p "$cache_root"/{cargo-registry,cargo-git} "$target_cache"
     if (( $# == 0 )); then
       set -- /bin/bash
     fi
@@ -88,7 +98,7 @@ case "${1:-}" in
   run)
     shift
     (( $# > 0 )) || { usage >&2; exit 2; }
-    mkdir -p "$cache_root"/{cargo-registry,cargo-git,target}
+    mkdir -p "$cache_root"/{cargo-registry,cargo-git} "$target_cache"
     docker run --rm "${docker_args[@]}" "$image" "$@"
     ;;
   *)
