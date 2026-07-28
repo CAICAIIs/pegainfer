@@ -192,6 +192,39 @@ fn lone_scheduled_defers_until_first_token() {
     );
 }
 
+/// P/D metadata can be the only event in one ready burst. It must survive
+/// until the terminal output rather than disappearing with that empty burst.
+#[test]
+fn lone_kv_transfer_defers_until_terminal_output() {
+    let mut d = Demux::new();
+    d.add("req-handoff");
+    let params = serde_json::json!({"openinfer_pd": {"version": 1}});
+    d.emit(
+        "req-handoff",
+        TokenEvent::KvTransfer {
+            params: params.clone(),
+        },
+    );
+    assert!(d.drain());
+    assert!(d.next_output().is_none(), "KV transfer alone emits nothing");
+    assert!(
+        d.streams["req-handoff"].kv_transfer_params.is_some(),
+        "handoff metadata remains attached to the live request"
+    );
+
+    d.emit(
+        "req-handoff",
+        TokenEvent::Finished {
+            finish_reason: FinishReason::Stop,
+            prompt_tokens: 4,
+            completion_tokens: 1,
+        },
+    );
+    assert!(d.drain());
+    let output = d.next_output().expect("terminal output");
+    assert_eq!(output.outputs[0].kv_transfer_params, Some(params));
+}
+
 /// First-token metadata (queued/scheduled events + prefill stats) rides the
 /// first output exactly once, and `num_computed_tokens` is prompt minus the
 /// prefix-cache hit — not the full prompt.

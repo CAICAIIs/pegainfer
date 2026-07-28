@@ -948,7 +948,7 @@ fn enqueue_engine_command(
             let id = RequestId(*next_request_id);
             *next_request_id += 1;
             tracker.enter_queue(id, req.trace_parent);
-            let pending = PendingRequest::from_scheduler_request(id, req);
+            let pending = PendingRequest::from_scheduler_request(id, *req);
             if pending_control.is_empty() {
                 deferred.push(pending);
             } else {

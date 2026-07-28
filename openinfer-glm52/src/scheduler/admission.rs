@@ -123,6 +123,19 @@ fn reject(req: &GenerateRequest, message: String) {
     });
 }
 
+fn reject_native_pd_error(
+    state: &mut offload::NativePdState,
+    rank: usize,
+    req: &GenerateRequest,
+    err: &anyhow::Error,
+) {
+    state.clear(rank);
+    reject(
+        req,
+        format!("GLM5.2 native-MTP P/D restore failed ({err:#}); retry via P"),
+    );
+}
+
 /// Fast-reject invalid requests at intake (Scheduled → Rejected), otherwise
 /// bind the request to exactly one rank queue. The binding is permanent so
 /// frontend `engine_index`, metrics labels, and actual KV ownership agree.
@@ -239,14 +252,21 @@ pub(super) fn admit_from_queue(
                     continue;
                 };
                 let offload = offload.expect("native P/D state requires offload");
-                match offload::admit_native_mtp_pd(
+                let outcome = match offload::admit_native_mtp_pd(
                     state,
                     rank,
                     &offload[rank],
                     &pools[rank],
                     &req,
                     handoff,
-                )? {
+                ) {
+                    Ok(outcome) => outcome,
+                    Err(err) => {
+                        reject_native_pd_error(state, rank, &req, &err);
+                        continue;
+                    }
+                };
+                match outcome {
                     VllmAdmitOutcome::Admit { kv, cached_tokens } => Some((*kv, cached_tokens)),
                     VllmAdmitOutcome::Park => {
                         pending[rank].push_front(req);
@@ -507,5 +527,25 @@ mod tests {
         let many = request(vec![10, 11], SamplingParams::default(), 2);
         let error = validate_request(&many, 4096, true).expect_err("decode must be rejected");
         assert!(error.contains("requires max_tokens=1"), "{error}");
+    }
+
+    #[test]
+    fn native_pd_restore_error_rejects_only_the_request() {
+        let mut req = request(vec![10], SamplingParams::default(), 1);
+        let (token_tx, mut token_rx) = openinfer_core::engine::TokenSink::standalone();
+        req.token_tx = token_tx;
+        let mut state = offload::NativePdState::new(1);
+
+        reject_native_pd_error(&mut state, 0, &req, &anyhow::anyhow!("invalid handoff"));
+
+        assert!(matches!(
+            token_rx.try_recv().map(|(_, event)| event),
+            Ok(TokenEvent::Scheduled { .. })
+        ));
+        assert!(matches!(
+            token_rx.try_recv().map(|(_, event)| event),
+            Ok(TokenEvent::Rejected { message, .. })
+                if message.contains("invalid handoff")
+        ));
     }
 }

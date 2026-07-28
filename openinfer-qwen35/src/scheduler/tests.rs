@@ -17,6 +17,7 @@ fn send_rejection_reports_kv_lifetime_request_tokens() {
         params: SamplingParams::default(),
         max_tokens: 65,
         lora_adapter: None,
+        kv_transfer_params: None,
         token_tx,
         logprobs: 0,
         echo: false,
@@ -102,6 +103,7 @@ fn tp2_scheduler_chunked_prefill_then_decode_smoke() {
             },
             max_tokens: 3,
             lora_adapter: None,
+            kv_transfer_params: None,
             token_tx,
             logprobs: 1,
             echo: false,
@@ -128,7 +130,11 @@ fn tp2_scheduler_chunked_prefill_then_decode_smoke() {
                 assert_eq!(tokens.len(), 3);
                 break;
             }
-            Some(TokenEvent::Scheduled { .. } | TokenEvent::PromptTokens { .. }) => {}
+            Some(
+                TokenEvent::Scheduled { .. }
+                | TokenEvent::PromptTokens { .. }
+                | TokenEvent::KvTransfer { .. },
+            ) => {}
             Some(TokenEvent::Error { message, .. }) => {
                 panic!("TP scheduler smoke failed: {message}")
             }
@@ -152,6 +158,7 @@ fn send_rejection_reports_context_window_limit() {
         params: SamplingParams::default(),
         max_tokens: 17,
         lora_adapter: None,
+        kv_transfer_params: None,
         token_tx,
         logprobs: 0,
         echo: false,

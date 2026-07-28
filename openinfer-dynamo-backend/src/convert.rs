@@ -108,7 +108,7 @@ pub fn map_token_event(event: TokenEvent) -> Mapped {
         // surface it as OpenAI `prompt_tokens_details.cached_tokens`.
         TokenEvent::Scheduled { cached_tokens, .. } => Mapped::Cached(cached_tokens as u32),
         // Echo / prompt-logprobs are not surfaced in M1.
-        TokenEvent::PromptTokens { .. } => Mapped::Ignore,
+        TokenEvent::PromptTokens { .. } | TokenEvent::KvTransfer { .. } => Mapped::Ignore,
     }
 }
 

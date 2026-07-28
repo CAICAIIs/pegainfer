@@ -157,6 +157,7 @@ fn generate(
             params: SamplingParams::default(),
             max_tokens,
             lora_adapter: None,
+            kv_transfer_params: None,
             token_tx,
             logprobs,
             echo: false,
@@ -170,7 +171,11 @@ fn generate(
                 id,
                 top_logprobs: logprob.map(|lp| lp.top_logprobs).unwrap_or_default(),
             }),
-            Some(TokenEvent::Scheduled { .. } | TokenEvent::PromptTokens { .. }) => {}
+            Some(
+                TokenEvent::Scheduled { .. }
+                | TokenEvent::PromptTokens { .. }
+                | TokenEvent::KvTransfer { .. },
+            ) => {}
             Some(TokenEvent::Finished { .. }) => return steps,
             Some(TokenEvent::Error { message, .. }) => panic!("generation failed: {message}"),
             Some(TokenEvent::Rejected { message, .. }) => panic!("generation rejected: {message}"),
@@ -201,6 +206,7 @@ fn generate_concurrent(handle: &EngineHandle, requests: Vec<(Vec<u32>, usize)>) 
                     params: SamplingParams::default(),
                     max_tokens,
                     lora_adapter: None,
+                    kv_transfer_params: None,
                     token_tx,
                     logprobs: 0,
                     echo: false,
@@ -222,7 +228,11 @@ fn generate_concurrent(handle: &EngineHandle, requests: Vec<(Vec<u32>, usize)>) 
                         id,
                         top_logprobs: logprob.map(|lp| lp.top_logprobs).unwrap_or_default(),
                     }),
-                    Some(TokenEvent::Scheduled { .. } | TokenEvent::PromptTokens { .. }) => {}
+                    Some(
+                        TokenEvent::Scheduled { .. }
+                        | TokenEvent::PromptTokens { .. }
+                        | TokenEvent::KvTransfer { .. },
+                    ) => {}
                     Some(TokenEvent::Finished { .. }) => break,
                     Some(TokenEvent::Error { message, .. }) => {
                         panic!("generation failed: {message}")
@@ -255,6 +265,7 @@ fn prefill_next(handle: &EngineHandle, context: Vec<u32>, logprobs: usize) -> St
             params: SamplingParams::default(),
             max_tokens: 1,
             lora_adapter: None,
+            kv_transfer_params: None,
             token_tx,
             logprobs,
             echo: true,
@@ -269,7 +280,11 @@ fn prefill_next(handle: &EngineHandle, context: Vec<u32>, logprobs: usize) -> St
                     top_logprobs: logprob.map(|lp| lp.top_logprobs).unwrap_or_default(),
                 };
             }
-            Some(TokenEvent::Scheduled { .. } | TokenEvent::PromptTokens { .. }) => {}
+            Some(
+                TokenEvent::Scheduled { .. }
+                | TokenEvent::PromptTokens { .. }
+                | TokenEvent::KvTransfer { .. },
+            ) => {}
             Some(TokenEvent::Finished { .. }) => panic!("echo prefill finished without a token"),
             Some(TokenEvent::Error { message, .. }) => panic!("prefill failed: {message}"),
             Some(TokenEvent::Rejected { message, .. }) => panic!("prefill rejected: {message}"),
@@ -716,6 +731,7 @@ fn dflash_request_in_draft_headroom_is_rejected_not_panicked() {
             params: SamplingParams::default(),
             max_tokens,
             lora_adapter: None,
+            kv_transfer_params: None,
             token_tx,
             logprobs: 0,
             echo: false,
@@ -728,7 +744,11 @@ fn dflash_request_in_draft_headroom_is_rejected_not_panicked() {
                 eprintln!("draft-headroom request rejected as expected: {message}");
                 break;
             }
-            Some(TokenEvent::Scheduled { .. } | TokenEvent::PromptTokens { .. }) => {}
+            Some(
+                TokenEvent::Scheduled { .. }
+                | TokenEvent::PromptTokens { .. }
+                | TokenEvent::KvTransfer { .. },
+            ) => {}
             Some(TokenEvent::Token { .. } | TokenEvent::Finished { .. }) => {
                 panic!("draft-headroom request was admitted instead of rejected")
             }

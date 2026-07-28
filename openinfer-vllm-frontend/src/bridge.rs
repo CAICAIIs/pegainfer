@@ -424,6 +424,9 @@ impl LocalEngineBridge {
 struct RequestStreamState {
     first_token_events: Option<Vec<EngineCoreEvent>>,
     first_token_prefill_stats: Option<PrefillStats>,
+    /// P/D handoff metadata can arrive in a burst with no token or terminal
+    /// event, so retain it until the next output carries it to the router.
+    kv_transfer_params: Option<serde_json::Value>,
     abort_reason: Arc<AtomicU8>,
     has_emitted_tokens: bool,
     /// Request-lifetime root span (submit → finish). The scheduler opens
@@ -442,6 +445,7 @@ impl RequestStreamState {
         Self {
             first_token_events: None,
             first_token_prefill_stats: None,
+            kv_transfer_params: None,
             abort_reason,
             has_emitted_tokens: false,
             trace_root,
@@ -537,7 +541,6 @@ fn reduce_request(
     let mut has_logprobs = false;
     let mut finish_reason: Option<EngineCoreFinishReason> = None;
     let mut stop_reason: Option<StopReason> = None;
-    let mut kv_transfer_params: Option<serde_json::Value> = None;
     let mut terminated = false;
 
     for event in events {
@@ -584,7 +587,7 @@ fn reduce_request(
                 // Prompt logprobs are intentionally deferred for this bridge.
             }
             TokenEvent::KvTransfer { params } => {
-                kv_transfer_params = Some(params);
+                state.kv_transfer_params = Some(params);
             }
             TokenEvent::Finished {
                 finish_reason: fr, ..
@@ -623,7 +626,7 @@ fn reduce_request(
         state.first_token_events.take(),
         state.first_token_prefill_stats.take(),
     );
-    output.kv_transfer_params = kv_transfer_params;
+    output.kv_transfer_params = state.kv_transfer_params.take();
     (Some(output), terminated)
 }
 

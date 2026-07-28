@@ -122,7 +122,7 @@ pub enum EngineControlRequest {
 }
 
 pub enum EngineCommand {
-    Generate(GenerateRequest),
+    Generate(Box<GenerateRequest>),
     Control(EngineControlRequest),
 }
 
@@ -559,9 +559,9 @@ impl EngineHandle {
             Some(submit_tx) => submit_tx.send(req),
             None => match self.inner.command_tx.as_ref() {
                 Some(command_tx) => command_tx
-                    .send(EngineCommand::Generate(req))
+                    .send(EngineCommand::Generate(Box::new(req)))
                     .map_err(|err| match err.0 {
-                        EngineCommand::Generate(req) => mpsc::error::SendError(req),
+                        EngineCommand::Generate(req) => mpsc::error::SendError(*req),
                         EngineCommand::Control(_) => unreachable!("submitted generate command"),
                     }),
                 None => Err(mpsc::error::SendError(req)),

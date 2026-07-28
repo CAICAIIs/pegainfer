@@ -100,6 +100,7 @@ fn timed_generate(handle: &EngineHandle, prompt_tokens: Vec<u32>) -> (usize, Dur
             },
             max_tokens: GENERATED_TOKENS,
             lora_adapter: None,
+            kv_transfer_params: None,
             token_tx,
             logprobs: 0,
             echo: false,
@@ -110,7 +111,11 @@ fn timed_generate(handle: &EngineHandle, prompt_tokens: Vec<u32>) -> (usize, Dur
     loop {
         match rx.blocking_recv().map(|(_, event)| event) {
             Some(TokenEvent::Token { .. }) => count += 1,
-            Some(TokenEvent::Scheduled { .. } | TokenEvent::PromptTokens { .. }) => {}
+            Some(
+                TokenEvent::Scheduled { .. }
+                | TokenEvent::PromptTokens { .. }
+                | TokenEvent::KvTransfer { .. },
+            ) => {}
             Some(TokenEvent::Finished { .. }) => return (count, start.elapsed()),
             Some(TokenEvent::Error { message, .. }) => panic!("generation failed: {message}"),
             Some(TokenEvent::Rejected { message, .. }) => panic!("generation rejected: {message}"),

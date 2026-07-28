@@ -198,6 +198,7 @@ fn sample_wave(
                     params: *params,
                     max_tokens: POSITIONS,
                     lora_adapter: None,
+                    kv_transfer_params: None,
                     token_tx,
                     logprobs: 0,
                     echo: false,
@@ -214,7 +215,11 @@ fn sample_wave(
             loop {
                 match rx.blocking_recv().map(|(_, event)| event) {
                     Some(TokenEvent::Token { id, .. }) => tokens.push(id),
-                    Some(TokenEvent::Scheduled { .. } | TokenEvent::PromptTokens { .. }) => {}
+                    Some(
+                        TokenEvent::Scheduled { .. }
+                        | TokenEvent::PromptTokens { .. }
+                        | TokenEvent::KvTransfer { .. },
+                    ) => {}
                     Some(TokenEvent::Finished { .. }) => break,
                     Some(TokenEvent::Error { message, .. }) => {
                         panic!("generation failed: {message}")

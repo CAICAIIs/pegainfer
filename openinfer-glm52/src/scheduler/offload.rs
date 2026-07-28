@@ -230,6 +230,10 @@ pub(super) fn native_pd_tail_len(committed_len: usize) -> usize {
         .map_or(0, |last| last % PAGE + 1)
 }
 
+fn native_pd_needs_tail_load(cached_tokens: usize, committed_len: usize, tail_len: usize) -> bool {
+    tail_len > 0 && cached_tokens < committed_len
+}
+
 impl NativePdState {
     pub(super) fn new(ranks: usize) -> Self {
         Self {
@@ -724,7 +728,7 @@ pub(super) fn admit_native_mtp_pd(
     if cached_tokens < full_len {
         return native_pd_wait(state, rank, req, "full-page rematch");
     }
-    if handoff.tail_len > 0 {
+    if native_pd_needs_tail_load(cached_tokens, handoff.committed_len, handoff.tail_len) {
         let key = hex::decode(handoff.tail_key.as_deref().expect("validated tail key"))
             .context("native-MTP P/D tail key is not hex")?;
         anyhow::ensure!(
@@ -996,5 +1000,11 @@ mod tests {
         assert_eq!(native_pd_tail_len(PAGE), PAGE);
         assert_eq!(native_pd_tail_len(PAGE + 1), 1);
         assert_eq!(native_pd_tail_len(2 * PAGE), PAGE);
+    }
+
+    #[test]
+    fn native_pd_reuses_an_already_cached_aligned_tail() {
+        assert!(!native_pd_needs_tail_load(PAGE, PAGE, PAGE));
+        assert!(native_pd_needs_tail_load(0, PAGE, PAGE));
     }
 }

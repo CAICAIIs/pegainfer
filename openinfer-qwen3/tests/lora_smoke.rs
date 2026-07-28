@@ -105,6 +105,7 @@ fn generate_tokens(
             params: SamplingParams::default(),
             max_tokens,
             lora_adapter,
+            kv_transfer_params: None,
             token_tx,
             logprobs: 0,
             echo: false,
@@ -115,7 +116,11 @@ fn generate_tokens(
     loop {
         match token_rx.blocking_recv().map(|(_, event)| event) {
             Some(TokenEvent::Token { id, .. }) => tokens.push(id),
-            Some(TokenEvent::PromptTokens { .. } | TokenEvent::Scheduled { .. }) => {}
+            Some(
+                TokenEvent::PromptTokens { .. }
+                | TokenEvent::Scheduled { .. }
+                | TokenEvent::KvTransfer { .. },
+            ) => {}
             Some(TokenEvent::Finished { finish_reason, .. }) => return (tokens, finish_reason),
             Some(TokenEvent::Error { message, .. }) => panic!("generation failed: {message}"),
             Some(TokenEvent::Rejected { message, .. }) => panic!("generation rejected: {message}"),
