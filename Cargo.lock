@@ -3201,6 +3201,7 @@ dependencies = [
  "fastrace",
  "log",
  "serde",
+ "serde_json",
  "tokio",
 ]
 

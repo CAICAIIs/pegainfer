@@ -489,6 +489,14 @@ impl RequestKv {
             .collect()
     }
 
+    /// Physical pages covering the KV tokens currently committed to this
+    /// request, in logical sequence order.
+    pub fn current_page_indices(&self) -> Vec<i32> {
+        let mut pages = self.page_indices();
+        pages.truncate(self.seq.kv_position().div_ceil(self.seq.block_size()));
+        pages
+    }
+
     /// Page IDs covering exactly the KV tokens present after this step
     /// appends `new_tokens` (`kv_position + new_tokens`). `page_indices()`
     /// can hold one block more: kvbm's `schedule_decode` eagerly allocates

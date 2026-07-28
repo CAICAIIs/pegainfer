@@ -31,6 +31,7 @@ use crate::moe_tp::Glm52MoeTpSliceBank;
 use crate::moe_tp::Glm52MoeTpState;
 use crate::moe_tp::Glm52TpExchange;
 use crate::moe_tp::load_tp_slice_layer;
+use crate::prefill_tp::Glm52PrefillOutput;
 use crate::weights::Glm52RankGpuContext;
 use crate::weights::Glm52RankGpuWeights;
 use crate::weights::Glm52RankLoadBundle;
@@ -105,8 +106,15 @@ pub(crate) struct Glm52PrefillBatch {
     pub(crate) request_indptr: Vec<u32>,
     pub(crate) block_indptr: Vec<u32>,
     pub(crate) block_ids: Vec<i32>,
+    /// Scheduler slot owning each request range. Needed to address the
+    /// per-slot native-MTP speculative scratch pages after the boundary.
+    pub(crate) request_slots: Vec<usize>,
     pub(crate) padding_block: i32,
     pub(crate) slot_mapping: Vec<i64>,
+    /// Shifted-token carry for MTP layer 78, one per request range. A prompt
+    /// token continues a mid-prompt chunk; `None` means the target boundary
+    /// output becomes the carry after sampling.
+    pub(crate) mtp_next_tokens: Vec<Option<u32>>,
     pub(crate) output_rows: Vec<u32>,
     pub(crate) sampling: Vec<Glm52RowSample>,
     pub(crate) seed: u64,
@@ -126,6 +134,10 @@ impl Glm52PrefillBatch {
             "GLM5.2 prefill request row ranges are invalid"
         );
         let requests = self.request_indptr.len() - 1;
+        ensure!(
+            self.mtp_next_tokens.len() == requests && self.request_slots.len() == requests,
+            "GLM5.2 prefill request metadata differs from {requests} request ranges"
+        );
         ensure!(
             self.block_indptr.len() == requests + 1
                 && self.block_indptr.first() == Some(&0)
@@ -154,7 +166,7 @@ impl Glm52PrefillBatch {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Glm52MtpAppend {
     /// Row in the target step's retained final-normalized hidden buffer.
     pub(crate) target_row: usize,
@@ -163,6 +175,9 @@ pub(crate) struct Glm52MtpAppend {
     /// first-pass input construction.
     pub(crate) input_token: u32,
     pub(crate) position: usize,
+    /// Target BlockPool pages covering the committed sequence after this
+    /// target step. Layer 78 must address these same physical page IDs.
+    pub(crate) pages: Vec<i32>,
 }
 
 /// One rank's work in a fleet-wide native-MTP round. The coordinator selects
@@ -204,6 +219,13 @@ impl Glm52MtpRound {
             Self::Context { source_bucket, .. } | Self::Propose { source_bucket, .. } => {
                 Some(*source_bucket)
             }
+        }
+    }
+
+    pub(crate) fn appends(&self) -> &[Glm52MtpAppend] {
+        match self {
+            Self::Reset { .. } => &[],
+            Self::Context { appends, .. } | Self::Propose { appends, .. } => appends,
         }
     }
 }
@@ -259,7 +281,7 @@ enum Glm52RankCommand {
     },
     PrefillChunk {
         batch: Glm52PrefillBatch,
-        resp: Sender<Result<Vec<u32>>>,
+        resp: Sender<Result<Glm52PrefillOutput>>,
     },
     /// Non-collective: load the DSpark draft model onto this rank. Issued to
     /// every rank after BuildModel (the draft reuses the target's
@@ -452,7 +474,7 @@ impl Glm52RankWorker {
     pub(crate) fn prefill_chunk_async(
         &self,
         batch: Glm52PrefillBatch,
-    ) -> Result<Receiver<Result<Vec<u32>>>> {
+    ) -> Result<Receiver<Result<Glm52PrefillOutput>>> {
         let (resp_tx, resp_rx) = bounded(1);
         self.tx
             .send(Glm52RankCommand::PrefillChunk {
@@ -642,7 +664,7 @@ impl Glm52Worker {
     pub(crate) fn prefill_chunk_async(
         &self,
         batch: Glm52PrefillBatch,
-    ) -> Result<Receiver<Result<Vec<u32>>>> {
+    ) -> Result<Receiver<Result<Glm52PrefillOutput>>> {
         match self {
             Self::Local(worker) => worker.prefill_chunk_async(batch),
             Self::Remote(_) => {
@@ -789,7 +811,12 @@ impl Glm52RankThreadState {
             let dev_ctx = self.ctx.device_context()?;
             let tp_slices_started = Instant::now();
             let mut slowest_layer = None::<(usize, f64)>;
-            for layer in crate::config::GLM52_DENSE_LAYERS..crate::config::GLM52_LAYERS {
+            let end = if self.bundle.plan.native_mtp {
+                crate::config::GLM52_MTP_LAYER + 1
+            } else {
+                crate::config::GLM52_LAYERS
+            };
+            for layer in crate::config::GLM52_DENSE_LAYERS..end {
                 let layer_started = Instant::now();
                 let bank = load_tp_slice_layer(
                     &dev_ctx,
@@ -989,10 +1016,8 @@ impl Glm52RankThreadState {
         runtime.model.mtp_propose(
             &dev_ctx,
             &runtime.aux_ctx,
-            runtime
-                .ep8
-                .as_mut()
-                .context("GLM5.2 native MTP requires the EP8 collective state")?,
+            runtime.ep8.as_mut(),
+            runtime.tp.as_mut(),
             round,
         )
     }
@@ -1143,7 +1168,7 @@ impl Glm52RankThreadState {
         )
     }
 
-    fn prefill_chunk(&mut self, batch: &Glm52PrefillBatch) -> Result<Vec<u32>> {
+    fn prefill_chunk(&mut self, batch: &Glm52PrefillBatch) -> Result<Glm52PrefillOutput> {
         batch.validate()?;
         let dev_ctx = self.ctx.device_context()?;
         let runtime = self
@@ -1152,7 +1177,7 @@ impl Glm52RankThreadState {
             .context("GLM5.2 prefill chunk before build_model")?;
         runtime
             .model
-            .prefill_chunk(&dev_ctx, batch, runtime.tp.as_mut())
+            .prefill_chunk(&dev_ctx, &runtime.aux_ctx, batch, runtime.tp.as_mut())
     }
 
     fn vllm_rope_fixup(&mut self, pages: &[i32]) -> Result<()> {

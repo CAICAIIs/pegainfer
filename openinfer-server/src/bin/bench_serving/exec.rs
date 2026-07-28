@@ -135,6 +135,7 @@ pub(crate) fn run_scheduler_stream(
             params,
             max_tokens,
             lora_adapter: None,
+            kv_transfer_params: None,
             token_tx,
             logprobs: 0,
             echo: false,
@@ -148,7 +149,11 @@ pub(crate) fn run_scheduler_stream(
                     return Ok(StreamOutcome { finished: false });
                 }
             }
-            Some(TokenEvent::PromptTokens { .. } | TokenEvent::Scheduled { .. }) => {}
+            Some(
+                TokenEvent::PromptTokens { .. }
+                | TokenEvent::Scheduled { .. }
+                | TokenEvent::KvTransfer { .. },
+            ) => {}
             Some(TokenEvent::Finished { .. }) => return Ok(StreamOutcome { finished: true }),
             Some(TokenEvent::Error { message, .. }) => {
                 anyhow::bail!("scheduler request failed: {message}");

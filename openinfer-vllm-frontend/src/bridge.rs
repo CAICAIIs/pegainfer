@@ -370,6 +370,11 @@ impl LocalEngineBridge {
                 return Ok(());
             }
         };
+        let kv_transfer_params = sampling_params
+            .extra_args
+            .as_ref()
+            .and_then(|args| args.get("kv_transfer_params"))
+            .cloned();
 
         let tag: RequestTag = Arc::from(request_id.as_str());
         let abort_reason = Arc::new(AtomicU8::new(RequestAbortReason::None as u8));
@@ -399,6 +404,7 @@ impl LocalEngineBridge {
                 params: convert_sampling(&sampling_params),
                 max_tokens: sampling_params.max_tokens as usize,
                 lora_adapter,
+                kv_transfer_params,
                 token_tx,
                 logprobs: requested_logprobs(&sampling_params),
                 echo: false,
@@ -531,6 +537,7 @@ fn reduce_request(
     let mut has_logprobs = false;
     let mut finish_reason: Option<EngineCoreFinishReason> = None;
     let mut stop_reason: Option<StopReason> = None;
+    let mut kv_transfer_params: Option<serde_json::Value> = None;
     let mut terminated = false;
 
     for event in events {
@@ -576,6 +583,9 @@ fn reduce_request(
             TokenEvent::PromptTokens { .. } => {
                 // Prompt logprobs are intentionally deferred for this bridge.
             }
+            TokenEvent::KvTransfer { params } => {
+                kv_transfer_params = Some(params);
+            }
             TokenEvent::Finished {
                 finish_reason: fr, ..
             } => {
@@ -604,7 +614,7 @@ fn reduce_request(
     }
 
     let logprobs = has_logprobs.then_some(MaybeWireLogprobs::Direct(Logprobs { positions }));
-    let output = engine_output(
+    let mut output = engine_output(
         request_id.to_string(),
         token_ids,
         logprobs,
@@ -613,6 +623,7 @@ fn reduce_request(
         state.first_token_events.take(),
         state.first_token_prefill_stats.take(),
     );
+    output.kv_transfer_params = kv_transfer_params;
     (Some(output), terminated)
 }
 

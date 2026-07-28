@@ -11,6 +11,7 @@ use anyhow::Context as _;
 use anyhow::Result;
 use anyhow::ensure;
 use cudarc::driver::CudaSlice;
+use cudarc::driver::DevicePtr;
 use half::bf16;
 use openinfer_core::cuda_graph::CudaGraphState;
 use openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN;
@@ -19,11 +20,13 @@ use openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_TOPK;
 use openinfer_kernels::ops::Glm52FlashMlaSparseDecode;
 use openinfer_kernels::ops::Glm52IndexerCacheLayout;
 use openinfer_kernels::ops::argmax_bf16_split_into;
+use openinfer_kernels::ops::copy_hidden_rows_raw_into;
 use openinfer_kernels::ops::embedding_rows_into;
 use openinfer_kernels::ops::glm52_flashmla_sparse_decode_num_sm_parts;
 use openinfer_kernels::ops::rms_norm_rows_into;
 use openinfer_kernels::tensor::DeviceContext;
 use openinfer_kernels::tensor::DeviceMatrix;
+use openinfer_kv_offload::KvArena;
 
 use super::GLM52_DECODE_BUCKETS;
 use super::GLM52_MAX_BATCH_PER_RANK;
@@ -45,19 +48,22 @@ use crate::indexer::Glm52IndexerScratch;
 use crate::layer::Glm52DecodeStep;
 use crate::layer::Glm52DecoderLayerWeights;
 use crate::layer::Glm52LayerCaches;
-use crate::layer::Glm52LayerIndexMode;
 use crate::layer::Glm52LayerMlp;
 use crate::layer::glm52_layer_attention_half;
 use crate::layer::glm52_layer_finish;
+use crate::mla_decode::Glm52MlaBackend;
 use crate::mla_decode::Glm52MlaSchedMetadata;
 use crate::mla_decode::glm52_select_mla_backend;
+use crate::moe_decode::run_router_into;
 use crate::moe_ep_wo::Glm52MoeEpState;
+use crate::moe_tp::Glm52MoeTpRank;
 use crate::mtp::GLM52_MTP_DRAFTS;
 use crate::mtp::Glm52MtpBookendWeights;
 use crate::mtp::Glm52MtpScratch;
 use crate::mtp::glm52_mtp_prepare_into;
 use crate::mtp::glm52_mtp_recycle_into;
 use crate::rows::Rows;
+use crate::runner::Glm52MtpAppend;
 use crate::runner::Glm52MtpRound;
 use crate::scratch::Glm52DecodeScratch;
 use crate::weights::Glm52RankGpuWeights;
@@ -73,17 +79,85 @@ struct Glm52MtpBucket {
     decoder_input: Rows<GLM52_HIDDEN>,
     block_table: CudaSlice<i32>,
     compute_graph: CudaGraphState,
-    reuse_graph: CudaGraphState,
+}
+
+pub(super) struct Glm52MtpProposalSeed<'a> {
+    pub(super) previous: &'a Rows<GLM52_HIDDEN>,
+    pub(super) draft1: &'a [u32],
+}
+
+fn mtp_cache_bytes(
+    topology: crate::Glm52MoeTopo,
+    backend: Glm52MlaBackend,
+) -> (usize, Option<usize>) {
+    let execution = backend.cache_bytes_per_token();
+    let wire =
+        (topology == crate::Glm52MoeTopo::Tp4).then_some(GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN);
+    (execution, wire)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proposal_scratch_backs_up_partial_committed_page() {
+        let (table, copy) = proposal_page_table(&[11, 37], 127, [100, 101]).unwrap();
+        assert_eq!(table, [11, 37, 101]);
+        assert_eq!(copy, Some(37));
+    }
+
+    #[test]
+    fn proposal_scratch_appends_after_aligned_committed_page() {
+        let (table, copy) = proposal_page_table(&[11, 37], 128, [100, 101]).unwrap();
+        assert_eq!(table, [11, 37, 100, 101]);
+        assert_eq!(copy, None);
+    }
+
+    #[test]
+    fn tp4_mtp_keeps_flashinfer_execution_separate_from_pd_wire_layout() {
+        let (execution, wire) =
+            mtp_cache_bytes(crate::Glm52MoeTopo::Tp4, Glm52MlaBackend::FlashInferFp8);
+        assert_eq!(execution, 576);
+        assert_eq!(wire, Some(656));
+    }
+}
+
+const MTP_SCRATCH_PAGES_PER_SLOT: usize = 2;
+
+fn proposal_page_table(
+    committed_pages: &[i32],
+    committed_len: usize,
+    scratch: [i32; MTP_SCRATCH_PAGES_PER_SLOT],
+) -> Result<(Vec<i32>, Option<i32>)> {
+    let mut table = committed_pages.to_vec();
+    let copy_source = if committed_len.is_multiple_of(GLM52_FLASHMLA_SPARSE_PAGE_SIZE) {
+        table.push(scratch[0]);
+        None
+    } else {
+        let source = *table
+            .last()
+            .context("GLM5.2 MTP partial committed context has no page")?;
+        Some(source)
+    };
+    table.push(scratch[1]);
+    Ok((table, copy_source))
 }
 
 pub(super) struct Glm52NativeMtp {
     bookend: Glm52MtpBookendWeights,
     layer: Glm52DecoderLayerWeights,
+    /// Local single-token proposal cache, in the selected decode backend's
+    /// native layout (576 B/token for TP4 FlashInfer).
     cache: Glm52LayerCaches,
+    /// TP4 P/D wire cache. Decode workers consume fp8_ds_mla at 656 B/token,
+    /// so the producer keeps this alongside its local FlashInfer cache.
+    transfer_cache: Option<Glm52LayerCaches>,
+    cache_bytes_per_token: usize,
     buckets: [Glm52MtpBucket; GLM52_DECODE_BUCKETS.len()],
     max_model_len: usize,
     table_width: usize,
-    pages_per_slot: usize,
+    committed_blocks: usize,
     ep_ranks: usize,
     positions: CudaSlice<u32>,
     cos: CudaSlice<bf16>,
@@ -91,16 +165,59 @@ pub(super) struct Glm52NativeMtp {
     token_ids: CudaSlice<u32>,
     slot_mapping: CudaSlice<i64>,
     seq_lens: CudaSlice<i32>,
-    shared_topk: CudaSlice<i32>,
     committed_lens: [usize; GLM52_MAX_BATCH_PER_RANK],
 }
 
 impl Glm52NativeMtp {
+    pub(super) fn prefill_parts(
+        &mut self,
+    ) -> (
+        &Glm52MtpBookendWeights,
+        &Glm52DecoderLayerWeights,
+        &mut Glm52LayerCaches,
+        &mut Glm52LayerCaches,
+    ) {
+        let transfer = self
+            .transfer_cache
+            .as_mut()
+            .expect("MTP prefill parts are TP4-only");
+        (&self.bookend, &self.layer, transfer, &mut self.cache)
+    }
+
+    pub(super) fn kv_arenas(&self, stream: &cudarc::driver::CudaStream) -> Result<[KvArena; 2]> {
+        let mla_bytes = GLM52_FLASHMLA_SPARSE_PAGE_SIZE * GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN;
+        let idx_bytes = INDEX_CACHE_BLOCK * (GLM52_INDEX_HEAD_DIM + 4);
+        let transfer = self.transfer_cache.as_ref().unwrap_or(&self.cache);
+        let (mla_ptr, _) = transfer.mla_cache.device_ptr(stream);
+        let index_k = transfer
+            .index_k_cache
+            .as_ref()
+            .context("GLM5.2 MTP layer 78 has no index-K cache")?;
+        let (idx_ptr, _) = index_k.device_ptr(stream);
+        Ok([
+            KvArena {
+                name: format!("glm52.L{GLM52_MTP_LAYER}.mla"),
+                base_ptr: mla_ptr,
+                num_blocks: self.committed_blocks,
+                bytes_per_block: mla_bytes,
+                block_stride_bytes: mla_bytes,
+            },
+            KvArena {
+                name: format!("glm52.L{GLM52_MTP_LAYER}.idxk"),
+                base_ptr: idx_ptr,
+                num_blocks: self.committed_blocks,
+                bytes_per_block: idx_bytes,
+                block_stride_bytes: idx_bytes,
+            },
+        ])
+    }
+
     pub(super) fn build(
         ctx: &DeviceContext,
         weights: &mut Glm52RankGpuWeights,
         max_model_len: usize,
         moe_topo: crate::Glm52MoeTopo,
+        attn_shard: Option<usize>,
     ) -> Result<Self> {
         let prefix = format!("model.layers.{GLM52_MTP_LAYER}");
         let enorm = build::take_bf16_vec(
@@ -132,16 +249,20 @@ impl Glm52NativeMtp {
             GLM52_HIDDEN,
         )?;
         let bookend = Glm52MtpBookendWeights::new(enorm, hnorm, eh_proj, shared_norm)?;
-        let layer = build::build_decoder_layer(ctx, weights, GLM52_MTP_LAYER, moe_topo, None)?;
+        let layer =
+            build::build_decoder_layer(ctx, weights, GLM52_MTP_LAYER, moe_topo, attn_shard)?;
 
-        let num_blocks = glm52_pool_blocks(max_model_len, GLM52_MAX_BATCH_PER_RANK);
+        let committed_blocks = glm52_pool_blocks(max_model_len, GLM52_MAX_BATCH_PER_RANK);
+        let num_blocks = committed_blocks + GLM52_MAX_BATCH_PER_RANK * MTP_SCRATCH_PAGES_PER_SLOT;
         let table_width = glm52_table_width(max_model_len);
         let index_layout = Glm52IndexerCacheLayout {
             cache_blocks: num_blocks,
             cache_block_size: INDEX_CACHE_BLOCK,
             cache_block_stride_bytes: INDEX_CACHE_BLOCK * (GLM52_INDEX_HEAD_DIM + 4),
         };
-        let backend = glm52_select_mla_backend(crate::config::GLM52_HEADS)?;
+        let attention_heads = layer.mla.heads;
+        let backend = glm52_select_mla_backend(attention_heads)?;
+        let (cache_bytes_per_token, transfer_bytes_per_token) = mtp_cache_bytes(moe_topo, backend);
         let contract = Glm52FlashMlaSparseDecode {
             batch_size: GLM52_MAX_BATCH_PER_RANK,
             num_blocks,
@@ -151,15 +272,41 @@ impl Glm52NativeMtp {
         };
         let cache = Glm52LayerCaches {
             mla_cache: ctx.stream.alloc_zeros::<u8>(
-                num_blocks
-                    * GLM52_FLASHMLA_SPARSE_PAGE_SIZE
-                    * GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN,
+                num_blocks * GLM52_FLASHMLA_SPARSE_PAGE_SIZE * cache_bytes_per_token,
             )?,
             index_k_cache: Some(
                 ctx.stream
                     .alloc_zeros::<u8>(index_layout.min_cache_bytes()?)?,
             ),
         };
+        let transfer_cache = transfer_bytes_per_token
+            .map(|bytes_per_token| -> Result<_> {
+                Ok(Glm52LayerCaches {
+                    mla_cache: ctx.stream.alloc_zeros::<u8>(
+                        num_blocks * GLM52_FLASHMLA_SPARSE_PAGE_SIZE * bytes_per_token,
+                    )?,
+                    index_k_cache: Some(
+                        ctx.stream
+                            .alloc_zeros::<u8>(index_layout.min_cache_bytes()?)?,
+                    ),
+                })
+            })
+            .transpose()?;
+        log::info!(
+            "GLM5.2 native MTP cache: topology={moe_topo:?} \
+             execution_backend={backend:?} execution_bytes/token={cache_bytes_per_token} \
+             wire_layout={} wire_bytes/token={}",
+            if transfer_cache.is_some() {
+                "fp8_ds_mla"
+            } else {
+                "execution-native"
+            },
+            if transfer_cache.is_some() {
+                transfer_bytes_per_token.expect("transfer cache has a wire layout")
+            } else {
+                cache_bytes_per_token
+            },
+        );
 
         let mut buckets = Vec::with_capacity(GLM52_DECODE_BUCKETS.len());
         for rows in GLM52_DECODE_BUCKETS {
@@ -179,14 +326,14 @@ impl Glm52NativeMtp {
                 sched: Glm52MlaSchedMetadata::new_for_backend(
                     ctx,
                     row_contract,
-                    crate::config::GLM52_HEADS,
+                    attention_heads,
                     backend,
                 )?,
                 scratch: Glm52DecodeScratch::new_for_backend(
                     ctx,
                     &row_contract,
                     mqa_shape,
-                    crate::config::GLM52_HEADS,
+                    attention_heads,
                     backend,
                     false,
                 )?,
@@ -196,19 +343,20 @@ impl Glm52NativeMtp {
                 decoder_input: Rows::zeros(ctx, rows)?,
                 block_table: ctx.stream.alloc_zeros::<i32>(rows * table_width)?,
                 compute_graph: CudaGraphState::new(),
-                reuse_graph: CudaGraphState::new(),
             });
         }
         Ok(Self {
             bookend,
             layer,
             cache,
+            transfer_cache,
+            cache_bytes_per_token,
             buckets: buckets
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("GLM5.2 MTP bucket count drifted"))?,
             max_model_len,
             table_width,
-            pages_per_slot: (max_model_len + 1).div_ceil(GLM52_FLASHMLA_SPARSE_PAGE_SIZE),
+            committed_blocks,
             ep_ranks: moe_topo.expected_ep_size(),
             positions: ctx.stream.alloc_zeros(GLM52_MAX_BATCH_PER_RANK)?,
             cos: ctx
@@ -220,9 +368,6 @@ impl Glm52NativeMtp {
             token_ids: ctx.stream.alloc_zeros(GLM52_MAX_BATCH_PER_RANK)?,
             slot_mapping: ctx.stream.alloc_zeros(GLM52_MAX_BATCH_PER_RANK)?,
             seq_lens: ctx.stream.alloc_zeros(GLM52_MAX_BATCH_PER_RANK)?,
-            shared_topk: ctx
-                .stream
-                .alloc_zeros(GLM52_MAX_BATCH_PER_RANK * GLM52_FLASHMLA_SPARSE_TOPK)?,
             committed_lens: [0; GLM52_MAX_BATCH_PER_RANK],
         })
     }
@@ -239,18 +384,39 @@ impl Glm52NativeMtp {
         Ok(())
     }
 
+    pub(super) fn resume_reset_slots(
+        &mut self,
+        resets: &[usize],
+        appends: &[Glm52MtpAppend],
+    ) -> Result<()> {
+        for &slot in resets {
+            if let Some(first) = appends.iter().find(|append| append.slot == slot) {
+                ensure!(
+                    first.position <= self.max_model_len,
+                    "GLM5.2 MTP restored position {} exceeds cap {}",
+                    first.position,
+                    self.max_model_len
+                );
+                self.committed_lens[slot] = first.position;
+            }
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn propose(
         &mut self,
         ctx: &DeviceContext,
         aux: &DeviceContext,
-        ep: &mut Glm52MoeEpState,
+        mut ep: Option<&mut Glm52MoeEpState>,
+        mut tp: Option<&mut Glm52MoeTpRank>,
         embed: &DeviceMatrix,
         lm_head: &DeviceMatrix,
         cos_table: &DeviceMatrix,
         sin_table: &DeviceMatrix,
         target_final_normed: &Rows<GLM52_HIDDEN>,
         round: &Glm52MtpRound,
+        seed: Option<Glm52MtpProposalSeed<'_>>,
     ) -> Result<Vec<[u32; GLM52_MTP_DRAFTS]>> {
         let (context_bucket, appends, proposal) = match round {
             Glm52MtpRound::Context {
@@ -302,32 +468,44 @@ impl Glm52NativeMtp {
                 append.position,
                 self.committed_lens[append.slot]
             );
-            let src = target_final_normed
-                .data()
-                .slice(append.target_row * GLM52_HIDDEN..(append.target_row + 1) * GLM52_HIDDEN);
-            let mut dst = self.buckets[context_index]
-                .previous
-                .data_mut()
-                .slice_mut(packed * GLM52_HIDDEN..(packed + 1) * GLM52_HIDDEN);
-            ctx.stream.memcpy_dtod(&src, &mut dst)?;
+            if seed.is_none() {
+                let src = target_final_normed.data().slice(
+                    append.target_row * GLM52_HIDDEN..(append.target_row + 1) * GLM52_HIDDEN,
+                );
+                let mut dst = self.buckets[context_index]
+                    .previous
+                    .data_mut()
+                    .slice_mut(packed * GLM52_HIDDEN..(packed + 1) * GLM52_HIDDEN);
+                ctx.stream.memcpy_dtod(&src, &mut dst)?;
+            }
             self.committed_lens[append.slot] += 1;
         }
-        let context_inputs: Vec<(usize, u32, usize)> = appends
-            .iter()
-            .map(|append| (append.slot, append.input_token, append.position))
-            .collect();
-        self.forward(
-            ctx,
-            aux,
-            ep,
-            embed,
-            lm_head,
-            cos_table,
-            sin_table,
-            context_index,
-            &context_inputs,
-            Glm52LayerIndexMode::Normal,
-        )?;
+        if seed.is_none() {
+            let context_inputs: Vec<(usize, u32, usize, Option<&[i32]>)> = appends
+                .iter()
+                .map(|append| {
+                    (
+                        append.slot,
+                        append.input_token,
+                        append.position,
+                        Some(append.pages.as_slice()),
+                    )
+                })
+                .collect();
+            self.forward(
+                ctx,
+                aux,
+                ep.as_deref_mut(),
+                tp.as_deref_mut(),
+                embed,
+                lm_head,
+                cos_table,
+                sin_table,
+                context_index,
+                &context_inputs,
+            )
+            .context("GLM5.2 MTP context forward")?;
+        }
         let Some((draft_bucket, proposal_slots)) = proposal else {
             return Ok(Vec::new());
         };
@@ -344,22 +522,33 @@ impl Glm52NativeMtp {
                 .with_context(|| format!("GLM5.2 MTP proposal slot {slot} has no append"))?;
             last_rows.push(row);
         }
-        let context_tokens = self.argmax_host(ctx, context_index)?;
+        let context_tokens = match seed.as_ref() {
+            Some(seed) => {
+                ensure!(
+                    seed.draft1.len() == appends.len() && seed.previous.tokens() >= appends.len(),
+                    "GLM5.2 TP prefill MTP proposal seed shape mismatch"
+                );
+                seed.draft1.to_vec()
+            }
+            None => self
+                .argmax_host(ctx, context_index)
+                .context("GLM5.2 MTP context argmax")?,
+        };
         let draft_index = self.bucket_index(draft_bucket)?;
+        let mut proposal_pages = Vec::with_capacity(proposal_slots.len());
+        let mut partial_backups = Vec::with_capacity(proposal_slots.len());
         for (packed, (&slot, &context_row)) in proposal_slots.iter().zip(&last_rows).enumerate() {
-            let src_topk = self.buckets[context_index].scratch.idx.global_slots.slice(
-                context_row * GLM52_FLASHMLA_SPARSE_TOPK
-                    ..(context_row + 1) * GLM52_FLASHMLA_SPARSE_TOPK,
-            );
-            let mut dst_topk = self.shared_topk.slice_mut(
-                packed * GLM52_FLASHMLA_SPARSE_TOPK..(packed + 1) * GLM52_FLASHMLA_SPARSE_TOPK,
-            );
-            ctx.stream.memcpy_dtod(&src_topk, &mut dst_topk)?;
-            let src_hidden = self.buckets[context_index]
-                .scratch
-                .final_normed
-                .data()
-                .slice(context_row * GLM52_HIDDEN..(context_row + 1) * GLM52_HIDDEN);
+            let src_hidden = match seed.as_ref() {
+                Some(seed) => seed
+                    .previous
+                    .data()
+                    .slice(packed * GLM52_HIDDEN..(packed + 1) * GLM52_HIDDEN),
+                None => self.buckets[context_index]
+                    .scratch
+                    .final_normed
+                    .data()
+                    .slice(context_row * GLM52_HIDDEN..(context_row + 1) * GLM52_HIDDEN),
+            };
             let mut dst_hidden = self.buckets[draft_index]
                 .previous
                 .data_mut()
@@ -369,6 +558,18 @@ impl Glm52NativeMtp {
                 self.committed_lens[slot] < self.max_model_len,
                 "GLM5.2 MTP slot {slot} exhausted its context cap"
             );
+            let committed_len = self.committed_lens[slot];
+            let scratch = [
+                self.scratch_page(slot, 0) as i32,
+                self.scratch_page(slot, 1) as i32,
+            ];
+            let (table, copy_source) =
+                proposal_page_table(&appends[context_row].pages, committed_len, scratch)?;
+            if let Some(source) = copy_source {
+                self.copy_cache_page(ctx, source as usize, scratch[0] as usize)?;
+            }
+            proposal_pages.push(table);
+            partial_backups.push(copy_source.map(|source| (scratch[0], source)));
         }
 
         let mut spans = vec![[0u32; GLM52_MTP_DRAFTS]; proposal_slots.len()];
@@ -376,7 +577,7 @@ impl Glm52NativeMtp {
             span[0] = context_tokens[row];
         }
         for iteration in 1..GLM52_MTP_DRAFTS {
-            let inputs: Vec<(usize, u32, usize)> = proposal_slots
+            let inputs: Vec<(usize, u32, usize, Option<&[i32]>)> = proposal_slots
                 .iter()
                 .enumerate()
                 .map(|(row, &slot)| {
@@ -384,34 +585,26 @@ impl Glm52NativeMtp {
                         slot,
                         spans[row][iteration - 1],
                         self.committed_lens[slot] + iteration - 1,
+                        Some(proposal_pages[row].as_slice()),
                     )
                 })
                 .collect();
-            {
-                let topk_len = proposal_slots.len() * GLM52_FLASHMLA_SPARSE_TOPK;
-                if topk_len > 0 {
-                    let src = self.shared_topk.slice(..topk_len);
-                    let mut dst = self.buckets[draft_index]
-                        .scratch
-                        .idx
-                        .global_slots
-                        .slice_mut(..topk_len);
-                    ctx.stream.memcpy_dtod(&src, &mut dst)?;
-                }
-            }
             self.forward(
                 ctx,
                 aux,
-                ep,
+                ep.as_deref_mut(),
+                tp.as_deref_mut(),
                 embed,
                 lm_head,
                 cos_table,
                 sin_table,
                 draft_index,
                 &inputs,
-                Glm52LayerIndexMode::Reuse,
-            )?;
-            let tokens = self.argmax_host(ctx, draft_index)?;
+            )
+            .with_context(|| format!("GLM5.2 MTP proposal iteration {iteration} forward"))?;
+            let tokens = self
+                .argmax_host(ctx, draft_index)
+                .with_context(|| format!("GLM5.2 MTP proposal iteration {iteration} argmax"))?;
             for (row, span) in spans.iter_mut().enumerate() {
                 span[iteration] = tokens[row];
                 let src = self.buckets[draft_index]
@@ -426,6 +619,9 @@ impl Glm52NativeMtp {
                 ctx.stream.memcpy_dtod(&src, &mut dst)?;
             }
         }
+        for backup in partial_backups.into_iter().flatten() {
+            self.restore_cache_page(ctx, backup.0 as usize, backup.1 as usize)?;
+        }
         Ok(spans)
     }
 
@@ -436,19 +632,74 @@ impl Glm52NativeMtp {
             .with_context(|| format!("GLM5.2 MTP bucket {rows} is not in {GLM52_DECODE_BUCKETS:?}"))
     }
 
+    fn scratch_page(&self, slot: usize, offset: usize) -> usize {
+        self.committed_blocks + slot * MTP_SCRATCH_PAGES_PER_SLOT + offset
+    }
+
+    fn copy_cache_page(&mut self, ctx: &DeviceContext, source: usize, target: usize) -> Result<()> {
+        let mla_bytes = GLM52_FLASHMLA_SPARSE_PAGE_SIZE * self.cache_bytes_per_token;
+        let split = self.committed_blocks * mla_bytes;
+        let (committed, mut scratch) = self.cache.mla_cache.split_at_mut(split);
+        let src = committed.slice(source * mla_bytes..(source + 1) * mla_bytes);
+        let target = target - self.committed_blocks;
+        let mut dst = scratch.slice_mut(target * mla_bytes..(target + 1) * mla_bytes);
+        ctx.stream.memcpy_dtod(&src, &mut dst)?;
+
+        let idx_bytes = INDEX_CACHE_BLOCK * (GLM52_INDEX_HEAD_DIM + 4);
+        let index_k = self
+            .cache
+            .index_k_cache
+            .as_mut()
+            .context("GLM5.2 MTP layer 78 has no index-K cache")?;
+        let split = self.committed_blocks * idx_bytes;
+        let (committed, mut scratch) = index_k.split_at_mut(split);
+        let src = committed.slice(source * idx_bytes..(source + 1) * idx_bytes);
+        let mut dst = scratch.slice_mut(target * idx_bytes..(target + 1) * idx_bytes);
+        ctx.stream.memcpy_dtod(&src, &mut dst)?;
+        Ok(())
+    }
+
+    fn restore_cache_page(
+        &mut self,
+        ctx: &DeviceContext,
+        source: usize,
+        target: usize,
+    ) -> Result<()> {
+        let mla_bytes = GLM52_FLASHMLA_SPARSE_PAGE_SIZE * self.cache_bytes_per_token;
+        let split = self.committed_blocks * mla_bytes;
+        let (mut committed, scratch) = self.cache.mla_cache.split_at_mut(split);
+        let source = source - self.committed_blocks;
+        let src = scratch.slice(source * mla_bytes..(source + 1) * mla_bytes);
+        let mut dst = committed.slice_mut(target * mla_bytes..(target + 1) * mla_bytes);
+        ctx.stream.memcpy_dtod(&src, &mut dst)?;
+
+        let idx_bytes = INDEX_CACHE_BLOCK * (GLM52_INDEX_HEAD_DIM + 4);
+        let index_k = self
+            .cache
+            .index_k_cache
+            .as_mut()
+            .context("GLM5.2 MTP layer 78 has no index-K cache")?;
+        let split = self.committed_blocks * idx_bytes;
+        let (mut committed, scratch) = index_k.split_at_mut(split);
+        let src = scratch.slice(source * idx_bytes..(source + 1) * idx_bytes);
+        let mut dst = committed.slice_mut(target * idx_bytes..(target + 1) * idx_bytes);
+        ctx.stream.memcpy_dtod(&src, &mut dst)?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn forward(
         &mut self,
         ctx: &DeviceContext,
         aux: &DeviceContext,
-        ep: &mut Glm52MoeEpState,
+        mut ep: Option<&mut Glm52MoeEpState>,
+        mut tp: Option<&mut Glm52MoeTpRank>,
         embed: &DeviceMatrix,
         lm_head: &DeviceMatrix,
         cos_table: &DeviceMatrix,
         sin_table: &DeviceMatrix,
         bucket_index: usize,
-        inputs: &[(usize, u32, usize)],
-        index_mode: Glm52LayerIndexMode,
+        inputs: &[(usize, u32, usize, Option<&[i32]>)],
     ) -> Result<()> {
         let rows = self.buckets[bucket_index].rows;
         let mut tokens = [0u32; GLM52_MAX_BATCH_PER_RANK];
@@ -456,7 +707,7 @@ impl Glm52NativeMtp {
         let mut seq_lens = [1i32; GLM52_MAX_BATCH_PER_RANK];
         let mut slot_mapping = [0i64; GLM52_MAX_BATCH_PER_RANK];
         let mut pages = vec![0i32; rows * self.table_width];
-        for (row, &(slot, token, position)) in inputs.iter().enumerate() {
+        for (row, &(slot, token, position, committed_pages)) in inputs.iter().enumerate() {
             ensure!(
                 row < rows && slot < GLM52_MAX_BATCH_PER_RANK && position < self.max_model_len,
                 "GLM5.2 MTP input row {row}/{rows}, slot \
@@ -468,14 +719,31 @@ impl Glm52NativeMtp {
             positions[row] = position as u32;
             seq_lens[row] = (position + 1) as i32;
             let page_offset = position / GLM52_FLASHMLA_SPARSE_PAGE_SIZE;
-            let page = 1 + slot * self.pages_per_slot + page_offset;
+            let page = match committed_pages {
+                Some(committed_pages) => {
+                    ensure!(
+                        committed_pages.len() > page_offset && page_offset < self.table_width,
+                        "GLM5.2 MTP committed page table for slot {slot} has {} pages, \
+                         but position {position} needs logical page {page_offset} \
+                         within table width {}",
+                        committed_pages.len(),
+                        self.table_width,
+                    );
+                    // kvbm may eagerly own the dangling generation page at
+                    // the context cap. It is not addressable by this
+                    // position's max-model-len-wide attention table.
+                    let page_count = committed_pages.len().min(self.table_width);
+                    pages[row * self.table_width..row * self.table_width + page_count]
+                        .copy_from_slice(&committed_pages[..page_count]);
+                    committed_pages[page_offset] as usize
+                }
+                None => anyhow::bail!(
+                    "GLM5.2 MTP input at slot {slot} position {position} has no page table"
+                ),
+            };
             slot_mapping[row] = (page * GLM52_FLASHMLA_SPARSE_PAGE_SIZE
                 + position % GLM52_FLASHMLA_SPARSE_PAGE_SIZE)
                 as i64;
-            for logical_page in 0..=page_offset {
-                pages[row * self.table_width + logical_page] =
-                    (1 + slot * self.pages_per_slot + logical_page) as i32;
-            }
         }
         ctx.stream.memcpy_htod(&tokens, &mut self.token_ids)?;
         ctx.stream.memcpy_htod(&positions, &mut self.positions)?;
@@ -486,7 +754,13 @@ impl Glm52NativeMtp {
         embedding_rows_into(ctx, sin_table, &self.positions, rows, &mut self.sin)?;
         ctx.stream
             .memcpy_htod(&pages, &mut self.buckets[bucket_index].block_table)?;
-
+        if let Some(rank) = tp.as_deref_mut() {
+            // This is an independent TP model step, not part of the target
+            // graph that normally advances the LL epoch. Attention AR and
+            // the layer-78 MoE must share a fresh epoch on every context or
+            // proposal iteration.
+            rank.state.advance_epoch(ctx)?;
+        }
         let bucket = &mut self.buckets[bucket_index];
         let Glm52MtpBucket {
             sched,
@@ -497,7 +771,6 @@ impl Glm52NativeMtp {
             decoder_input,
             block_table,
             compute_graph,
-            reuse_graph,
             ..
         } = bucket;
         let step = Glm52DecodeStep {
@@ -510,11 +783,7 @@ impl Glm52NativeMtp {
             block_table,
             seq_lens: &self.seq_lens,
         };
-        let graph = match index_mode {
-            Glm52LayerIndexMode::Normal => compute_graph,
-            Glm52LayerIndexMode::Reuse => reuse_graph,
-        };
-        graph.run_or_capture(ctx, || {
+        compute_graph.run_or_capture(ctx, || {
             glm52_embed_into(ctx, embed, &self.token_ids, embeds)?;
             glm52_mtp_prepare_into(
                 ctx,
@@ -536,7 +805,16 @@ impl Glm52NativeMtp {
                 rows,
                 scratch.layer.normed.data_mut(),
             )?;
-            let mut carry_ready = index_mode == Glm52LayerIndexMode::Reuse;
+            let mut carry_ready = false;
+            let tp_ar = match &self.layer.mlp {
+                Glm52LayerMlp::MoeTp(_) => {
+                    let rank = tp
+                        .as_deref_mut()
+                        .context("GLM5.2 TP MTP attention has no TP runtime")?;
+                    Some((&mut rank.state, GLM52_MTP_LAYER))
+                }
+                _ => None,
+            };
             glm52_layer_attention_half(
                 ctx,
                 Some(aux),
@@ -547,14 +825,64 @@ impl Glm52NativeMtp {
                 &mut carry_ready,
                 0,
                 true,
-                None,
-                index_mode,
+                tp_ar,
             )?;
-            let Glm52LayerMlp::MoeEp8(moe) = &self.layer.mlp else {
-                anyhow::bail!("GLM5.2 MTP layer 78 is not EP MoE")
-            };
-            glm52_moe_ep_layer(ctx, aux, ep, moe, scratch, rows, self.ep_ranks * rows)?;
-            glm52_layer_finish(ctx, scratch, 0, false)?;
+            let mut tp_padded_mlp = false;
+            match &self.layer.mlp {
+                Glm52LayerMlp::MoeEp8(moe) => {
+                    let ep = ep
+                        .as_deref_mut()
+                        .context("GLM5.2 EP MTP layer has no DeepEP runtime")?;
+                    glm52_moe_ep_layer(ctx, aux, ep, moe, scratch, rows, self.ep_ranks * rows)?;
+                }
+                Glm52LayerMlp::MoeTp(router) => {
+                    let (state, slot, bank) = tp
+                        .as_deref_mut()
+                        .and_then(|rank| rank.layer_bank(GLM52_MTP_LAYER))
+                        .context("GLM5.2 TP MTP layer has no layer-78 slice bank")?;
+                    run_router_into(
+                        ctx,
+                        router,
+                        scratch.layer.normed2.data(),
+                        &mut scratch.router,
+                    )?;
+                    if rows == GLM52_MAX_BATCH_PER_RANK {
+                        state.forward(
+                            ctx,
+                            slot,
+                            bank,
+                            scratch.layer.normed2.data(),
+                            &scratch.router.route.topk_idx,
+                            &scratch.router.route.topk_weight,
+                            scratch.layer.mlp_out.data_mut(),
+                        )?;
+                    } else {
+                        copy_hidden_rows_raw_into(
+                            ctx,
+                            scratch.layer.normed2.data(),
+                            GLM52_HIDDEN,
+                            &mut scratch.tp_normed2,
+                            GLM52_HIDDEN,
+                            0,
+                            rows,
+                        )?;
+                        state.forward(
+                            ctx,
+                            slot,
+                            bank,
+                            &scratch.tp_normed2,
+                            &scratch.router.route.topk_idx,
+                            &scratch.router.route.topk_weight,
+                            &mut scratch.tp_mlp_out,
+                        )?;
+                        tp_padded_mlp = true;
+                    }
+                }
+                Glm52LayerMlp::Dense(_) => {
+                    anyhow::bail!("GLM5.2 MTP layer 78 unexpectedly has a dense MLP")
+                }
+            }
+            glm52_layer_finish(ctx, scratch, 0, tp_padded_mlp)?;
             glm52_mtp_recycle_into(
                 ctx,
                 &self.bookend,

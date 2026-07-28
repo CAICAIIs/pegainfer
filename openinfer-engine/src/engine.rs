@@ -83,6 +83,9 @@ pub struct GenerateRequest {
     pub params: SamplingParams,
     pub max_tokens: usize,
     pub lora_adapter: Option<String>,
+    /// Opaque router/P-D metadata from the request's
+    /// `vllm_xargs.kv_transfer_params`.
+    pub kv_transfer_params: Option<serde_json::Value>,
     /// Where the scheduler emits this request's `TokenEvent`s. All requests on
     /// one engine share a single tagged output channel behind this sink (see
     /// [`TokenSink`]); the frontend demuxes by tag.
@@ -164,6 +167,9 @@ pub enum TokenEvent {
         ids: Vec<u32>,
         logprobs: Vec<Option<TokenLogprob>>,
     },
+    /// Opaque P/D handoff metadata forwarded through the vLLM-compatible
+    /// `kv_transfer_params` response field.
+    KvTransfer { params: serde_json::Value },
     Finished {
         finish_reason: FinishReason,
         prompt_tokens: usize,

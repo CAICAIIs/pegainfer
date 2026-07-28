@@ -582,12 +582,10 @@ impl Args {
                 if self.dflash_draft_model_path.is_some() {
                     bail!("--glm52-prefill-only is incompatible with the DSpark drafter");
                 }
-                if self.glm52_native_mtp {
-                    bail!("--glm52-prefill-only is incompatible with native MTP");
-                }
-                if self.kv_offload || self.kv_pd_vllm_seed.is_some() {
+                if self.kv_pd_vllm_seed.is_some() || (self.kv_offload && !self.glm52_native_mtp) {
                     bail!(
-                        "--glm52-prefill-only does not support KV offload or an external P/D peer"
+                        "--glm52-prefill-only KV offload requires --glm52-native-mtp; \
+                         vLLM's 99-arena peer is incompatible with the 101-arena contract"
                     );
                 }
                 if self.dump_graph_png.is_some() {
@@ -613,10 +611,16 @@ impl Args {
             if self.glm52_native_mtp
                 && !matches!(
                     moe_topo,
-                    openinfer_glm52::Glm52MoeTopo::Ep4 | openinfer_glm52::Glm52MoeTopo::Ep8
+                    openinfer_glm52::Glm52MoeTopo::Ep4
+                        | openinfer_glm52::Glm52MoeTopo::Ep8
+                        | openinfer_glm52::Glm52MoeTopo::Ep16
+                        | openinfer_glm52::Glm52MoeTopo::Ep32
+                        | openinfer_glm52::Glm52MoeTopo::Ep64
                 )
+                && !(self.glm52_prefill_only
+                    && matches!(moe_topo, openinfer_glm52::Glm52MoeTopo::Tp4))
             {
-                bail!("--glm52-native-mtp currently requires --moe-topo=ep4 or ep8");
+                bail!("--glm52-native-mtp requires EP decode or TP4 prefill-only");
             }
         }
         Ok(())

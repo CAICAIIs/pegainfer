@@ -27,6 +27,7 @@ use openinfer_kernels::ops::gemm_strided_batched_bf16;
 use openinfer_kernels::ops::glm52_flashmla_sparse_prefill_launch;
 use openinfer_kernels::ops::glm52_fp8_per_token_group_quant_bf16_ue8m0_launch;
 use openinfer_kernels::ops::glm52_mla_cache_pack_launch;
+use openinfer_kernels::ops::glm52_mla_front_pack_fp8_launch;
 use openinfer_kernels::ops::glm52_mla_query_assemble_launch;
 use openinfer_kernels::ops::glm52_prefill_moe_gather_rows_launch;
 use openinfer_kernels::ops::glm52_prefill_unpack_pages_launch;
@@ -47,6 +48,7 @@ use crate::bookend::glm52_lm_head_into;
 use crate::config::GLM52_HIDDEN;
 use crate::config::GLM52_KV_A_OUT;
 use crate::config::GLM52_KV_LORA_RANK;
+use crate::config::GLM52_MTP_LAYER;
 use crate::config::GLM52_QK_HEAD_DIM;
 use crate::config::GLM52_QK_NOPE_HEAD_DIM;
 use crate::config::GLM52_RMS_EPS;
@@ -64,9 +66,12 @@ use crate::layer::Glm52LayerMlp;
 use crate::mla_front::Glm52MlaFront;
 use crate::mla_front::Glm52MlaLayerWeights;
 use crate::mla_front::glm52_mla_prefill_front_into;
+use crate::model::GLM52_MAX_BATCH_PER_RANK;
 use crate::moe_tp::Glm52MoeTpPrefillScratch;
 use crate::moe_tp::Glm52MoeTpRank;
 use crate::moe_tp::Glm52MoeTpState;
+use crate::mtp::Glm52MtpBookendWeights;
+use crate::mtp::Glm52MtpPrefillScratch;
 use crate::rows::Rows;
 use crate::runner::Glm52PrefillBatch;
 
@@ -81,6 +86,40 @@ const PREFILL_ATTN_TILE_ROWS: usize = 4096;
 const PREFILL_DENSE_TILE_ROWS: usize = 2048;
 
 const GLM52_INDEXER_TOPK: usize = 2048;
+
+fn mtp_shifted_tokens(batch: &Glm52PrefillBatch, boundary_outputs: &[u32]) -> Result<Vec<u32>> {
+    ensure!(
+        boundary_outputs.len() == batch.output_rows.len(),
+        "GLM5.2 MTP boundary outputs {} != output rows {}",
+        boundary_outputs.len(),
+        batch.output_rows.len()
+    );
+    let mut shifted = vec![0u32; batch.token_ids.len()];
+    let mut boundary = 0usize;
+    for (request, range) in batch.request_indptr.windows(2).enumerate() {
+        let start = range[0] as usize;
+        let end = range[1] as usize;
+        shifted[start..end - 1].copy_from_slice(&batch.token_ids[start + 1..end]);
+        shifted[end - 1] = match batch.mtp_next_tokens[request] {
+            Some(token) => token,
+            None => {
+                ensure!(
+                    batch.output_rows.get(boundary).copied() == Some((end - 1) as u32),
+                    "GLM5.2 MTP boundary row does not end request range {request}"
+                );
+                let token = boundary_outputs[boundary];
+                boundary += 1;
+                token
+            }
+        };
+    }
+    ensure!(
+        boundary == boundary_outputs.len(),
+        "GLM5.2 MTP consumed {boundary} boundary outputs, got {}",
+        boundary_outputs.len()
+    );
+    Ok(shifted)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Glm52TpPrefillLayout {
@@ -228,6 +267,39 @@ pub(crate) struct Glm52TpPrefillExecutor {
     argmax_partial_indices: CudaSlice<i32>,
     argmax_values: CudaSlice<bf16>,
     argmax_indices: CudaSlice<i32>,
+    // ---- native MTP context pass (chunk-scale) ----
+    mtp_embeds: CudaSlice<bf16>,
+    mtp_previous: CudaSlice<bf16>,
+    mtp_decoder_input: CudaSlice<bf16>,
+    mtp_bookend_scratch: Glm52MtpPrefillScratch,
+    mtp_flashinfer_query: CudaSlice<u8>,
+    /// Target final-normalized boundary rows retained for the small-M native
+    /// proposal loop after the large-M committed context pass.
+    mtp_target_boundary: Rows<GLM52_HIDDEN>,
+    /// Large-M MTP boundary state seeds the proposal loop directly. Reusing
+    /// it avoids recomputing the boundary through the decode attention path.
+    mtp_proposal_boundary: Rows<GLM52_HIDDEN>,
+}
+
+pub(crate) struct Glm52TpPrefillMtpView<'a> {
+    pub(crate) bookend: &'a Glm52MtpBookendWeights,
+    pub(crate) layer: &'a Glm52DecoderLayerWeights,
+    pub(crate) transfer_cache: &'a mut Glm52LayerCaches,
+    pub(crate) proposal_cache: &'a mut Glm52LayerCaches,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Glm52PrefillOutput {
+    pub(crate) target_tokens: Vec<u32>,
+    /// First native-MTP proposal token for every target boundary row.
+    ///
+    /// This is deliberately separate from `target_tokens`: the target token
+    /// is the anchor emitted to the client, while this token is uncommitted
+    /// proposal metadata for the decode worker's first verify span.
+    pub(crate) mtp_draft1: Vec<u32>,
+    /// Complete five-token proposal generated after the committed context
+    /// pass. Empty only when native MTP is disabled or there is no boundary.
+    pub(crate) mtp_drafts: Vec<[u32; crate::mtp::GLM52_MTP_DRAFTS]>,
 }
 
 pub(crate) struct Glm52TpPrefillModelView<'a> {
@@ -241,6 +313,7 @@ pub(crate) struct Glm52TpPrefillModelView<'a> {
     pub(crate) full_lm_head: &'a DeviceMatrix,
     pub(crate) vocab_start: usize,
     pub(crate) sampling_scratch: &'a mut BatchSamplingScratch,
+    pub(crate) mtp: Option<Glm52TpPrefillMtpView<'a>>,
 }
 
 impl Glm52TpPrefillExecutor {
@@ -324,8 +397,23 @@ impl Glm52TpPrefillExecutor {
                 .alloc_zeros(argmax_batch_bf16_split_partials_len(32, GLM52_VOCAB))?,
             argmax_values: ctx.stream.alloc_zeros(32)?,
             argmax_indices: ctx.stream.alloc_zeros(32)?,
+            mtp_embeds: ctx.stream.alloc_zeros(chunk * GLM52_HIDDEN)?,
+            mtp_previous: ctx.stream.alloc_zeros(chunk * GLM52_HIDDEN)?,
+            mtp_decoder_input: ctx.stream.alloc_zeros(chunk * GLM52_HIDDEN)?,
+            mtp_bookend_scratch: Glm52MtpPrefillScratch::new(ctx, chunk)?,
+            mtp_flashinfer_query: ctx.stream.alloc_zeros(chunk * 16 * GLM52_KV_A_OUT)?,
+            mtp_target_boundary: Rows::zeros(ctx, GLM52_MAX_BATCH_PER_RANK)?,
+            mtp_proposal_boundary: Rows::zeros(ctx, GLM52_MAX_BATCH_PER_RANK)?,
             layout,
         })
+    }
+
+    pub(crate) fn mtp_target_boundary(&self) -> &Rows<GLM52_HIDDEN> {
+        &self.mtp_target_boundary
+    }
+
+    pub(crate) fn mtp_proposal_boundary(&self) -> &Rows<GLM52_HIDDEN> {
+        &self.mtp_proposal_boundary
     }
 
     /// Run the complete TP4 prefill forward for one coordinator batch,
@@ -337,7 +425,7 @@ impl Glm52TpPrefillExecutor {
         batch: &Glm52PrefillBatch,
         tp: &mut Glm52MoeTpRank,
         model: Glm52TpPrefillModelView<'_>,
-    ) -> Result<Vec<u32>> {
+    ) -> Result<Glm52PrefillOutput> {
         ensure!(
             model.layers.len() == model.caches.len() && !model.layers.is_empty(),
             "GLM5.2 TP prefill layer/cache layout is invalid"
@@ -392,6 +480,7 @@ impl Glm52TpPrefillExecutor {
                 glm52_prefill_unpack_pages_launch(
                     ctx,
                     &cache.mla_cache,
+                    cache.mla_cache.len() / self.layout.kv_slots,
                     &self.block_ids,
                     batch.block_ids.len(),
                     &mut self.unpacked_kv,
@@ -520,8 +609,234 @@ impl Glm52TpPrefillExecutor {
             )?);
         }
         self.profiler.stop(ctx, "lm_head_sampling", mark)?;
+        if !batch.output_rows.is_empty() {
+            ensure!(
+                batch.output_rows.len() <= GLM52_MAX_BATCH_PER_RANK,
+                "GLM5.2 prefill boundary rows exceed native-MTP capacity"
+            );
+            ctx.stream.memcpy_dtod(
+                &self
+                    .final_normed
+                    .data()
+                    .slice(..batch.output_rows.len() * GLM52_HIDDEN),
+                &mut self
+                    .mtp_target_boundary
+                    .data_mut()
+                    .slice_mut(..batch.output_rows.len() * GLM52_HIDDEN),
+            )?;
+        }
+        let mtp_draft1 = if let Some(mtp) = model.mtp {
+            let mark = self.profiler.start(ctx)?;
+            let drafts = self.run_mtp_context(
+                ctx,
+                batch,
+                &outputs,
+                tp,
+                model.embed,
+                model.final_norm,
+                model.shard_lm_head,
+                model.full_lm_head,
+                model.vocab_start,
+                model.sampling_scratch,
+                mtp,
+                rows,
+                rows4,
+            )?;
+            self.profiler.stop(ctx, "mtp_context", mark)?;
+            drafts
+        } else {
+            Vec::new()
+        };
         self.profiler.report(ctx, rows)?;
-        Ok(outputs)
+        Ok(Glm52PrefillOutput {
+            target_tokens: outputs,
+            mtp_draft1,
+            mtp_drafts: Vec::new(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_mtp_context(
+        &mut self,
+        ctx: &DeviceContext,
+        batch: &Glm52PrefillBatch,
+        boundary_outputs: &[u32],
+        tp: &mut Glm52MoeTpRank,
+        embed: &DeviceMatrix,
+        final_norm: &DeviceVec,
+        shard_lm_head: &DeviceMatrix,
+        full_lm_head: &DeviceMatrix,
+        vocab_start: usize,
+        sampling_scratch: &mut BatchSamplingScratch,
+        mtp: Glm52TpPrefillMtpView<'_>,
+        rows: usize,
+        rows4: usize,
+    ) -> Result<Vec<u32>> {
+        let shifted = mtp_shifted_tokens(batch, boundary_outputs)?;
+        ctx.stream
+            .memcpy_htod(&shifted, &mut self.token_ids.slice_mut(..rows))?;
+        embedding_rows_into(ctx, embed, &self.token_ids, rows, &mut self.mtp_embeds)?;
+        rms_norm_rows_into(
+            ctx,
+            &self.hidden,
+            final_norm,
+            GLM52_RMS_EPS,
+            GLM52_HIDDEN,
+            rows,
+            &mut self.mtp_previous,
+        )?;
+        mtp.bookend.prepare_prefill_into(
+            ctx,
+            &self.positions,
+            &self.mtp_embeds,
+            &self.mtp_previous,
+            rows,
+            &mut self.mtp_bookend_scratch,
+            &mut self.mtp_decoder_input,
+        )?;
+        if rows4 > rows {
+            ctx.stream.memset_zeros(
+                &mut self
+                    .mtp_decoder_input
+                    .slice_mut(rows * GLM52_HIDDEN..rows4 * GLM52_HIDDEN),
+            )?;
+        }
+        ctx.stream.memcpy_dtod(
+            &self.mtp_decoder_input.slice(..rows * GLM52_HIDDEN),
+            &mut self.hidden.slice_mut(..rows * GLM52_HIDDEN),
+        )?;
+        rms_norm_rows_into(
+            ctx,
+            &self.hidden,
+            &mtp.layer.input_ln,
+            GLM52_RMS_EPS,
+            GLM52_HIDDEN,
+            rows4,
+            &mut self.normed,
+        )?;
+
+        glm52_mla_prefill_front_into(
+            ctx,
+            &mtp.layer.mla,
+            rows4,
+            &self.normed,
+            &mut self.fp8_gemm,
+            &mut self.mla_front,
+        )?;
+        self.pack_mla_cache(ctx, &mtp.layer.mla, &mut mtp.transfer_cache.mla_cache, rows)?;
+        glm52_mla_front_pack_fp8_launch(
+            ctx,
+            rows,
+            16,
+            &self.ql_nope,
+            &self.mla_front.q_full,
+            GLM52_QK_NOPE_HEAD_DIM,
+            GLM52_QK_HEAD_DIM,
+            &self.mla_front.ckv,
+            &mtp.layer.mla.kv_a_ln.data,
+            GLM52_RMS_EPS,
+            &self.cos,
+            &self.sin,
+            &mut self.mtp_flashinfer_query,
+            &mut mtp.proposal_cache.mla_cache,
+            &self.slot_mapping,
+        )?;
+        if !batch.block_ids.is_empty() {
+            glm52_prefill_unpack_pages_launch(
+                ctx,
+                &mtp.transfer_cache.mla_cache,
+                openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN,
+                &self.block_ids,
+                batch.block_ids.len(),
+                &mut self.unpacked_kv,
+            )?;
+        }
+        let Glm52LayerIndexer::Full(indexer) = &mtp.layer.indexer else {
+            anyhow::bail!("GLM5.2 MTP layer 78 must own a full indexer")
+        };
+        let index_k = mtp
+            .proposal_cache
+            .index_k_cache
+            .as_mut()
+            .context("GLM5.2 MTP layer 78 is missing index-K cache")?;
+        self.indexer.run_layer(
+            ctx,
+            indexer,
+            &self.normed,
+            self.mla_front.q_resid.data(),
+            &self.cos,
+            &self.sin,
+            index_k,
+            &self.slot_mapping,
+            rows,
+            &mut self.fp8_gemm,
+            &mut self.carry_slots,
+            &mut self.carry_lens,
+        )?;
+        let transfer_index_k = mtp
+            .transfer_cache
+            .index_k_cache
+            .as_mut()
+            .context("GLM5.2 MTP transfer layer 78 is missing index-K cache")?;
+        ctx.stream.memcpy_dtod(index_k, transfer_index_k)?;
+        self.attend_chunk(ctx, &mtp.layer.mla, rows)?;
+        fp8_linear_large_m_into(
+            ctx,
+            &mtp.layer.mla.o_proj,
+            rows4,
+            &self.attention_v,
+            &mut self.fp8_gemm,
+            &mut self.attention_partial,
+        )?;
+        self.reduce_and_norm_attention(ctx, &mut tp.state, &mtp.layer.post_attn_ln, rows)?;
+        let Glm52LayerMlp::MoeTp(router) = &mtp.layer.mlp else {
+            anyhow::bail!("GLM5.2 TP4 MTP layer 78 is not TP MoE")
+        };
+        let (state, _, bank) = tp
+            .layer_bank(GLM52_MTP_LAYER)
+            .context("GLM5.2 TP4 MTP layer 78 has no expert slice bank")?;
+        self.moe.forward(
+            ctx,
+            state,
+            router,
+            bank,
+            &self.normed,
+            rows,
+            &mut self.mlp_out,
+        )?;
+        state.prefill_allreduce_in_place(ctx, rows, &mut self.mlp_out)?;
+        self.finish_layer(ctx, None, rows)?;
+        if batch.output_rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let boundary_rows: Vec<i32> = batch.output_rows.iter().map(|&row| row as i32).collect();
+        let mut drafts = Vec::with_capacity(boundary_rows.len());
+        for rows_block in boundary_rows.chunks(32) {
+            drafts.extend(self.output_tokens(
+                ctx,
+                &mut tp.state,
+                mtp.bookend.shared_norm(),
+                shard_lm_head,
+                full_lm_head,
+                vocab_start,
+                rows_block,
+                &[],
+                batch.seed,
+                sampling_scratch,
+            )?);
+        }
+        let boundary_count = boundary_rows.len();
+        ctx.stream.memcpy_dtod(
+            &self
+                .final_normed
+                .data()
+                .slice(..boundary_count * GLM52_HIDDEN),
+            &mut self
+                .mtp_proposal_boundary
+                .data_mut()
+                .slice_mut(..boundary_count * GLM52_HIDDEN),
+        )?;
+        Ok(drafts)
     }
 
     /// Upload token ids/positions/slot mapping/block list and stage
@@ -948,6 +1263,28 @@ impl Glm52TpPrefillExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mtp_shift_carries_across_chunks_and_uses_boundary_anchor() {
+        let batch = Glm52PrefillBatch {
+            token_ids: vec![10, 11, 20, 21, 22],
+            positions: vec![0, 1, 4, 5, 6],
+            request_indptr: vec![0, 2, 5],
+            block_indptr: vec![0, 1, 2],
+            block_ids: vec![1, 2],
+            request_slots: vec![0, 1],
+            padding_block: 0,
+            slot_mapping: vec![0; 5],
+            mtp_next_tokens: vec![Some(12), None],
+            output_rows: vec![4],
+            sampling: Vec::new(),
+            seed: 0,
+        };
+        assert_eq!(
+            mtp_shifted_tokens(&batch, &[99]).unwrap(),
+            [11, 12, 21, 22, 99]
+        );
+    }
 
     #[test]
     #[ignore = "requires a GPU"]

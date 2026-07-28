@@ -267,6 +267,7 @@ fn run_stream(
             params,
             max_tokens,
             lora_adapter: None,
+            kv_transfer_params: None,
             token_tx,
             logprobs: 0,
             echo: false,
@@ -277,7 +278,11 @@ fn run_stream(
     loop {
         match token_rx.blocking_recv().map(|(_, event)| event) {
             Some(TokenEvent::Token { .. }) => stamps.push(Instant::now()),
-            Some(TokenEvent::Scheduled { .. } | TokenEvent::PromptTokens { .. }) => {}
+            Some(
+                TokenEvent::Scheduled { .. }
+                | TokenEvent::PromptTokens { .. }
+                | TokenEvent::KvTransfer { .. },
+            ) => {}
             Some(TokenEvent::Finished { .. }) => return Ok(stamps),
             Some(TokenEvent::Error { message, .. }) => bail!("request failed: {message}"),
             Some(TokenEvent::Rejected { message, .. }) => bail!("request rejected: {message}"),

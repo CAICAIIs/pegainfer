@@ -27,6 +27,7 @@ use openinfer_kv_offload::OffloadEngine;
 use openinfer_kv_offload::QueryOutcome;
 use openinfer_kv_offload::VLLM_HASH_BYTES;
 use openinfer_kv_offload::VllmBlockHasher;
+use serde::Deserialize;
 
 use super::PAGE;
 
@@ -111,6 +112,22 @@ impl RankOffload {
         };
         self.engine.save(&block_ids, &block_hashes, pin);
     }
+
+    /// Persist the mutable last page under the native-P/D handoff key.
+    /// kvbm does not expose an immutable guard or lineage hash until a page
+    /// seals, so capture this page synchronously while the request still owns
+    /// it. The response may race cache visibility; D admission already parks
+    /// and retries until PegaFlow publishes the key.
+    pub(super) fn save_native_tail(&self, kv: &RequestKv, key: [u8; 16]) -> anyhow::Result<()> {
+        let page_id = kv
+            .current_page_indices()
+            .last()
+            .copied()
+            .context("native P/D tail has no committed physical page")?;
+        self.engine
+            .save_blocking(&[page_id], &[key.to_vec()])
+            .map_err(|err| anyhow::anyhow!("native P/D tail save: {err}"))
+    }
 }
 
 /// vLLM-compat P/D miss breaker: after this many consecutive requests each
@@ -150,6 +167,102 @@ pub(super) struct VllmPdState {
     /// [`BREAKER_PROBE_WINDOW`] instead (a complete restore resets this).
     consecutive_miss_windows: u32,
     parked: Vec<Option<ParkedFront>>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub(super) struct NativeMtpHandoff {
+    pub(super) draft_tokens: [u32; crate::mtp::GLM52_MTP_DRAFTS],
+    pub(super) committed_len: usize,
+    pub(super) arena_count: usize,
+    pub(super) tail_len: usize,
+    pub(super) tail_key: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct NativeMtpEnvelope {
+    version: u32,
+    native_mtp: NativeMtpHandoff,
+}
+
+#[derive(Deserialize)]
+struct OpenInferPdEnvelope {
+    openinfer_pd: NativeMtpEnvelope,
+}
+
+pub(super) fn native_mtp_handoff(
+    req: &GenerateRequest,
+) -> anyhow::Result<Option<NativeMtpHandoff>> {
+    let Some(value) = req.kv_transfer_params.clone() else {
+        return Ok(None);
+    };
+    let envelope: OpenInferPdEnvelope =
+        serde_json::from_value(value).context("invalid openinfer native-MTP P/D metadata")?;
+    anyhow::ensure!(
+        envelope.openinfer_pd.version == 1,
+        "unsupported openinfer P/D metadata version {}",
+        envelope.openinfer_pd.version
+    );
+    anyhow::ensure!(
+        envelope.openinfer_pd.native_mtp.arena_count == 101,
+        "native-MTP P/D requires 101 arenas, got {}",
+        envelope.openinfer_pd.native_mtp.arena_count
+    );
+    Ok(Some(envelope.openinfer_pd.native_mtp))
+}
+
+pub(super) struct NativePdState {
+    parked: Vec<Option<NativeParked>>,
+}
+
+struct NativeParked {
+    request_id: Option<String>,
+    query_key: String,
+    parked_at: Instant,
+    deadline: Instant,
+}
+
+/// Keep the final committed page out of the lineage-hashed full-page prefix.
+/// KV block hashes require a dangling token after a sealed page, so an
+/// exactly page-aligned context still has a PAGE-token explicit tail.
+pub(super) fn native_pd_tail_len(committed_len: usize) -> usize {
+    committed_len
+        .checked_sub(1)
+        .map_or(0, |last| last % PAGE + 1)
+}
+
+impl NativePdState {
+    pub(super) fn new(ranks: usize) -> Self {
+        Self {
+            parked: (0..ranks).map(|_| None).collect(),
+        }
+    }
+
+    fn parked(&mut self, rank: usize, req: &GenerateRequest) -> &mut NativeParked {
+        let stale = self.parked[rank]
+            .as_ref()
+            .is_none_or(|parked| parked.request_id != req.request_id);
+        if stale {
+            let now = Instant::now();
+            self.parked[rank] = Some(NativeParked {
+                request_id: req.request_id.clone(),
+                query_key: format!(
+                    "glm52-native-pd-{}",
+                    QUERY_SEQ.fetch_add(1, Ordering::Relaxed)
+                ),
+                parked_at: now,
+                deadline: now + REMOTE_FETCH_DEADLINE,
+            });
+        }
+        self.parked[rank].as_mut().expect("just initialized")
+    }
+
+    pub(super) fn clear(&mut self, rank: usize) {
+        self.parked[rank] = None;
+    }
+
+    pub(super) fn any_parked(&self) -> bool {
+        self.parked.iter().any(Option::is_some)
+    }
 }
 
 /// The rank's front request currently waiting out the P/D handoff race.
@@ -532,6 +645,183 @@ pub(super) fn admit_vllm_pd(
     }
 }
 
+/// Native OpenInfer P/D restore. Full pages use kvbm lineage hashes; the
+/// producer includes the partial-tail hash in metadata because a mutable
+/// page has no independently derivable cache key on the decode request.
+pub(super) fn admit_native_mtp_pd(
+    state: &mut NativePdState,
+    rank: usize,
+    offload: &RankOffload,
+    pool: &BlockPool,
+    req: &GenerateRequest,
+    handoff: &NativeMtpHandoff,
+) -> anyhow::Result<VllmAdmitOutcome> {
+    anyhow::ensure!(
+        req.prompt_tokens.len() == handoff.committed_len + 1,
+        "native-MTP P/D expects prompt = committed KV + anchor ({} != {} + 1)",
+        req.prompt_tokens.len(),
+        handoff.committed_len
+    );
+    anyhow::ensure!(
+        handoff.tail_len == native_pd_tail_len(handoff.committed_len),
+        "native-MTP P/D tail length {} disagrees with committed length {}",
+        handoff.tail_len,
+        handoff.committed_len
+    );
+    anyhow::ensure!(
+        (handoff.tail_len == 0) == handoff.tail_key.is_none(),
+        "native-MTP P/D tail key presence disagrees with tail length"
+    );
+
+    let query_key = state.parked(rank, req).query_key.clone();
+    let prompt_kv = &req.prompt_tokens[..handoff.committed_len];
+    let full_len = handoff.committed_len - handoff.tail_len;
+    let mut probe = pool.probe_prefix(prompt_kv.to_vec(), None);
+    let hashes = probe.cpu_query_hashes();
+    if !hashes.is_empty() {
+        match offload.engine.query(&format!("{query_key}-full"), &hashes) {
+            Ok(QueryOutcome::Ready(hit)) => match hit.lease {
+                Some(lease) if hit.num_blocks == hashes.len() => {
+                    let Some(reservation) = pool.reserve_loaded_blocks(hit.num_blocks) else {
+                        offload.engine.release_query_lease(lease);
+                        return native_pd_wait(state, rank, req, "GPU page reservation");
+                    };
+                    match offload.engine.load(lease, reservation.page_ids()) {
+                        Ok(handle) => {
+                            handle.wait().map_err(|err| {
+                                anyhow::anyhow!("native P/D full-page load: {err}")
+                            })?;
+                            pool.commit_loaded_blocks(&mut probe, reservation);
+                        }
+                        Err(err) => {
+                            offload.engine.release_query_lease(lease);
+                            return native_pd_reject(
+                                state,
+                                rank,
+                                req,
+                                format!("full-page load submit: {err}"),
+                            );
+                        }
+                    }
+                }
+                Some(lease) => {
+                    offload.engine.release_query_lease(lease);
+                    return native_pd_wait(state, rank, req, "partial full-page registration");
+                }
+                None => return native_pd_wait(state, rank, req, "full-page registration"),
+            },
+            Ok(QueryOutcome::Loading) => {
+                return native_pd_wait(state, rank, req, "full-page transfer");
+            }
+            Err(err) => {
+                return native_pd_reject(state, rank, req, format!("full-page query: {err}"));
+            }
+        }
+    }
+
+    let mut kv = pool.new_request(req.prompt_tokens.clone(), req.max_tokens, None);
+    let mut cached_tokens = kv.match_and_add_prefix(pool)?;
+    if cached_tokens < full_len {
+        return native_pd_wait(state, rank, req, "full-page rematch");
+    }
+    if handoff.tail_len > 0 {
+        let key = hex::decode(handoff.tail_key.as_deref().expect("validated tail key"))
+            .context("native-MTP P/D tail key is not hex")?;
+        anyhow::ensure!(
+            key.len() == 16,
+            "native-MTP P/D tail key must be 16 bytes, got {}",
+            key.len()
+        );
+        match offload.engine.query(&format!("{query_key}-tail"), &[key]) {
+            Ok(QueryOutcome::Ready(hit)) => match hit.lease {
+                Some(lease) if hit.num_blocks == 1 => {
+                    kv.schedule_prefill(handoff.tail_len, pool)
+                        .map_err(|err| anyhow::anyhow!("native P/D tail schedule: {err}"))?;
+                    let tail_page = *kv
+                        .step_page_indices(handoff.tail_len)
+                        .last()
+                        .expect("tail schedule owns one page");
+                    match offload.engine.load(lease, vec![tail_page]) {
+                        Ok(handle) => {
+                            if let Err(err) = handle.wait() {
+                                kv.revert_schedule()?;
+                                return native_pd_reject(
+                                    state,
+                                    rank,
+                                    req,
+                                    format!("tail load: {err}"),
+                                );
+                            }
+                            kv.apply_prefill_chunk(pool)?;
+                            cached_tokens += handoff.tail_len;
+                        }
+                        Err(err) => {
+                            offload.engine.release_query_lease(lease);
+                            kv.revert_schedule()?;
+                            return native_pd_reject(
+                                state,
+                                rank,
+                                req,
+                                format!("tail load submit: {err}"),
+                            );
+                        }
+                    }
+                }
+                Some(lease) => {
+                    offload.engine.release_query_lease(lease);
+                    return native_pd_wait(state, rank, req, "partial tail registration");
+                }
+                None => return native_pd_wait(state, rank, req, "tail registration"),
+            },
+            Ok(QueryOutcome::Loading) => {
+                return native_pd_wait(state, rank, req, "tail transfer");
+            }
+            Err(err) => {
+                return native_pd_reject(state, rank, req, format!("tail query: {err}"));
+            }
+        }
+    }
+    if cached_tokens != handoff.committed_len || req.prompt_tokens.len() - kv.kv_position() != 1 {
+        return native_pd_wait(state, rank, req, "complete-prefix install");
+    }
+    state.clear(rank);
+    Ok(VllmAdmitOutcome::Admit {
+        kv: Box::new(kv),
+        cached_tokens,
+    })
+}
+
+fn native_pd_wait(
+    state: &mut NativePdState,
+    rank: usize,
+    req: &GenerateRequest,
+    phase: &str,
+) -> anyhow::Result<VllmAdmitOutcome> {
+    let parked = state.parked(rank, req);
+    if Instant::now() < parked.deadline {
+        return Ok(VllmAdmitOutcome::Park);
+    }
+    let waited = parked.parked_at.elapsed();
+    state.clear(rank);
+    Ok(VllmAdmitOutcome::Reject {
+        message: format!(
+            "GLM5.2 native-MTP P/D handoff incomplete after {waited:?} ({phase}); retry via P"
+        ),
+    })
+}
+
+fn native_pd_reject(
+    state: &mut NativePdState,
+    rank: usize,
+    _req: &GenerateRequest,
+    reason: String,
+) -> anyhow::Result<VllmAdmitOutcome> {
+    state.clear(rank);
+    Ok(VllmAdmitOutcome::Reject {
+        message: format!("GLM5.2 native-MTP P/D restore failed ({reason}); retry via P"),
+    })
+}
+
 /// Strict mode rejects (the router retries through the prefill peer); the
 /// `allow_local_prefill` debug mode falls back to the plain admission path.
 fn fail_or_fallback(state: &VllmPdState, message: String) -> VllmAdmitOutcome {
@@ -696,5 +986,15 @@ mod tests {
         req.request_id = Some("client-controlled".to_string());
         let parked = state.parked_front(0, &req);
         assert!(parked.query_key.starts_with("glm52-pd-"));
+    }
+
+    #[test]
+    fn native_pd_tail_keeps_the_last_aligned_page_explicit() {
+        assert_eq!(native_pd_tail_len(0), 0);
+        assert_eq!(native_pd_tail_len(1), 1);
+        assert_eq!(native_pd_tail_len(PAGE - 1), PAGE - 1);
+        assert_eq!(native_pd_tail_len(PAGE), PAGE);
+        assert_eq!(native_pd_tail_len(PAGE + 1), 1);
+        assert_eq!(native_pd_tail_len(2 * PAGE), PAGE);
     }
 }

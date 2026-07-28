@@ -168,6 +168,7 @@ pub(super) fn admit_from_queue(
     usable_blocks: &[usize],
     offload: Option<&[offload::RankOffload]>,
     vllm_pd: &mut Option<VllmPdState>,
+    native_pd: &mut Option<offload::NativePdState>,
     workers: &[Glm52Worker],
     mirrored: bool,
     prefix_cache_enabled: bool,
@@ -221,54 +222,99 @@ pub(super) fn admit_from_queue(
                 }
                 continue;
             }
+            let native_handoff = match offload::native_mtp_handoff(&req) {
+                Ok(handoff) => handoff,
+                Err(err) => {
+                    reject(&req, format!("{err:#}"));
+                    continue;
+                }
+            };
+            let native_admitted = if let Some(handoff) = native_handoff.as_ref() {
+                let Some(state) = native_pd.as_mut() else {
+                    reject(
+                        &req,
+                        "native-MTP P/D metadata reached a decode engine without native P/D offload"
+                            .to_string(),
+                    );
+                    continue;
+                };
+                let offload = offload.expect("native P/D state requires offload");
+                match offload::admit_native_mtp_pd(
+                    state,
+                    rank,
+                    &offload[rank],
+                    &pools[rank],
+                    &req,
+                    handoff,
+                )? {
+                    VllmAdmitOutcome::Admit { kv, cached_tokens } => Some((*kv, cached_tokens)),
+                    VllmAdmitOutcome::Park => {
+                        pending[rank].push_front(req);
+                        break;
+                    }
+                    VllmAdmitOutcome::Reject { message } => {
+                        reject(&req, message);
+                        continue;
+                    }
+                    VllmAdmitOutcome::LocalFallback => {
+                        unreachable!("native-MTP P/D never silently falls back to local prefill")
+                    }
+                }
+            } else {
+                None
+            };
             // vLLM-compat P/D admission: the full peer-prefilled prefix must
             // restore (this node never computes prompt positions), a racing
             // registration parks the request at the queue front for the next
             // step boundary, and an exhausted wait window rejects it for the
             // router to retry through the prefill peer.
-            let pd_admitted = match vllm_pd.as_mut() {
-                Some(pd) => {
-                    let offload = offload.expect("vLLM-compat P/D requires --kv-offload");
-                    // Launch validation pins vllm-compat to the EP topology
-                    // (kv-offload ⇒ EP8): each rank's executor owns the only
-                    // replica of its arenas, so it alone runs the fixup. A
-                    // mirrored topology would need every worker here.
-                    assert!(
-                        !mirrored,
-                        "vLLM-compat P/D admission assumes the EP topology"
-                    );
-                    match offload::admit_vllm_pd(
-                        pd,
-                        rank,
-                        &offload[rank],
-                        &pools[rank],
-                        &req,
-                        &workers[rank],
-                    ) {
-                        Ok(VllmAdmitOutcome::Admit { kv, cached_tokens }) => {
-                            Some((*kv, cached_tokens))
-                        }
-                        Ok(VllmAdmitOutcome::Park) => {
-                            pending[rank].push_front(req);
-                            break; // head-of-line wait: retry next step boundary
-                        }
-                        Ok(VllmAdmitOutcome::Reject { message }) => {
-                            reject(&req, message);
-                            continue;
-                        }
-                        Ok(VllmAdmitOutcome::LocalFallback) => None,
-                        Err(err) => {
-                            let err = err.context("GLM5.2 P/D admission");
-                            let _ = req.token_tx.send(TokenEvent::Error {
-                                message: format!("{err:#}"),
-                                prompt_tokens: req.prompt_tokens.len(),
-                                completion_tokens: 0,
-                            });
-                            return Err(err);
+            let pd_admitted = if native_admitted.is_some() {
+                native_admitted
+            } else {
+                match vllm_pd.as_mut() {
+                    Some(pd) => {
+                        let offload = offload.expect("vLLM-compat P/D requires --kv-offload");
+                        // Launch validation pins vllm-compat to the EP topology
+                        // (kv-offload ⇒ EP8): each rank's executor owns the only
+                        // replica of its arenas, so it alone runs the fixup. A
+                        // mirrored topology would need every worker here.
+                        assert!(
+                            !mirrored,
+                            "vLLM-compat P/D admission assumes the EP topology"
+                        );
+                        match offload::admit_vllm_pd(
+                            pd,
+                            rank,
+                            &offload[rank],
+                            &pools[rank],
+                            &req,
+                            &workers[rank],
+                        ) {
+                            Ok(VllmAdmitOutcome::Admit { kv, cached_tokens }) => {
+                                Some((*kv, cached_tokens))
+                            }
+                            Ok(VllmAdmitOutcome::Park) => {
+                                pending[rank].push_front(req);
+                                break; // head-of-line wait: retry next step boundary
+                            }
+                            Ok(VllmAdmitOutcome::Reject { message }) => {
+                                reject(&req, message);
+                                continue;
+                            }
+                            Ok(VllmAdmitOutcome::LocalFallback) => None,
+                            Err(err) => {
+                                let err = err.context("GLM5.2 P/D admission");
+                                let _ = req.token_tx.send(TokenEvent::Error {
+                                    message: format!("{err:#}"),
+                                    prompt_tokens: req.prompt_tokens.len(),
+                                    completion_tokens: 0,
+                                });
+                                return Err(err);
+                            }
                         }
                     }
+                    None => None,
                 }
-                None => None,
             };
             let (kv, cached_tokens) = if let Some(admitted) = pd_admitted {
                 admitted
@@ -315,12 +361,27 @@ pub(super) fn admit_from_queue(
                 prompt_tokens: req.prompt_tokens.len(),
                 cached_tokens,
             });
-            let state = Glm52SlotState::new(
+            let mut state = Glm52SlotState::new(
                 req.prompt_tokens.clone(),
                 req.max_tokens,
                 req.params.ignore_eos,
                 cached_tokens,
             );
+            if let Some(handoff) = native_handoff {
+                anyhow::ensure!(
+                    cached_tokens == handoff.committed_len,
+                    "native-MTP P/D admitted {} cached tokens, expected {}",
+                    cached_tokens,
+                    handoff.committed_len
+                );
+                state.set_drafts(handoff.draft_tokens.to_vec(), crate::mtp::GLM52_MTP_DRAFTS);
+                log::info!(
+                    "GLM5.2 native P/D admitted: rank={rank} slot={slot} \
+                     committed_len={} drafts={} first_step=verify",
+                    handoff.committed_len,
+                    handoff.draft_tokens.len()
+                );
+            }
             if drafter_enabled {
                 pending_resets[rank].push(slot);
             }

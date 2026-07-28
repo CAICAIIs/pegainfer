@@ -51,7 +51,11 @@ pub(crate) const GLM52_MTP_DRAFTS: usize = 5;
 /// probe; this function is the exact monotone term used to derive the context
 /// cap before those arenas are allocated.
 pub(crate) fn glm52_mtp_arena_bytes(max_model_len: usize) -> Result<usize> {
-    let blocks = glm52_pool_blocks(max_model_len, GLM52_MAX_BATCH_PER_RANK);
+    // Two private pages per slot hold unverified proposal KV. Committed
+    // layer-78 rows use the target BlockPool page IDs and are transferable;
+    // scratch pages sit beyond that registered range.
+    let blocks =
+        glm52_pool_blocks(max_model_len, GLM52_MAX_BATCH_PER_RANK) + 2 * GLM52_MAX_BATCH_PER_RANK;
     let mla = blocks
         .checked_mul(GLM52_MODEL_LEN_ALIGN)
         .and_then(|v| v.checked_mul(openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN))
@@ -144,6 +148,24 @@ pub(crate) struct Glm52MtpScratch {
     fused_input: HiddenStates,
 }
 
+pub(crate) struct Glm52MtpPrefillScratch {
+    masked_embed: CudaSlice<bf16>,
+    normed_embed: CudaSlice<bf16>,
+    normed_previous: CudaSlice<bf16>,
+    fused_input: CudaSlice<bf16>,
+}
+
+impl Glm52MtpPrefillScratch {
+    pub(crate) fn new(ctx: &DeviceContext, rows: usize) -> Result<Self> {
+        Ok(Self {
+            masked_embed: ctx.stream.alloc_zeros(rows * GLM52_HIDDEN)?,
+            normed_embed: ctx.stream.alloc_zeros(rows * GLM52_HIDDEN)?,
+            normed_previous: ctx.stream.alloc_zeros(rows * GLM52_HIDDEN)?,
+            fused_input: ctx.stream.alloc_zeros(rows * MTP_FUSED_INPUT)?,
+        })
+    }
+}
+
 impl Glm52MtpScratch {
     pub(crate) fn new(ctx: &DeviceContext, tokens: usize) -> Result<Self> {
         Ok(Self {
@@ -162,6 +184,95 @@ impl Glm52MtpScratch {
     #[cfg(test)]
     pub(crate) fn normed_previous(&self) -> &Rows<GLM52_HIDDEN> {
         &self.normed_previous
+    }
+}
+
+impl Glm52MtpBookendWeights {
+    pub(crate) fn shared_norm(&self) -> &DeviceVec {
+        &self.shared_norm
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_prefill_into(
+        &self,
+        ctx: &DeviceContext,
+        positions: &CudaSlice<u32>,
+        inputs_embeds: &CudaSlice<bf16>,
+        previous_hidden: &CudaSlice<bf16>,
+        rows: usize,
+        scratch: &mut Glm52MtpPrefillScratch,
+        decoder_input: &mut CudaSlice<bf16>,
+    ) -> Result<()> {
+        let hidden = rows * GLM52_HIDDEN;
+        ensure!(
+            positions.len() >= rows
+                && inputs_embeds.len() >= hidden
+                && previous_hidden.len() >= hidden
+                && decoder_input.len() >= hidden,
+            "GLM5.2 MTP prefill row buffers are smaller than {rows}"
+        );
+        mask_position_zero_rows_into(
+            ctx,
+            inputs_embeds,
+            positions,
+            GLM52_HIDDEN,
+            rows,
+            &mut scratch.masked_embed,
+        )?;
+        rms_norm_rows_into(
+            ctx,
+            &scratch.masked_embed,
+            &self.enorm,
+            GLM52_RMS_EPS,
+            GLM52_HIDDEN,
+            rows,
+            &mut scratch.normed_embed,
+        )?;
+        rms_norm_rows_into(
+            ctx,
+            previous_hidden,
+            &self.hnorm,
+            GLM52_RMS_EPS,
+            GLM52_HIDDEN,
+            rows,
+            &mut scratch.normed_previous,
+        )?;
+        copy_hidden_rows_raw_into(
+            ctx,
+            &scratch.normed_embed,
+            GLM52_HIDDEN,
+            &mut scratch.fused_input,
+            MTP_FUSED_INPUT,
+            0,
+            rows,
+        )?;
+        copy_hidden_rows_raw_into(
+            ctx,
+            &scratch.normed_previous,
+            GLM52_HIDDEN,
+            &mut scratch.fused_input,
+            MTP_FUSED_INPUT,
+            GLM52_HIDDEN,
+            rows,
+        )?;
+        gemm_strided_batched_bf16(
+            ctx,
+            true,
+            false,
+            GLM52_HIDDEN,
+            rows,
+            MTP_FUSED_INPUT,
+            &self.eh_proj.data,
+            MTP_FUSED_INPUT,
+            0,
+            &scratch.fused_input,
+            MTP_FUSED_INPUT,
+            0,
+            decoder_input,
+            GLM52_HIDDEN,
+            0,
+            1,
+        )
     }
 }
 

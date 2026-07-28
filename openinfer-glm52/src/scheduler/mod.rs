@@ -71,6 +71,8 @@ use plan::launch_ahead_flags;
 use plan::plan_prefill_spans;
 use plan::plan_step_shapes;
 use plan::takes_argmax;
+use sha2::Digest as _;
+use sha2::Sha256;
 use slot::GLM52_PADDING_STEP;
 use slot::Glm52SlotState;
 use slot::Glm52StepOutcome;
@@ -194,6 +196,8 @@ pub(crate) fn run_dp8_coordinator(
     });
     let mut vllm_pd =
         vllm_compat.map(|opts| VllmPdState::new(&opts, moe_topo.logical_rank_count()));
+    let mut native_pd = (drafter.is_mtp() && offload.is_some() && !prefill_only)
+        .then(|| offload::NativePdState::new(moe_topo.logical_rank_count()));
     // One KV page pool per LOGICAL rank: pool block ids index the rank's
     // per-layer MLA and index-K arenas directly (the arenas were built for
     // `glm52_pool_blocks` blocks). Block 0-equivalent is the reserved
@@ -233,8 +237,9 @@ pub(crate) fn run_dp8_coordinator(
     // loses target hidden rows and continuity in its separate KV cache.
     // Prefix matching therefore stays off while any drafter is active.
     // `--no-prefix-cache` remains the explicit kill switch.
-    let prefix_cache_enabled = !drafter.enabled() && !no_prefix_cache;
-    if drafter.enabled() && !no_prefix_cache {
+    let prefix_cache_enabled =
+        (!drafter.enabled() || (prefill_only && drafter.is_mtp())) && !no_prefix_cache;
+    if drafter.enabled() && !prefix_cache_enabled && !no_prefix_cache {
         log::info!("GLM5.2 prefix cache disabled: speculative decoding is on");
     }
     let mut slots: Vec<RankSlots> = (0..logical_ranks)
@@ -339,6 +344,7 @@ pub(crate) fn run_dp8_coordinator(
             &usable_blocks,
             offload.as_deref(),
             &mut vllm_pd,
+            &mut native_pd,
             &workers,
             mirrored,
             prefix_cache_enabled,
@@ -355,7 +361,11 @@ pub(crate) fn run_dp8_coordinator(
             // A parked P/D front re-queries at admission; with no running
             // slots there is no step cadence to pace the retries — throttle
             // instead of spinning on the MetaServer.
-            if vllm_pd.as_ref().is_some_and(VllmPdState::any_parked) {
+            if vllm_pd.as_ref().is_some_and(VllmPdState::any_parked)
+                || native_pd
+                    .as_ref()
+                    .is_some_and(offload::NativePdState::any_parked)
+            {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
             continue;
@@ -382,6 +392,7 @@ pub(crate) fn run_dp8_coordinator(
                 max_rows,
                 eos_token_ids,
                 sample_step,
+                offload.as_deref(),
             ) {
                 fail_step(&mut slots, &err);
                 break 'serve;
@@ -723,6 +734,7 @@ fn submit_join_apply_prefill(
     max_rows: usize,
     eos_token_ids: &[u32],
     sample_step: u64,
+    offload: Option<&[offload::RankOffload]>,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
         slots.len() == 1 && pools.len() == 1 && workers.len() > 1,
@@ -737,8 +749,10 @@ fn submit_join_apply_prefill(
         request_indptr: vec![0],
         block_indptr: vec![0],
         block_ids: Vec::new(),
+        request_slots: Vec::new(),
         padding_block: pool.padding_block_id(),
         slot_mapping: Vec::new(),
+        mtp_next_tokens: Vec::new(),
         output_rows: Vec::new(),
         sampling: Vec::new(),
         seed: mix_seed(GLM52_SAMPLE_SEED, sample_step),
@@ -774,9 +788,13 @@ fn submit_join_apply_prefill(
                 .push(page as i64 * PAGE as i64 + (input.position % PAGE) as i64);
         }
         batch.block_ids.extend_from_slice(view.page_indices());
+        batch.request_slots.push(slot_id);
         batch.request_indptr.push(batch.token_ids.len() as u32);
         batch.block_indptr.push(batch.block_ids.len() as u32);
         let boundary = span == active.state.remaining_prompt();
+        batch
+            .mtp_next_tokens
+            .push((!boundary).then(|| active.state.next_input_at(span).token));
         if boundary {
             batch.output_rows.push((batch.token_ids.len() - 1) as u32);
             if !takes_argmax(&active.req.params) {
@@ -807,17 +825,31 @@ fn submit_join_apply_prefill(
     for (rank, output) in outputs.iter().enumerate().skip(1) {
         anyhow::ensure!(
             output == &outputs[0],
-            "GLM5.2 TP prefill output diverged on rank {rank}"
+            "GLM5.2 TP prefill output diverged on rank {rank}: rank0={:?}, rank{rank}={output:?}",
+            outputs[0],
         );
     }
     anyhow::ensure!(
-        outputs[0].len() == batch.output_rows.len(),
+        outputs[0].target_tokens.len() == batch.output_rows.len(),
         "GLM5.2 prefill returned {} boundary outputs, expected {}",
-        outputs[0].len(),
+        outputs[0].target_tokens.len(),
+        batch.output_rows.len()
+    );
+    anyhow::ensure!(
+        outputs[0].mtp_draft1.is_empty() || outputs[0].mtp_draft1.len() == batch.output_rows.len(),
+        "GLM5.2 prefill returned {} MTP draft-1 tokens, expected zero or {}",
+        outputs[0].mtp_draft1.len(),
+        batch.output_rows.len()
+    );
+    anyhow::ensure!(
+        outputs[0].mtp_drafts.is_empty() || outputs[0].mtp_drafts.len() == batch.output_rows.len(),
+        "GLM5.2 prefill returned {} complete MTP proposals, expected zero or {}",
+        outputs[0].mtp_drafts.len(),
         batch.output_rows.len()
     );
 
-    let mut boundary_output = outputs[0].iter();
+    let mut boundary_output = outputs[0].target_tokens.iter();
+    let mut boundary_drafts = outputs[0].mtp_drafts.iter();
     for (slot_id, span, boundary) in scheduled {
         let slot = &mut slots[0][slot_id];
         let active = slot
@@ -856,6 +888,44 @@ fn submit_join_apply_prefill(
                         break;
                     }
                 }
+                if boundary
+                    && !freed
+                    && let Some(drafts) = boundary_drafts.next()
+                {
+                    let committed_len = active.kv.kv_position();
+                    let tail_len = offload::native_pd_tail_len(committed_len);
+                    let tail_key = if tail_len > 0 {
+                        let mut hasher = Sha256::new();
+                        hasher.update(b"openinfer-glm52-native-mtp-tail-v1");
+                        hasher.update((committed_len as u64).to_le_bytes());
+                        for token in &active.req.prompt_tokens[..committed_len] {
+                            hasher.update(token.to_le_bytes());
+                        }
+                        let digest = hasher.finalize();
+                        let mut key = [0_u8; 16];
+                        key.copy_from_slice(&digest[..16]);
+                        if let Some(offload) = offload {
+                            offload[0].save_native_tail(&active.kv, key)?;
+                        }
+                        Some(hex::encode(key))
+                    } else {
+                        None
+                    };
+                    let _ = active.req.token_tx.send(TokenEvent::KvTransfer {
+                        params: serde_json::json!({
+                            "openinfer_pd": {
+                                "version": 1,
+                                "native_mtp": {
+                                    "draft_tokens": drafts,
+                                    "committed_len": committed_len,
+                                    "arena_count": 101,
+                                    "tail_len": tail_len,
+                                    "tail_key": tail_key
+                                }
+                            }
+                        }),
+                    });
+                }
                 if let Some(finish_reason) = finish
                     && !freed
                 {
@@ -870,6 +940,9 @@ fn submit_join_apply_prefill(
             }
         };
         if freed {
+            if let Some(offload) = offload {
+                offload[0].save_sealed_on_release(&active.kv);
+            }
             if let Err(err) = active.kv.release() {
                 log::warn!("GLM5.2 prefill slot {slot_id} KV release failed: {err:#}");
             }
@@ -1041,6 +1114,7 @@ fn apply_step_outputs(
                             slot: slot_id,
                             input_token,
                             position: step_inputs[rank][target_row].1,
+                            pages: active.kv.current_page_indices(),
                         });
                     }
                 }

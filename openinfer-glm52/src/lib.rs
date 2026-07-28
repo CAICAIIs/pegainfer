@@ -456,8 +456,9 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
     } = options;
     if drafter.is_mtp() {
         ensure!(
-            matches!(moe_topo, Glm52MoeTopo::Ep4 | Glm52MoeTopo::Ep8),
-            "GLM5.2 native MTP currently requires the single-node EP4 or EP8 topology"
+            moe_topo.uses_ep_expert_bundles()
+                || (moe_topo == Glm52MoeTopo::Tp4 && prefill_only.is_some()),
+            "GLM5.2 native MTP requires EP decode or TP4 prefill-only"
         );
         ensure!(
             rank_hosts.is_empty(),
@@ -506,16 +507,16 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
             GLM52_PREFILL_CHUNK_ALIGN,
         );
         ensure!(
-            !drafter.enabled(),
-            "GLM5.2 prefill-only mode is incompatible with speculative decoding"
+            !drafter.is_dspark(),
+            "GLM5.2 prefill-only mode is incompatible with DSpark"
         );
         ensure!(
             !no_prefix_cache,
             "GLM5.2 prefill-only mode requires prefix caching"
         );
         ensure!(
-            kv_offload.is_none(),
-            "GLM5.2 prefill-only mode does not support KV offload or an external P/D peer"
+            kv_offload.is_none() || drafter.is_mtp(),
+            "GLM5.2 prefill-only KV offload requires native MTP's 101-arena contract"
         );
         ensure!(
             dump_graph_png.is_none(),
@@ -527,16 +528,23 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
     // for offload is contradictory — fail loud instead of silently idling an
     // allocated multi-GiB pinned pool.
     ensure!(
-        kv_offload.is_none() || (!drafter.enabled() && !no_prefix_cache),
+        kv_offload.is_none() || ((!drafter.enabled() || drafter.is_mtp()) && !no_prefix_cache),
         "GLM5.2 --kv-offload requires the prefix cache: drop --no-prefix-cache and the \
-         drafter (speculative decoding and prefix caching are mutually exclusive)"
+         DSpark drafter"
     );
     // The tp8 topology mirrors KV on every rank; the host tier's restore leg
     // H2Ds into ONE rank's arena, which would silently desync the other 7.
     ensure!(
-        kv_offload.is_none() || moe_topo == Glm52MoeTopo::Ep8,
-        "GLM5.2 --kv-offload requires the EP8 topology (tp8 replicates KV on all ranks; \
-         a host-tier restore would land on one)"
+        kv_offload.is_none()
+            || moe_topo.uses_ep_expert_bundles()
+            || (moe_topo == Glm52MoeTopo::Tp4 && prefill_only.is_some()),
+        "GLM5.2 --kv-offload requires EP decode or TP4 prefill-only"
+    );
+    ensure!(
+        kv_offload
+            .as_ref()
+            .is_none_or(|kv| kv.vllm_compat.is_none() || !drafter.is_mtp()),
+        "GLM5.2 native MTP uses 101 arenas and cannot restore vLLM's target-only 99 arenas"
     );
     // The vLLM prefill peer's KV lives in its pegaflow-server's pool (a
     // separate process even on the same host); without the P2P mesh the
@@ -1025,8 +1033,10 @@ fn preflight_prefill_kernels(workers: &[Glm52Worker]) -> Result<()> {
                 request_indptr: vec![0, 1],
                 block_indptr: vec![0, 1],
                 block_ids: vec![0],
+                request_slots: vec![0],
                 padding_block: 1,
                 slot_mapping: vec![0],
+                mtp_next_tokens: vec![Some(0)],
                 output_rows: Vec::new(),
                 sampling: Vec::new(),
                 seed: 0,
@@ -1210,13 +1220,17 @@ fn build_offload_engines(
     // connector derives an 8-hex namespace from vLLM config (and logs it at
     // startup); reproducing that derivation would mean chasing Python repr
     // of vLLM internals, so the operator passes it through explicitly.
+    let native_mtp = rank_arenas
+        .first()
+        .is_some_and(|arenas| arenas.iter().any(|arena| arena.name == "glm52.L78.mla"));
     let namespace = match &opts.vllm_compat {
         Some(compat) => compat.namespace.clone(),
         None => format!(
-            "openinfer-glm52-l{GLM52_LAYERS}-p{}-mla{}-idxk{}",
+            "openinfer-glm52-l{GLM52_LAYERS}-p{}-mla{}-idxk{}-mtp{}",
             mla_page_size,
             mla_bytes_per_token,
             config::GLM52_INDEX_HEAD_DIM + 4,
+            usize::from(native_mtp),
         ),
     };
     // vLLM-compat: the P side's connector stores MLA-model blocks page-first —
@@ -1249,7 +1263,8 @@ fn build_offload_engines(
     let arenas_per_rank = GLM52_LAYERS
         + (0..GLM52_LAYERS)
             .filter(|&layer| config::glm52_layer_has_full_indexer(layer))
-            .count();
+            .count()
+        + usize::from(native_mtp) * 2;
     log::info!(
         "GLM5.2 KV offload up: {} pinned host pool (hugepages: {}), namespace {namespace}, \
          {} rank instances x {arenas_per_rank} arenas",
