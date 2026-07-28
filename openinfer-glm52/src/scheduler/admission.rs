@@ -26,6 +26,7 @@ fn validate_request(
     req: &GenerateRequest,
     max_model_len: usize,
     prefill_only: bool,
+    native_mtp_prefill: bool,
 ) -> Result<(), String> {
     if req.prompt_tokens.is_empty() {
         return Err("GLM5.2 requires a non-empty prompt".to_owned());
@@ -48,6 +49,16 @@ fn validate_request(
             "GLM5.2 context cap: prompt {} + max_tokens {} exceeds max_model_len {max_model_len}",
             req.prompt_tokens.len(),
             req.max_tokens
+        ));
+    }
+    if native_mtp_prefill
+        && req.prompt_tokens.len() + crate::mtp::GLM52_MTP_DRAFTS - 1 > max_model_len
+    {
+        return Err(format!(
+            "GLM5.2 native-MTP prefill requires {} positions of proposal headroom: \
+             prompt {} exceeds max_model_len {max_model_len}",
+            crate::mtp::GLM52_MTP_DRAFTS - 1,
+            req.prompt_tokens.len()
         ));
     }
     // Mirror the sampler kernel's parameter ensures HERE: past intake a bad
@@ -145,8 +156,9 @@ pub(super) fn intake(
     running: &[usize],
     max_model_len: usize,
     prefill_only: bool,
+    native_mtp_prefill: bool,
 ) {
-    if let Err(message) = validate_request(&req, max_model_len, prefill_only) {
+    if let Err(message) = validate_request(&req, max_model_len, prefill_only, native_mtp_prefill) {
         reject(&req, message);
         return;
     }
@@ -394,6 +406,7 @@ pub(super) fn admit_from_queue(
                     cached_tokens,
                     handoff.committed_len
                 );
+                state.seed_native_pd_anchor();
                 state.set_drafts(handoff.draft_tokens.to_vec(), crate::mtp::GLM52_MTP_DRAFTS);
                 log::info!(
                     "GLM5.2 native P/D admitted: rank={rank} slot={slot} \
@@ -452,7 +465,7 @@ mod tests {
         for params in cases {
             let req = request(vec![10], params, 4);
             assert!(
-                validate_request(&req, 4096, false).is_err(),
+                validate_request(&req, 4096, false, false).is_err(),
                 "params must be rejected at intake: {params:?}"
             );
         }
@@ -466,7 +479,7 @@ mod tests {
             },
             4,
         );
-        assert!(validate_request(&req, 4096, false).is_ok());
+        assert!(validate_request(&req, 4096, false, false).is_ok());
     }
 
     #[test]
@@ -475,7 +488,7 @@ mod tests {
 
         let mut bound = request(vec![10], SamplingParams::default(), 4);
         bound.data_parallel_rank = Some(2);
-        intake(bound, &mut pending, &[0, 0, 0], 4096, false);
+        intake(bound, &mut pending, &[0, 0, 0], 4096, false, false);
         assert_eq!(
             pending.iter().map(VecDeque::len).collect::<Vec<_>>(),
             [0, 0, 1]
@@ -486,6 +499,7 @@ mod tests {
             &mut pending,
             &[2, 1, 2],
             4096,
+            false,
             false,
         );
         assert_eq!(
@@ -500,6 +514,7 @@ mod tests {
             &mut pending,
             &[2, 1, 2],
             4096,
+            false,
             false,
         );
         assert_eq!(
@@ -522,11 +537,31 @@ mod tests {
     #[test]
     fn prefill_only_accepts_exactly_one_output_token() {
         let one = request(vec![10, 11], SamplingParams::default(), 1);
-        assert!(validate_request(&one, 4096, true).is_ok());
+        assert!(validate_request(&one, 4096, true, false).is_ok());
 
         let many = request(vec![10, 11], SamplingParams::default(), 2);
-        let error = validate_request(&many, 4096, true).expect_err("decode must be rejected");
+        let error =
+            validate_request(&many, 4096, true, false).expect_err("decode must be rejected");
         assert!(error.contains("requires max_tokens=1"), "{error}");
+    }
+
+    #[test]
+    fn native_mtp_prefill_reserves_the_fixed_proposal_positions() {
+        let fits = request(vec![10; 4092], SamplingParams::default(), 1);
+        assert!(validate_request(&fits, 4096, true, true).is_ok());
+
+        let overflows = request(vec![10; 4093], SamplingParams::default(), 1);
+        let error = validate_request(&overflows, 4096, true, true)
+            .expect_err("fixed MTP proposal must fit inside the context cap");
+        assert!(
+            error.contains("4 positions of proposal headroom"),
+            "{error}"
+        );
+
+        assert!(
+            validate_request(&overflows, 4096, true, false).is_ok(),
+            "plain TP4 prefill does not execute the native-MTP proposal loop"
+        );
     }
 
     #[test]

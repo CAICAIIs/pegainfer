@@ -2,9 +2,11 @@
 
 > **TL;DR:** TP4 prefill transfers 99 target plus two committed native-MTP
 > arenas and a five-token proposal to EP decode. Real 89-token, 4K, and 16K
-> TP4 P → EP4 D gates restore over RDMA and enter `first_step=verify`; in a
+> TP4 P → EP4 D gates restore over RDMA; post-review state-machine coverage
+> now guarantees that the forwarded anchor starts directly in verify. In a
 > five-run cold-prefix A/B, P-to-D-first p50 was 82/386/1,465 ms versus EP4
-> local-prefill TTFT of 317/13,853/55,932 ms.
+> local-prefill TTFT of 317/13,853/55,932 ms; hardware first-verify telemetry
+> must be rerun after the state fix.
 >
 > **Last touched:** 2026-07
 
@@ -34,6 +36,10 @@
   - The desired boundary is stronger than the existing `suffix == 1`
     handoff: P returns an anchor plus initial draft token IDs, and D's first
     target step verifies that span directly.
+  - Post-review found that the original admission log claimed
+    `first_step=verify` without changing the slot out of its one-token prompt
+    suffix. The historical hardware runs restored the intended bytes but did
+    not verify the transferred proposal on their first target step.
 - **Plan**:
   1. Specify and unit-test the handoff state machine: P transfers committed
      target pages, committed MTP layer-78 pages, `anchor`, initial draft token
@@ -75,6 +81,23 @@
     gate.
 
 ## Execution Log
+
+### Post-review first-verify and context-cap fixes
+
+- Native D admission now marks the forwarded anchor as the current decode
+  token, with the prompt fully fed and D-side completion still zero. The
+  installed five-token proposal therefore makes the first target span
+  speculative instead of a `PrefillBoundary` that clears the drafts.
+- TP4 native-MTP prefill now reserves the four extra positions used after
+  draft-1 by the fixed five-token proposal loop. Requests above
+  `max_model_len - 4` are rejected at intake instead of failing the prefill
+  engine inside proposal generation. Plain TP4 prefill keeps its original
+  context limit.
+- Release validation: the two focused regression tests passed, followed by
+  the full GLM5.2 library suite (`97 passed`, `21 ignored`). The historical
+  hardware TTFT rows remain useful transfer/latency measurements, but their
+  initial-proposal acceptance claim is withdrawn until the EP4 handoff is
+  rerun.
 
 ### TP4 P → EP4 D hardware handoff
 
@@ -270,5 +293,9 @@ logical dimensions hid a physical-stride mismatch until a page boundary.
 Future P/D additions should log both wire and execution layouts at startup and
 must either prove them byte-identical or make the conversion boundary explicit.
 
-Next action: run the 89-token token-ID handoff gate against EP16 and record its
-RDMA and first-verify telemetry here.
+The post-review state bug also showed that a log describing the intended next
+step is not evidence of the slot's actual span kind. First-verify gates must
+assert the state transition or observed speculative span.
+
+Next action: rerun the 89-token token-ID handoff gate against EP4, then EP16,
+and record observed first-verify telemetry here.

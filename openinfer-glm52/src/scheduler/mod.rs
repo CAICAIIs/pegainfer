@@ -313,6 +313,7 @@ pub(crate) fn run_dp8_coordinator(
                     &running_counts(&slots),
                     max_model_len,
                     prefill_only,
+                    prefill_only && mtp_enabled,
                 ),
                 None => channel_open = false,
             }
@@ -325,6 +326,7 @@ pub(crate) fn run_dp8_coordinator(
                     &running_counts(&slots),
                     max_model_len,
                     prefill_only,
+                    prefill_only && mtp_enabled,
                 ),
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => channel_open = false,
