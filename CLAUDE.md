@@ -20,6 +20,8 @@ Every model line is behind a cargo feature; only `qwen3` is a default feature, s
 
 **Always use `--release`** — debug builds are extremely slow for GPU/CUDA and will timeout.
 
+When developing with Docker, use `docker/Dockerfile.dev` and `docker/dev.sh` as described in `docker/README.md`.
+
 ```bash
 # Qwen3 (default feature, no Python anywhere in the build)
 cargo run --release -- --model-path models/Qwen3-4B
