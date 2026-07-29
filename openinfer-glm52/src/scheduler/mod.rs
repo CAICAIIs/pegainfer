@@ -928,28 +928,40 @@ fn submit_join_apply_prefill(
                         let mut key = [0_u8; 16];
                         key.copy_from_slice(&digest[..16]);
                         if let Some(offload) = offload {
-                            offload[0].save_native_tail(&active.kv, key)?;
+                            if let Err(err) = offload[0].save_native_tail(&active.kv, key) {
+                                let message =
+                                    format!("GLM5.2 native P/D tail save failed: {err:#}");
+                                log::warn!("{message}");
+                                let _ = active.req.token_tx.send(TokenEvent::Error {
+                                    message,
+                                    prompt_tokens,
+                                    completion_tokens: active.state.completion_tokens(),
+                                });
+                                freed = true;
+                            }
                         }
                         Some(hex::encode(key))
                     } else {
                         None
                     };
-                    let _ = active.req.token_tx.send(TokenEvent::KvTransfer {
-                        params: serde_json::json!({
-                            "openinfer_pd": {
-                                "version": 2,
-                                "native_mtp": {
-                                    "draft_tokens": drafts,
-                                    "committed_len": committed_len,
-                                    "arena_count": 101,
-                                    "tail_len": tail_len,
-                                    "tail_key": tail_key,
-                                    "anchor_token_id": committed[0],
-                                    "anchor_emitted": emit == 1
+                    if !freed {
+                        let _ = active.req.token_tx.send(TokenEvent::KvTransfer {
+                            params: serde_json::json!({
+                                "openinfer_pd": {
+                                    "version": 2,
+                                    "native_mtp": {
+                                        "draft_tokens": drafts,
+                                        "committed_len": committed_len,
+                                        "arena_count": 101,
+                                        "tail_len": tail_len,
+                                        "tail_key": tail_key,
+                                        "anchor_token_id": committed[0],
+                                        "anchor_emitted": emit == 1
+                                    }
                                 }
-                            }
-                        }),
-                    });
+                            }),
+                        });
+                    }
                 }
                 if let Some(finish_reason) = finish
                     && !freed

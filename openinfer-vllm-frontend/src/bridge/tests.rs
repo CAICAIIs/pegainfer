@@ -42,10 +42,14 @@ impl Demux {
 
     /// Register a request as `start_request` does and return its abort reason.
     fn add(&mut self, id: &str) -> Arc<AtomicU8> {
-        self.add_with_eos(id, None)
+        self.add_with_stop_sentinel(id, None)
     }
 
     fn add_with_eos(&mut self, id: &str, eos_token_id: Option<u32>) -> Arc<AtomicU8> {
+        self.add_with_stop_sentinel(id, eos_token_id)
+    }
+
+    fn add_with_stop_sentinel(&mut self, id: &str, stop_sentinel_id: Option<u32>) -> Arc<AtomicU8> {
         let tag: RequestTag = Arc::from(id);
         let abort_reason = Arc::new(AtomicU8::new(RequestAbortReason::None as u8));
         self.streams.insert(
@@ -53,7 +57,7 @@ impl Demux {
             RequestStreamState::new(
                 Arc::clone(&abort_reason),
                 fastrace::Span::noop(),
-                eos_token_id,
+                stop_sentinel_id,
             ),
         );
         abort_reason
@@ -192,6 +196,35 @@ fn stop_output_appends_eos_for_vllm_decoder() {
     let batch = d.next_output().expect("terminal output");
     let output = &batch.outputs[0];
     assert_eq!(output.new_token_ids, vec![11, 2]);
+    assert_eq!(output.finish_reason, Some(EngineCoreFinishReason::Stop));
+}
+
+#[test]
+fn explicit_stop_token_is_used_as_sentinel_when_eos_is_absent() {
+    assert_eq!(stop_sentinel_id(None, &[42, 43]), Some(42));
+
+    let mut d = Demux::new();
+    d.add_with_stop_sentinel("req-stop-token", Some(42));
+    d.emit(
+        "req-stop-token",
+        TokenEvent::Token {
+            id: 11,
+            logprob: None,
+        },
+    );
+    d.emit(
+        "req-stop-token",
+        TokenEvent::Finished {
+            finish_reason: FinishReason::Stop,
+            prompt_tokens: 16,
+            completion_tokens: 2,
+        },
+    );
+    assert!(d.drain());
+
+    let batch = d.next_output().expect("terminal output");
+    let output = &batch.outputs[0];
+    assert_eq!(output.new_token_ids, vec![11, 42]);
     assert_eq!(output.finish_reason, Some(EngineCoreFinishReason::Stop));
 }
 
