@@ -918,15 +918,10 @@ fn submit_join_apply_prefill(
                     let committed_len = active.kv.kv_position();
                     let tail_len = offload::native_pd_tail_len(committed_len);
                     let tail_key = if tail_len > 0 {
-                        let mut hasher = Sha256::new();
-                        hasher.update(b"openinfer-glm52-native-mtp-tail-v1");
-                        hasher.update((committed_len as u64).to_le_bytes());
-                        for token in &active.req.prompt_tokens[..committed_len] {
-                            hasher.update(token.to_le_bytes());
-                        }
-                        let digest = hasher.finalize();
-                        let mut key = [0_u8; 16];
-                        key.copy_from_slice(&digest[..16]);
+                        let key = native_mtp_tail_key(
+                            &active.req.prompt_tokens[..committed_len],
+                            committed[0],
+                        );
                         if let Some(offload) = offload {
                             if let Err(err) = offload[0].save_native_tail(&active.kv, key) {
                                 let message =
@@ -996,8 +991,25 @@ fn take_boundary_drafts<'a>(
     if boundary { drafts.next() } else { None }
 }
 
+fn native_mtp_tail_key(committed_prompt: &[u32], anchor_token: u32) -> [u8; 16] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"openinfer-glm52-native-mtp-tail-v1");
+    hasher.update((committed_prompt.len() as u64).to_le_bytes());
+    for token in committed_prompt {
+        hasher.update(token.to_le_bytes());
+    }
+    // The final MTP context row is shifted by P's sampled anchor, so the
+    // stored tail is not identified by the prompt alone.
+    hasher.update(anchor_token.to_le_bytes());
+    let digest = hasher.finalize();
+    let mut key = [0_u8; 16];
+    key.copy_from_slice(&digest[..16]);
+    key
+}
+
 #[cfg(test)]
 mod tp_prefill_output_tests {
+    use super::native_mtp_tail_key;
     use super::take_boundary_drafts;
 
     #[test]
@@ -1011,6 +1023,19 @@ mod tp_prefill_output_tests {
         let _discarded_after_disconnect = take_boundary_drafts(true, &mut drafts);
         assert_eq!(take_boundary_drafts(false, &mut drafts), None);
         assert_eq!(take_boundary_drafts(true, &mut drafts), Some(&proposals[1]));
+    }
+
+    #[test]
+    fn sampled_anchor_is_part_of_the_native_mtp_tail_identity() {
+        let prompt = [1, 2, 3];
+        assert_ne!(
+            native_mtp_tail_key(&prompt, 10),
+            native_mtp_tail_key(&prompt, 11)
+        );
+        assert_eq!(
+            native_mtp_tail_key(&prompt, 10),
+            native_mtp_tail_key(&prompt, 10)
+        );
     }
 }
 
