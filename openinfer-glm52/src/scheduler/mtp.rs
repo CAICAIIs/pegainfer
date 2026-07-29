@@ -172,6 +172,7 @@ mod tests {
             slot: 0,
             input_token: 1,
             position: 0,
+            pages: vec![7],
         }
     }
 

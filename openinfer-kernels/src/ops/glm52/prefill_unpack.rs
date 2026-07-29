@@ -16,6 +16,7 @@ const LATENT: usize = 576;
 pub fn glm52_prefill_unpack_pages_launch(
     ctx: &DeviceContext,
     packed: &CudaSlice<u8>,
+    packed_bytes: usize,
     block_ids: &CudaSlice<i32>,
     blocks: usize,
     unpacked: &mut CudaSlice<bf16>,
@@ -29,11 +30,10 @@ pub fn glm52_prefill_unpack_pages_launch(
         "GLM5.2 prefill unpack output extent is invalid"
     );
     let max_slots = unpacked.len() / LATENT;
-    let packed_bytes = packed.len() / max_slots;
     ensure!(
         unpacked.len() == max_slots * LATENT
             && matches!(packed_bytes, 576 | 656)
-            && packed.len() == max_slots * packed_bytes,
+            && packed.len() >= max_slots * packed_bytes,
         "GLM5.2 prefill unpack cache extents disagree"
     );
     let (packed_ptr, _packed_guard) = packed.device_ptr(&ctx.stream);
@@ -80,7 +80,7 @@ mod tests {
         let packed = ctx.stream.clone_htod(&packed)?;
         let blocks = ctx.stream.clone_htod(&[0i32])?;
         let mut unpacked = ctx.stream.alloc_zeros::<bf16>(PAGE * LATENT)?;
-        glm52_prefill_unpack_pages_launch(&ctx, &packed, &blocks, 1, &mut unpacked)?;
+        glm52_prefill_unpack_pages_launch(&ctx, &packed, PACKED_BYTES, &blocks, 1, &mut unpacked)?;
         let unpacked = ctx.stream.clone_dtoh(&unpacked)?;
         for token in 0..PAGE {
             for dim in 0..512 {
@@ -99,7 +99,7 @@ mod tests {
         let packed = ctx.stream.clone_htod(&vec![0x38u8; PAGE * LATENT])?;
         let blocks = ctx.stream.clone_htod(&[0i32])?;
         let mut unpacked = ctx.stream.alloc_zeros::<bf16>(PAGE * LATENT)?;
-        glm52_prefill_unpack_pages_launch(&ctx, &packed, &blocks, 1, &mut unpacked)?;
+        glm52_prefill_unpack_pages_launch(&ctx, &packed, LATENT, &blocks, 1, &mut unpacked)?;
         let unpacked = ctx.stream.clone_dtoh(&unpacked)?;
         ensure!(
             unpacked.iter().all(|value| value.to_f32() == 1.0),

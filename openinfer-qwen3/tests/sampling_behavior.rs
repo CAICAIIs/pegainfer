@@ -55,6 +55,7 @@ fn generate(handle: &EngineHandle, prompt_tokens: Vec<u32>, params: SamplingPara
             params,
             max_tokens: GENERATED_TOKENS,
             lora_adapter: None,
+            kv_transfer_params: None,
             token_tx,
             logprobs: 0,
             echo: false,
@@ -65,7 +66,11 @@ fn generate(handle: &EngineHandle, prompt_tokens: Vec<u32>, params: SamplingPara
     loop {
         match rx.blocking_recv().map(|(_, event)| event) {
             Some(TokenEvent::Token { id, .. }) => tokens.push(id),
-            Some(TokenEvent::Scheduled { .. } | TokenEvent::PromptTokens { .. }) => {}
+            Some(
+                TokenEvent::Scheduled { .. }
+                | TokenEvent::PromptTokens { .. }
+                | TokenEvent::KvTransfer { .. },
+            ) => {}
             Some(TokenEvent::Finished { .. }) => return tokens,
             Some(TokenEvent::Error { message, .. }) => panic!("generation failed: {message}"),
             Some(TokenEvent::Rejected { message, .. }) => panic!("generation rejected: {message}"),

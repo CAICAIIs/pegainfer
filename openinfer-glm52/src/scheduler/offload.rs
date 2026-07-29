@@ -27,6 +27,7 @@ use openinfer_kv_offload::OffloadEngine;
 use openinfer_kv_offload::QueryOutcome;
 use openinfer_kv_offload::VLLM_HASH_BYTES;
 use openinfer_kv_offload::VllmBlockHasher;
+use serde::Deserialize;
 
 use super::PAGE;
 
@@ -111,6 +112,22 @@ impl RankOffload {
         };
         self.engine.save(&block_ids, &block_hashes, pin);
     }
+
+    /// Persist the mutable last page under the native-P/D handoff key.
+    /// kvbm does not expose an immutable guard or lineage hash until a page
+    /// seals, so capture this page synchronously while the request still owns
+    /// it. The response may race cache visibility; D admission already parks
+    /// and retries until PegaFlow publishes the key.
+    pub(super) fn save_native_tail(&self, kv: &RequestKv, key: [u8; 16]) -> anyhow::Result<()> {
+        let page_id = kv
+            .current_page_indices()
+            .last()
+            .copied()
+            .context("native P/D tail has no committed physical page")?;
+        self.engine
+            .save_blocking(&[page_id], &[key.to_vec()])
+            .map_err(|err| anyhow::anyhow!("native P/D tail save: {err}"))
+    }
 }
 
 /// vLLM-compat P/D miss breaker: after this many consecutive requests each
@@ -150,6 +167,182 @@ pub(super) struct VllmPdState {
     /// [`BREAKER_PROBE_WINDOW`] instead (a complete restore resets this).
     consecutive_miss_windows: u32,
     parked: Vec<Option<ParkedFront>>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub(super) struct NativeMtpHandoff {
+    pub(super) draft_tokens: [u32; crate::mtp::GLM52_MTP_DRAFTS],
+    pub(super) committed_len: usize,
+    pub(super) arena_count: usize,
+    pub(super) tail_len: usize,
+    pub(super) tail_key: Option<String>,
+    pub(super) anchor_token_id: u32,
+    /// Whether the anchor is client-visible; false only when it is an EOS
+    /// consumed by P but suppressed from the response, so D must not replay it.
+    pub(super) anchor_emitted: bool,
+}
+
+#[derive(Deserialize)]
+struct NativeMtpEnvelope {
+    version: u32,
+    native_mtp: NativeMtpHandoff,
+}
+
+#[derive(Deserialize)]
+struct OpenInferPdEnvelope {
+    openinfer_pd: NativeMtpEnvelope,
+}
+
+pub(super) fn native_mtp_handoff(
+    req: &GenerateRequest,
+) -> anyhow::Result<Option<NativeMtpHandoff>> {
+    let Some(value) = req.kv_transfer_params.clone() else {
+        return Ok(None);
+    };
+    if value.get("openinfer_pd").is_none() {
+        return Ok(None);
+    }
+    let envelope: OpenInferPdEnvelope =
+        serde_json::from_value(value).context("invalid openinfer native-MTP P/D metadata")?;
+    let version = envelope.openinfer_pd.version;
+    anyhow::ensure!(
+        version == 2,
+        "unsupported openinfer P/D metadata version {version}"
+    );
+    let handoff = envelope.openinfer_pd.native_mtp;
+    anyhow::ensure!(
+        handoff.arena_count == 101,
+        "native-MTP P/D requires 101 arenas, got {}",
+        handoff.arena_count
+    );
+    Ok(Some(handoff))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct NativeAnchorPlan {
+    pub(super) token: u32,
+    pub(super) replay_to_client: bool,
+    pub(super) emitted_by_prefill: bool,
+}
+
+/// Resolve the v2 router contract without mutating the queued request.
+///
+/// vLLM Router forwards the original request unchanged, so D must append and
+/// replay P's anchor. A manual v2 harness may already append the anchor and
+/// combine P+D output itself; keep accepting that shape without replay.
+pub(super) fn native_anchor_plan(
+    req: &GenerateRequest,
+    handoff: &NativeMtpHandoff,
+) -> anyhow::Result<NativeAnchorPlan> {
+    let token = handoff.anchor_token_id;
+    let emitted_by_prefill = handoff.anchor_emitted;
+    if req.prompt_tokens.len() == handoff.committed_len {
+        return Ok(NativeAnchorPlan {
+            token,
+            replay_to_client: true,
+            emitted_by_prefill,
+        });
+    }
+    anyhow::ensure!(
+        req.prompt_tokens.len() == handoff.committed_len + 1
+            && req.prompt_tokens.last() == Some(&token),
+        "native-MTP P/D v2 expects the original prompt or committed KV + anchor"
+    );
+    Ok(NativeAnchorPlan {
+        token,
+        replay_to_client: false,
+        emitted_by_prefill,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct NativeKvShape {
+    pub(super) input_tokens: usize,
+    pub(super) max_output_tokens: usize,
+}
+
+/// Exact kvbm geometry of a native-MTP D request. Router handoffs append P's
+/// anchor to the logical input; manual handoffs already carry it and instead
+/// need one extra internal output position because that anchor did not consume
+/// the D request's client-visible output budget.
+pub(super) fn native_kv_shape(
+    req: &GenerateRequest,
+    anchor_plan: NativeAnchorPlan,
+) -> anyhow::Result<NativeKvShape> {
+    let input_tokens = req
+        .prompt_tokens
+        .len()
+        .checked_add(usize::from(anchor_plan.replay_to_client))
+        .context("native-MTP P/D KV input length overflow")?;
+    let anchor_counts_against_client_budget =
+        anchor_plan.replay_to_client && anchor_plan.emitted_by_prefill;
+    let max_output_tokens = req
+        .max_tokens
+        .checked_add(usize::from(!anchor_counts_against_client_budget))
+        .context("native-MTP P/D KV output budget overflow")?;
+    Ok(NativeKvShape {
+        input_tokens,
+        max_output_tokens,
+    })
+}
+
+pub(super) struct NativePdState {
+    parked: Vec<Option<NativeParked>>,
+}
+
+struct NativeParked {
+    request_id: Option<String>,
+    query_key: String,
+    parked_at: Instant,
+    deadline: Instant,
+}
+
+/// Keep the final committed page out of the lineage-hashed full-page prefix.
+/// KV block hashes require a dangling token after a sealed page, so an
+/// exactly page-aligned context still has a PAGE-token explicit tail.
+pub(super) fn native_pd_tail_len(committed_len: usize) -> usize {
+    committed_len
+        .checked_sub(1)
+        .map_or(0, |last| last % PAGE + 1)
+}
+
+fn native_pd_needs_tail_load(cached_tokens: usize, committed_len: usize, tail_len: usize) -> bool {
+    tail_len > 0 && cached_tokens < committed_len
+}
+
+impl NativePdState {
+    pub(super) fn new(ranks: usize) -> Self {
+        Self {
+            parked: (0..ranks).map(|_| None).collect(),
+        }
+    }
+
+    fn parked(&mut self, rank: usize, req: &GenerateRequest) -> &mut NativeParked {
+        let stale = self.parked[rank]
+            .as_ref()
+            .is_none_or(|parked| parked.request_id != req.request_id);
+        if stale {
+            let now = Instant::now();
+            self.parked[rank] = Some(NativeParked {
+                request_id: req.request_id.clone(),
+                query_key: format!(
+                    "glm52-native-pd-{}",
+                    QUERY_SEQ.fetch_add(1, Ordering::Relaxed)
+                ),
+                parked_at: now,
+                deadline: now + REMOTE_FETCH_DEADLINE,
+            });
+        }
+        self.parked[rank].as_mut().expect("just initialized")
+    }
+
+    pub(super) fn clear(&mut self, rank: usize) {
+        self.parked[rank] = None;
+    }
+
+    pub(super) fn any_parked(&self) -> bool {
+        self.parked.iter().any(Option::is_some)
+    }
 }
 
 /// The rank's front request currently waiting out the P/D handoff race.
@@ -532,6 +725,197 @@ pub(super) fn admit_vllm_pd(
     }
 }
 
+/// Native OpenInfer P/D restore. Full pages use kvbm lineage hashes; the
+/// producer includes the partial-tail hash in metadata because a mutable
+/// page has no independently derivable cache key on the decode request.
+pub(super) fn admit_native_mtp_pd(
+    state: &mut NativePdState,
+    rank: usize,
+    offload: &RankOffload,
+    pool: &BlockPool,
+    req: &GenerateRequest,
+    handoff: &NativeMtpHandoff,
+) -> anyhow::Result<VllmAdmitOutcome> {
+    let anchor_plan = native_anchor_plan(req, handoff)?;
+    anyhow::ensure!(
+        handoff.tail_len == native_pd_tail_len(handoff.committed_len),
+        "native-MTP P/D tail length {} disagrees with committed length {}",
+        handoff.tail_len,
+        handoff.committed_len
+    );
+    anyhow::ensure!(
+        (handoff.tail_len == 0) == handoff.tail_key.is_none(),
+        "native-MTP P/D tail key presence disagrees with tail length"
+    );
+
+    let query_key = state.parked(rank, req).query_key.clone();
+    let prompt_kv = &req.prompt_tokens[..handoff.committed_len];
+    let cache_salt = super::native_mtp_cache_salt(prompt_kv);
+    let full_len = handoff.committed_len - handoff.tail_len;
+    let mut probe = pool.probe_prefix_with_cache_salt(prompt_kv.to_vec(), Some(&cache_salt), None);
+    let hashes = probe.cpu_query_hashes();
+    if !hashes.is_empty() {
+        match offload.engine.query(&format!("{query_key}-full"), &hashes) {
+            Ok(QueryOutcome::Ready(hit)) => match hit.lease {
+                Some(lease) if hit.num_blocks == hashes.len() => {
+                    let Some(reservation) = pool.reserve_loaded_blocks(hit.num_blocks) else {
+                        offload.engine.release_query_lease(lease);
+                        return native_pd_wait(state, rank, req, "GPU page reservation");
+                    };
+                    match offload.engine.load(lease, reservation.page_ids()) {
+                        Ok(handle) => {
+                            handle.wait().map_err(|err| {
+                                anyhow::anyhow!("native P/D full-page load: {err}")
+                            })?;
+                            pool.commit_loaded_blocks(&mut probe, reservation);
+                        }
+                        Err(err) => {
+                            offload.engine.release_query_lease(lease);
+                            return native_pd_reject(
+                                state,
+                                rank,
+                                req,
+                                format!("full-page load submit: {err}"),
+                            );
+                        }
+                    }
+                }
+                Some(lease) => {
+                    offload.engine.release_query_lease(lease);
+                    return native_pd_wait(state, rank, req, "partial full-page registration");
+                }
+                None => return native_pd_wait(state, rank, req, "full-page registration"),
+            },
+            Ok(QueryOutcome::Loading) => {
+                return native_pd_wait(state, rank, req, "full-page transfer");
+            }
+            Err(err) => {
+                return native_pd_reject(state, rank, req, format!("full-page query: {err}"));
+            }
+        }
+    }
+
+    let mut logical_prompt = req.prompt_tokens.clone();
+    if anchor_plan.replay_to_client {
+        logical_prompt.push(anchor_plan.token);
+    }
+    let logical_prompt_len = logical_prompt.len();
+    let kv_shape = native_kv_shape(req, anchor_plan)?;
+    anyhow::ensure!(
+        logical_prompt_len == kv_shape.input_tokens,
+        "native-MTP P/D KV input shape drift: built {logical_prompt_len}, planned {}",
+        kv_shape.input_tokens
+    );
+    let mut kv = pool.new_request_with_cache_salt(
+        logical_prompt,
+        kv_shape.max_output_tokens,
+        Some(&cache_salt),
+        None,
+    );
+    let mut cached_tokens = kv.match_and_add_prefix(pool)?;
+    if cached_tokens < full_len {
+        return native_pd_wait(state, rank, req, "full-page rematch");
+    }
+    if native_pd_needs_tail_load(cached_tokens, handoff.committed_len, handoff.tail_len) {
+        let key = hex::decode(handoff.tail_key.as_deref().expect("validated tail key"))
+            .context("native-MTP P/D tail key is not hex")?;
+        anyhow::ensure!(
+            key.len() == 16,
+            "native-MTP P/D tail key must be 16 bytes, got {}",
+            key.len()
+        );
+        match offload.engine.query(&format!("{query_key}-tail"), &[key]) {
+            Ok(QueryOutcome::Ready(hit)) => match hit.lease {
+                Some(lease) if hit.num_blocks == 1 => {
+                    kv.schedule_prefill(handoff.tail_len, pool)
+                        .map_err(|err| anyhow::anyhow!("native P/D tail schedule: {err}"))?;
+                    let tail_page = *kv
+                        .step_page_indices(handoff.tail_len)
+                        .last()
+                        .expect("tail schedule owns one page");
+                    match offload.engine.load(lease, vec![tail_page]) {
+                        Ok(handle) => {
+                            if let Err(err) = handle.wait() {
+                                kv.revert_schedule()?;
+                                return native_pd_reject(
+                                    state,
+                                    rank,
+                                    req,
+                                    format!("tail load: {err}"),
+                                );
+                            }
+                            kv.apply_prefill_chunk(pool)?;
+                            cached_tokens += handoff.tail_len;
+                        }
+                        Err(err) => {
+                            offload.engine.release_query_lease(lease);
+                            kv.revert_schedule()?;
+                            return native_pd_reject(
+                                state,
+                                rank,
+                                req,
+                                format!("tail load submit: {err}"),
+                            );
+                        }
+                    }
+                }
+                Some(lease) => {
+                    offload.engine.release_query_lease(lease);
+                    return native_pd_wait(state, rank, req, "partial tail registration");
+                }
+                None => return native_pd_wait(state, rank, req, "tail registration"),
+            },
+            Ok(QueryOutcome::Loading) => {
+                return native_pd_wait(state, rank, req, "tail transfer");
+            }
+            Err(err) => {
+                return native_pd_reject(state, rank, req, format!("tail query: {err}"));
+            }
+        }
+    }
+    if cached_tokens != handoff.committed_len || logical_prompt_len - kv.kv_position() != 1 {
+        return native_pd_wait(state, rank, req, "complete-prefix install");
+    }
+    kv.adopt_external_prefill_anchor()
+        .context("native-MTP P/D anchor adoption")?;
+    state.clear(rank);
+    Ok(VllmAdmitOutcome::Admit {
+        kv: Box::new(kv),
+        cached_tokens,
+    })
+}
+
+fn native_pd_wait(
+    state: &mut NativePdState,
+    rank: usize,
+    req: &GenerateRequest,
+    phase: &str,
+) -> anyhow::Result<VllmAdmitOutcome> {
+    let parked = state.parked(rank, req);
+    if Instant::now() < parked.deadline {
+        return Ok(VllmAdmitOutcome::Park);
+    }
+    let waited = parked.parked_at.elapsed();
+    state.clear(rank);
+    Ok(VllmAdmitOutcome::Reject {
+        message: format!(
+            "GLM5.2 native-MTP P/D handoff incomplete after {waited:?} ({phase}); retry via P"
+        ),
+    })
+}
+
+fn native_pd_reject(
+    state: &mut NativePdState,
+    rank: usize,
+    _req: &GenerateRequest,
+    reason: String,
+) -> anyhow::Result<VllmAdmitOutcome> {
+    state.clear(rank);
+    Ok(VllmAdmitOutcome::Reject {
+        message: format!("GLM5.2 native-MTP P/D restore failed ({reason}); retry via P"),
+    })
+}
+
 /// Strict mode rejects (the router retries through the prefill peer); the
 /// `allow_local_prefill` debug mode falls back to the plain admission path.
 fn fail_or_fallback(state: &VllmPdState, message: String) -> VllmAdmitOutcome {
@@ -696,5 +1080,101 @@ mod tests {
         req.request_id = Some("client-controlled".to_string());
         let parked = state.parked_front(0, &req);
         assert!(parked.query_key.starts_with("glm52-pd-"));
+    }
+
+    #[test]
+    fn native_pd_tail_keeps_the_last_aligned_page_explicit() {
+        assert_eq!(native_pd_tail_len(0), 0);
+        assert_eq!(native_pd_tail_len(1), 1);
+        assert_eq!(native_pd_tail_len(PAGE - 1), PAGE - 1);
+        assert_eq!(native_pd_tail_len(PAGE), PAGE);
+        assert_eq!(native_pd_tail_len(PAGE + 1), 1);
+        assert_eq!(native_pd_tail_len(2 * PAGE), PAGE);
+    }
+
+    #[test]
+    fn native_pd_reuses_an_already_cached_aligned_tail() {
+        assert!(!native_pd_needs_tail_load(PAGE, PAGE, PAGE));
+        assert!(native_pd_needs_tail_load(0, PAGE, PAGE));
+    }
+
+    #[test]
+    fn native_pd_v2_installs_and_replays_the_router_anchor() {
+        let mut req = testkit::request(vec![1, 2, 3], testkit::sampled(0.0), 8);
+        req.kv_transfer_params = Some(serde_json::json!({
+            "openinfer_pd": {
+                "version": 2,
+                "native_mtp": {
+                    "draft_tokens": [5, 6, 7, 8, 9],
+                    "committed_len": 3,
+                    "arena_count": 101,
+                    "tail_len": 3,
+                    "tail_key": "00000000000000000000000000000000",
+                    "anchor_token_id": 4,
+                    "anchor_emitted": true
+                }
+            }
+        }));
+        let handoff = native_mtp_handoff(&req)
+            .expect("valid v2 envelope")
+            .expect("native handoff");
+        assert_eq!(
+            native_anchor_plan(&req, &handoff).expect("router plan"),
+            NativeAnchorPlan {
+                token: 4,
+                replay_to_client: true,
+                emitted_by_prefill: true,
+            }
+        );
+
+        req.prompt_tokens.push(4);
+        assert_eq!(
+            native_anchor_plan(&req, &handoff).expect("manual plan"),
+            NativeAnchorPlan {
+                token: 4,
+                replay_to_client: false,
+                emitted_by_prefill: true,
+            }
+        );
+    }
+
+    #[test]
+    fn native_pd_rejects_v1_metadata() {
+        let mut req = testkit::request(vec![1, 2, 3, 4], testkit::sampled(0.0), 8);
+        req.kv_transfer_params = Some(serde_json::json!({
+            "openinfer_pd": {
+                "version": 1,
+                "native_mtp": {
+                    "draft_tokens": [5, 6, 7, 8, 9],
+                    "committed_len": 3,
+                    "arena_count": 101,
+                    "tail_len": 3,
+                    "tail_key": "00000000000000000000000000000000",
+                    "anchor_token_id": 4,
+                    "anchor_emitted": true
+                }
+            }
+        }));
+        let error = native_mtp_handoff(&req).expect_err("v1 must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported openinfer P/D metadata version 1"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn native_pd_ignores_router_prefill_connector_metadata() {
+        let mut req = testkit::request(vec![1, 2, 3], testkit::sampled(0.0), 1);
+        req.kv_transfer_params = Some(serde_json::json!({
+            "do_remote_prefill": true,
+            "do_remote_decode": false
+        }));
+        assert!(
+            native_mtp_handoff(&req)
+                .expect("unrelated connector metadata is not malformed")
+                .is_none()
+        );
     }
 }

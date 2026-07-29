@@ -83,6 +83,9 @@ pub struct GenerateRequest {
     pub params: SamplingParams,
     pub max_tokens: usize,
     pub lora_adapter: Option<String>,
+    /// Opaque router/P-D metadata from the request's
+    /// `vllm_xargs.kv_transfer_params`.
+    pub kv_transfer_params: Option<serde_json::Value>,
     /// Where the scheduler emits this request's `TokenEvent`s. All requests on
     /// one engine share a single tagged output channel behind this sink (see
     /// [`TokenSink`]); the frontend demuxes by tag.
@@ -119,7 +122,7 @@ pub enum EngineControlRequest {
 }
 
 pub enum EngineCommand {
-    Generate(GenerateRequest),
+    Generate(Box<GenerateRequest>),
     Control(EngineControlRequest),
 }
 
@@ -164,6 +167,9 @@ pub enum TokenEvent {
         ids: Vec<u32>,
         logprobs: Vec<Option<TokenLogprob>>,
     },
+    /// Opaque P/D handoff metadata forwarded through the vLLM-compatible
+    /// `kv_transfer_params` response field.
+    KvTransfer { params: serde_json::Value },
     Finished {
         finish_reason: FinishReason,
         prompt_tokens: usize,
@@ -553,9 +559,9 @@ impl EngineHandle {
             Some(submit_tx) => submit_tx.send(req),
             None => match self.inner.command_tx.as_ref() {
                 Some(command_tx) => command_tx
-                    .send(EngineCommand::Generate(req))
+                    .send(EngineCommand::Generate(Box::new(req)))
                     .map_err(|err| match err.0 {
-                        EngineCommand::Generate(req) => mpsc::error::SendError(req),
+                        EngineCommand::Generate(req) => mpsc::error::SendError(*req),
                         EngineCommand::Control(_) => unreachable!("submitted generate command"),
                     }),
                 None => Err(mpsc::error::SendError(req)),

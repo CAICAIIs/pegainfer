@@ -636,6 +636,7 @@ fn run_mixed_serving_generation(model_path: &Path, model_path_label: &str) -> Re
             },
             max_tokens,
             lora_adapter: None,
+            kv_transfer_params: None,
             token_tx,
             logprobs: 0,
             echo: false,
@@ -722,6 +723,7 @@ fn run_mixed_serving_position_fallback(
             },
             max_tokens,
             lora_adapter: None,
+            kv_transfer_params: None,
             token_tx,
             logprobs: 0,
             echo: false,
@@ -789,6 +791,7 @@ fn run_mixed_serving_rejection_isolation(
         params: SamplingParams::default(),
         max_tokens: 4,
         lora_adapter: None,
+        kv_transfer_params: None,
         token_tx: invalid_tx,
         logprobs: 1,
         echo: false,
@@ -804,6 +807,7 @@ fn run_mixed_serving_rejection_isolation(
         params: SamplingParams::default(),
         max_tokens: 6,
         lora_adapter: None,
+        kv_transfer_params: None,
         token_tx: valid_tx,
         logprobs: 0,
         echo: false,
@@ -824,6 +828,7 @@ fn run_mixed_serving_rejection_isolation(
             }
             TokenEvent::Token { .. }
             | TokenEvent::PromptTokens { .. }
+            | TokenEvent::KvTransfer { .. }
             | TokenEvent::Finished { .. }
             | TokenEvent::Error { .. } => {
                 anyhow::bail!("invalid mixed-serving request reached unexpected event")
@@ -855,7 +860,12 @@ fn drain_engine_stream(
     let mut tokens = Vec::new();
     loop {
         match token_rx.blocking_recv() {
-            Some((_tag, TokenEvent::Scheduled { .. } | TokenEvent::PromptTokens { .. })) => {}
+            Some((
+                _tag,
+                TokenEvent::Scheduled { .. }
+                | TokenEvent::PromptTokens { .. }
+                | TokenEvent::KvTransfer { .. },
+            )) => {}
             Some((_tag, TokenEvent::Token { id, .. })) => tokens.push(id),
             Some((_tag, TokenEvent::Finished { finish_reason, .. })) => {
                 return Ok((tokens, finish_reason));

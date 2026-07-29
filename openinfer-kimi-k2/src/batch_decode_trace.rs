@@ -154,6 +154,7 @@ pub fn trace_runtime_decode_kernel_calls(
                 },
                 max_tokens: 2,
                 lora_adapter: None,
+                kv_transfer_params: None,
                 token_tx,
                 logprobs: 0,
                 echo: false,
@@ -163,7 +164,8 @@ pub fn trace_runtime_decode_kernel_calls(
                     match event {
                         TokenEvent::Scheduled { .. }
                         | TokenEvent::Token { .. }
-                        | TokenEvent::PromptTokens { .. } => {}
+                        | TokenEvent::PromptTokens { .. }
+                        | TokenEvent::KvTransfer { .. } => {}
                         TokenEvent::Finished { .. } => return Ok(()),
                         TokenEvent::Error { message, .. } => {
                             anyhow::bail!("Kimi runtime trace request failed: {message}")

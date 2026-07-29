@@ -302,6 +302,7 @@ fn measure_decode_stream(
             params,
             max_tokens,
             lora_adapter: None,
+            kv_transfer_params: None,
             token_tx,
             logprobs: 0,
             echo: false,
@@ -329,7 +330,7 @@ fn measure_decode_stream(
                 }
                 prev_at = Some(now);
             }
-            Some(TokenEvent::PromptTokens { .. }) => {}
+            Some(TokenEvent::PromptTokens { .. } | TokenEvent::KvTransfer { .. }) => {}
             Some(TokenEvent::Finished { .. }) => break,
             Some(TokenEvent::Error { message, .. }) => bail!("decode request failed: {message}"),
             Some(TokenEvent::Rejected { message, .. }) => {

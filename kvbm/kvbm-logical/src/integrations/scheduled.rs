@@ -346,6 +346,18 @@ pub enum ApplyError {
     MissingTokenOnFinalChunk,
     #[error("append requested {requested} tokens but only {remaining} remain")]
     AppendExceedsRemaining { requested: usize, remaining: usize },
+    #[error(
+        "external prefill anchor requires one uncomputed final input token \
+         (prefill={prefill_position}, kv={kv_position}, input={num_input_tokens}, \
+         tail={tail_tokens}, remaining_output={remaining_output})"
+    )]
+    InvalidExternalPrefillAnchor {
+        prefill_position: usize,
+        kv_position: usize,
+        num_input_tokens: usize,
+        tail_tokens: usize,
+        remaining_output: usize,
+    },
 }
 
 // =============================================================================
@@ -865,6 +877,32 @@ impl<T: BlockMetadata> SchedulableSequence<T> {
         Ok(())
     }
 
+    /// Finish an externally restored prefill by promoting its final input
+    /// token to the single dangling generated token.
+    ///
+    /// The external worker has computed KV through `kv_position` and emitted
+    /// the next token, but that token's KV deliberately does not exist yet.
+    /// Reclassifying it makes the sequence equivalent to a local
+    /// `apply_prefill(Some(token))` without falsely advancing `kv_position`.
+    pub fn adopt_external_prefill_anchor(&mut self) -> Result<(), ApplyError> {
+        self.require_idle_for_apply()?;
+        let valid = self.prefill_position == self.kv_position
+            && self.prefill_position.checked_add(1) == Some(self.inner.num_input_tokens())
+            && self.tail_tokens() == 1
+            && self.inner.remaining_tokens() > 0;
+        if !valid {
+            return Err(ApplyError::InvalidExternalPrefillAnchor {
+                prefill_position: self.prefill_position,
+                kv_position: self.kv_position,
+                num_input_tokens: self.inner.num_input_tokens(),
+                tail_tokens: self.tail_tokens(),
+                remaining_output: self.inner.remaining_tokens(),
+            });
+        }
+        self.inner.promote_last_input_to_generated();
+        Ok(())
+    }
+
     // =====================================================================
     // Accessors
     // =====================================================================
@@ -1371,6 +1409,35 @@ mod tests {
         seq.schedule_prefill(4, &manager).unwrap();
         let err = seq.apply_prefill(None, &manager).unwrap_err();
         assert!(matches!(err, ApplyError::MissingTokenOnFinalChunk));
+    }
+
+    #[test]
+    fn test_external_prefill_anchor_enters_speculative_decode() {
+        let manager = create_test_manager::<TestMeta>(20);
+        // KV for the first four tokens was restored from another worker. The
+        // fifth token is that worker's generated anchor and has no KV yet.
+        let mut seq = SchedulableSequence::<TestMeta>::new(
+            make_tokens(5),
+            4,
+            BLOCK_SIZE,
+            noop_delegate(),
+            None,
+        );
+        seq.schedule_prefill(4, &manager).unwrap();
+        seq.apply_prefill(None, &manager).unwrap();
+
+        seq.adopt_external_prefill_anchor().unwrap();
+        assert!(seq.is_prefill_complete());
+        assert_eq!(seq.num_input_tokens(), 4);
+        assert_eq!(seq.generated_tokens(), 1);
+        assert_eq!(seq.kv_position(), 4);
+        assert_eq!(seq.tail_tokens(), 1);
+
+        seq.schedule_speculative(2, &manager).unwrap();
+        seq.apply_speculative(&[100, 101], &manager).unwrap();
+        assert_eq!(seq.generated_tokens(), 3);
+        assert_eq!(seq.kv_position(), 6);
+        assert_eq!(seq.tail_tokens(), 1);
     }
 
     // =========================================================================

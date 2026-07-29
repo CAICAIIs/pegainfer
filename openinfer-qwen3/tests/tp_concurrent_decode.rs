@@ -133,6 +133,7 @@ fn tp2_graph_dump_when_available_and_concurrent_decode_complete() {
                     params: SamplingParams::default(),
                     max_tokens: 24 + (i % 4) * 24,
                     lora_adapter: None,
+                    kv_transfer_params: None,
                     token_tx,
                     logprobs: 0,
                     echo: false,
@@ -148,7 +149,12 @@ fn tp2_graph_dump_when_available_and_concurrent_decode_complete() {
         loop {
             match rx.try_recv() {
                 Ok((_, TokenEvent::Token { .. })) => tokens += 1,
-                Ok((_, TokenEvent::Scheduled { .. } | TokenEvent::PromptTokens { .. })) => {}
+                Ok((
+                    _,
+                    TokenEvent::Scheduled { .. }
+                    | TokenEvent::PromptTokens { .. }
+                    | TokenEvent::KvTransfer { .. },
+                )) => {}
                 Ok((_, TokenEvent::Finished { .. })) => break,
                 Ok((_, TokenEvent::Error { message, .. })) => {
                     panic!("request {i} failed: {message}")

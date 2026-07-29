@@ -26,6 +26,7 @@ fn validate_request(
     req: &GenerateRequest,
     max_model_len: usize,
     prefill_only: bool,
+    native_mtp_prefill: bool,
 ) -> Result<(), String> {
     if req.prompt_tokens.is_empty() {
         return Err("GLM5.2 requires a non-empty prompt".to_owned());
@@ -48,6 +49,16 @@ fn validate_request(
             "GLM5.2 context cap: prompt {} + max_tokens {} exceeds max_model_len {max_model_len}",
             req.prompt_tokens.len(),
             req.max_tokens
+        ));
+    }
+    if native_mtp_prefill
+        && req.prompt_tokens.len() + crate::mtp::GLM52_MTP_DRAFTS - 1 > max_model_len
+    {
+        return Err(format!(
+            "GLM5.2 native-MTP prefill requires {} positions of proposal headroom: \
+             prompt {} exceeds max_model_len {max_model_len}",
+            crate::mtp::GLM52_MTP_DRAFTS - 1,
+            req.prompt_tokens.len()
         ));
     }
     // Mirror the sampler kernel's parameter ensures HERE: past intake a bad
@@ -93,6 +104,20 @@ pub(super) fn lifetime_blocks(prompt_tokens: usize, max_tokens: usize) -> usize 
     (prompt_tokens + max_tokens).div_ceil(PAGE)
 }
 
+fn admission_lifetime_blocks(
+    req: &GenerateRequest,
+    native_anchor: Option<offload::NativeAnchorPlan>,
+) -> anyhow::Result<usize> {
+    let (input_tokens, max_output_tokens) = match native_anchor {
+        Some(anchor) => {
+            let shape = offload::native_kv_shape(req, anchor)?;
+            (shape.input_tokens, shape.max_output_tokens)
+        }
+        None => (req.prompt_tokens.len(), req.max_tokens),
+    };
+    Ok(lifetime_blocks(input_tokens, max_output_tokens))
+}
+
 /// Pick a rank for a direct, unbound request. Waiting carries the same 4x
 /// weight as vLLM's DP load balancer; ties go to the lowest rank. Frontend
 /// requests bypass this function because their selected engine index is the
@@ -123,6 +148,19 @@ fn reject(req: &GenerateRequest, message: String) {
     });
 }
 
+fn reject_native_pd_error(
+    state: &mut offload::NativePdState,
+    rank: usize,
+    req: &GenerateRequest,
+    err: &anyhow::Error,
+) {
+    state.clear(rank);
+    reject(
+        req,
+        format!("GLM5.2 native-MTP P/D restore failed ({err:#}); retry via P"),
+    );
+}
+
 /// Fast-reject invalid requests at intake (Scheduled → Rejected), otherwise
 /// bind the request to exactly one rank queue. The binding is permanent so
 /// frontend `engine_index`, metrics labels, and actual KV ownership agree.
@@ -132,8 +170,9 @@ pub(super) fn intake(
     running: &[usize],
     max_model_len: usize,
     prefill_only: bool,
+    native_mtp_prefill: bool,
 ) {
-    if let Err(message) = validate_request(&req, max_model_len, prefill_only) {
+    if let Err(message) = validate_request(&req, max_model_len, prefill_only, native_mtp_prefill) {
         reject(&req, message);
         return;
     }
@@ -168,11 +207,12 @@ pub(super) fn admit_from_queue(
     usable_blocks: &[usize],
     offload: Option<&[offload::RankOffload]>,
     vllm_pd: &mut Option<VllmPdState>,
+    native_pd: &mut Option<offload::NativePdState>,
     workers: &[Glm52Worker],
     mirrored: bool,
     prefix_cache_enabled: bool,
     drafter_enabled: bool,
-    _prefill_only: bool,
+    native_mtp_prefill: bool,
     pending_resets: &mut [Vec<usize>],
     slots_changed: &mut bool,
 ) -> anyhow::Result<()> {
@@ -183,9 +223,7 @@ pub(super) fn admit_from_queue(
             rank_slots
                 .iter()
                 .flatten()
-                .map(|active| {
-                    lifetime_blocks(active.req.prompt_tokens.len(), active.req.max_tokens)
-                })
+                .map(|active| active.kv.lifetime_blocks())
                 .sum()
         })
         .collect();
@@ -207,74 +245,178 @@ pub(super) fn admit_from_queue(
             let Some(front) = pending[rank].front() else {
                 break;
             };
-            let need_blocks = lifetime_blocks(front.prompt_tokens.len(), front.max_tokens);
-            if committed[rank] + need_blocks > usable[rank] {
-                break;
-            }
-
-            let req = pending[rank].pop_front().expect("checked non-empty");
-            // The client left while the request sat in the queue — admitting
-            // it would burn a slot (and whole global steps) on a dead sink.
-            if req.token_tx.is_closed() {
+            // Drop a disconnected FIFO front before it can block valid work
+            // behind an admission budget it will never consume.
+            if front.token_tx.is_closed() {
+                pending[rank].pop_front();
                 if let Some(pd) = vllm_pd.as_mut() {
                     pd.clear_parked(rank);
                 }
+                if let Some(pd) = native_pd.as_mut() {
+                    pd.clear(rank);
+                }
                 continue;
             }
+            // Parse the native contract before budgeting: it changes the
+            // logical input/output capacity of the RequestKv created below.
+            // Invalid metadata must be rejected, not left at the FIFO head.
+            let native_handoff = match offload::native_mtp_handoff(front) {
+                Ok(handoff) => handoff,
+                Err(err) => {
+                    let req = pending[rank].pop_front().expect("checked non-empty");
+                    reject(&req, format!("{err:#}"));
+                    continue;
+                }
+            };
+            let native_anchor = match native_handoff
+                .as_ref()
+                .map(|handoff| offload::native_anchor_plan(front, handoff))
+                .transpose()
+            {
+                Ok(plan) => plan,
+                Err(err) => {
+                    let req = pending[rank].pop_front().expect("checked non-empty");
+                    reject(&req, format!("{err:#}"));
+                    continue;
+                }
+            };
+            let need_blocks = match admission_lifetime_blocks(front, native_anchor) {
+                Ok(blocks) => blocks,
+                Err(err) => {
+                    let req = pending[rank].pop_front().expect("checked non-empty");
+                    reject(&req, format!("{err:#}"));
+                    continue;
+                }
+            };
+            // `usable` accounts for the block classes the scheduler knows
+            // about. The allocator is the final authority: duplicate
+            // primaries, restore probes, or another guard lifetime can make
+            // fewer pages physically allocatable than that bookkeeping
+            // predicts. Add back only pages held by active requests (already
+            // represented in `committed`) and defer the FIFO front if the
+            // resulting physical lifetime budget is smaller.
+            let active_resident: usize = slots[rank]
+                .iter()
+                .flatten()
+                .map(|active| active.kv.resident_blocks())
+                .sum();
+            let physical_usable = pools[rank]
+                .available_blocks()
+                .saturating_add(active_resident);
+            if committed[rank] + need_blocks > usable[rank].min(physical_usable) {
+                break;
+            }
+
+            let mut req = pending[rank].pop_front().expect("checked non-empty");
+            let client_prompt_tokens = req.prompt_tokens.len();
+            let native_admitted = if let Some(handoff) = native_handoff.as_ref() {
+                let Some(state) = native_pd.as_mut() else {
+                    reject(
+                        &req,
+                        "native-MTP P/D metadata reached a decode engine without native P/D offload"
+                            .to_string(),
+                    );
+                    continue;
+                };
+                let offload = offload.expect("native P/D state requires offload");
+                let outcome = match offload::admit_native_mtp_pd(
+                    state,
+                    rank,
+                    &offload[rank],
+                    &pools[rank],
+                    &req,
+                    handoff,
+                ) {
+                    Ok(outcome) => outcome,
+                    Err(err) => {
+                        reject_native_pd_error(state, rank, &req, &err);
+                        continue;
+                    }
+                };
+                match outcome {
+                    VllmAdmitOutcome::Admit { kv, cached_tokens } => Some((*kv, cached_tokens)),
+                    VllmAdmitOutcome::Park => {
+                        pending[rank].push_front(req);
+                        break;
+                    }
+                    VllmAdmitOutcome::Reject { message } => {
+                        reject(&req, message);
+                        continue;
+                    }
+                    VllmAdmitOutcome::LocalFallback => {
+                        unreachable!("native-MTP P/D never silently falls back to local prefill")
+                    }
+                }
+            } else {
+                None
+            };
             // vLLM-compat P/D admission: the full peer-prefilled prefix must
             // restore (this node never computes prompt positions), a racing
             // registration parks the request at the queue front for the next
             // step boundary, and an exhausted wait window rejects it for the
             // router to retry through the prefill peer.
-            let pd_admitted = match vllm_pd.as_mut() {
-                Some(pd) => {
-                    let offload = offload.expect("vLLM-compat P/D requires --kv-offload");
-                    // Launch validation pins vllm-compat to the EP topology
-                    // (kv-offload ⇒ EP8): each rank's executor owns the only
-                    // replica of its arenas, so it alone runs the fixup. A
-                    // mirrored topology would need every worker here.
-                    assert!(
-                        !mirrored,
-                        "vLLM-compat P/D admission assumes the EP topology"
-                    );
-                    match offload::admit_vllm_pd(
-                        pd,
-                        rank,
-                        &offload[rank],
-                        &pools[rank],
-                        &req,
-                        &workers[rank],
-                    ) {
-                        Ok(VllmAdmitOutcome::Admit { kv, cached_tokens }) => {
-                            Some((*kv, cached_tokens))
-                        }
-                        Ok(VllmAdmitOutcome::Park) => {
-                            pending[rank].push_front(req);
-                            break; // head-of-line wait: retry next step boundary
-                        }
-                        Ok(VllmAdmitOutcome::Reject { message }) => {
-                            reject(&req, message);
-                            continue;
-                        }
-                        Ok(VllmAdmitOutcome::LocalFallback) => None,
-                        Err(err) => {
-                            let err = err.context("GLM5.2 P/D admission");
-                            let _ = req.token_tx.send(TokenEvent::Error {
-                                message: format!("{err:#}"),
-                                prompt_tokens: req.prompt_tokens.len(),
-                                completion_tokens: 0,
-                            });
-                            return Err(err);
+            let pd_admitted = if native_admitted.is_some() {
+                native_admitted
+            } else {
+                match vllm_pd.as_mut() {
+                    Some(pd) => {
+                        let offload = offload.expect("vLLM-compat P/D requires --kv-offload");
+                        // Launch validation pins vllm-compat to the EP topology
+                        // (kv-offload ⇒ EP8): each rank's executor owns the only
+                        // replica of its arenas, so it alone runs the fixup. A
+                        // mirrored topology would need every worker here.
+                        assert!(
+                            !mirrored,
+                            "vLLM-compat P/D admission assumes the EP topology"
+                        );
+                        match offload::admit_vllm_pd(
+                            pd,
+                            rank,
+                            &offload[rank],
+                            &pools[rank],
+                            &req,
+                            &workers[rank],
+                        ) {
+                            Ok(VllmAdmitOutcome::Admit { kv, cached_tokens }) => {
+                                Some((*kv, cached_tokens))
+                            }
+                            Ok(VllmAdmitOutcome::Park) => {
+                                pending[rank].push_front(req);
+                                break; // head-of-line wait: retry next step boundary
+                            }
+                            Ok(VllmAdmitOutcome::Reject { message }) => {
+                                reject(&req, message);
+                                continue;
+                            }
+                            Ok(VllmAdmitOutcome::LocalFallback) => None,
+                            Err(err) => {
+                                let err = err.context("GLM5.2 P/D admission");
+                                let _ = req.token_tx.send(TokenEvent::Error {
+                                    message: format!("{err:#}"),
+                                    prompt_tokens: req.prompt_tokens.len(),
+                                    completion_tokens: 0,
+                                });
+                                return Err(err);
+                            }
                         }
                     }
+                    None => None,
                 }
-                None => None,
             };
-            let (kv, cached_tokens) = if let Some(admitted) = pd_admitted {
+            let (mut kv, cached_tokens) = if let Some(admitted) = pd_admitted {
                 admitted
             } else {
-                let mut kv =
-                    pools[rank].new_request(req.prompt_tokens.clone(), req.max_tokens, None);
+                let mut kv = if native_mtp_prefill {
+                    let cache_salt = super::native_mtp_cache_salt(&req.prompt_tokens);
+                    pools[rank].new_request_with_cache_salt(
+                        req.prompt_tokens.clone(),
+                        req.max_tokens,
+                        Some(&cache_salt),
+                        None,
+                    )
+                } else {
+                    pools[rank].new_request(req.prompt_tokens.clone(), req.max_tokens, None)
+                };
                 // Host-tier restore first, so the GPU prefix match sees the union
                 // of HBM-resident and freshly-restored blocks. The probe stays
                 // alive across the match to close the eviction window.
@@ -309,22 +451,81 @@ pub(super) fn admit_from_queue(
                 (kv, cached_tokens)
             };
             let queued_at_unix_s = req.queued_at_unix_s.unwrap_or_else(unix_now_s);
+            if let Some(plan) = native_anchor.filter(|plan| plan.replay_to_client) {
+                req.prompt_tokens.push(plan.token);
+            }
             let _ = req.token_tx.send(TokenEvent::Scheduled {
                 queued_at_unix_s,
                 scheduled_at_unix_s: unix_now_s(),
-                prompt_tokens: req.prompt_tokens.len(),
+                prompt_tokens: client_prompt_tokens,
                 cached_tokens,
             });
-            let state = Glm52SlotState::new(
+            if let Some(plan) = native_anchor {
+                let replay_failed = plan.replay_to_client
+                    && plan.emitted_by_prefill
+                    && req
+                        .token_tx
+                        .send(TokenEvent::Token {
+                            id: plan.token,
+                            logprob: None,
+                        })
+                        .is_err();
+                let finish_reason = native_anchor_finish_reason(plan, req.max_tokens);
+                if replay_failed || finish_reason.is_some() {
+                    if let Some(finish_reason) = finish_reason
+                        && !req.token_tx.is_closed()
+                    {
+                        let _ = req.token_tx.send(TokenEvent::Finished {
+                            finish_reason,
+                            prompt_tokens: client_prompt_tokens,
+                            completion_tokens: 1,
+                        });
+                    }
+                    kv.release()?;
+                    continue;
+                }
+            }
+            let mut state = Glm52SlotState::new(
                 req.prompt_tokens.clone(),
                 req.max_tokens,
                 req.params.ignore_eos,
                 cached_tokens,
             );
+            if let Some(handoff) = native_handoff {
+                anyhow::ensure!(
+                    cached_tokens == handoff.committed_len,
+                    "native-MTP P/D admitted {} cached tokens, expected {}",
+                    cached_tokens,
+                    handoff.committed_len
+                );
+                if native_anchor.is_some_and(|plan| plan.replay_to_client) {
+                    state.seed_native_pd_replayed_anchor();
+                } else {
+                    state.seed_native_pd_anchor();
+                }
+                state.set_drafts(handoff.draft_tokens.to_vec(), crate::mtp::GLM52_MTP_DRAFTS);
+                log::info!(
+                    "GLM5.2 native P/D admitted: rank={rank} slot={slot} \
+                     committed_len={} drafts={} first_step=verify",
+                    handoff.committed_len,
+                    handoff.draft_tokens.len()
+                );
+            }
             if drafter_enabled {
                 pending_resets[rank].push(slot);
             }
-            slots[rank][slot] = Some(ActiveRequest { req, state, kv });
+            anyhow::ensure!(
+                kv.lifetime_blocks() == need_blocks,
+                "GLM5.2 admission budget drift: planned {need_blocks} blocks, RequestKv owns \
+                 lifetime capacity for {}",
+                kv.lifetime_blocks()
+            );
+            slots[rank][slot] = Some(ActiveRequest {
+                req,
+                state,
+                client_prompt_tokens,
+                kv,
+            });
             committed[rank] += need_blocks;
             *slots_changed = true;
         }
@@ -332,11 +533,28 @@ pub(super) fn admit_from_queue(
     Ok(())
 }
 
+fn native_anchor_finish_reason(
+    plan: offload::NativeAnchorPlan,
+    max_tokens: usize,
+) -> Option<openinfer_core::engine::FinishReason> {
+    if !plan.emitted_by_prefill {
+        // P consumed EOS without exposing it as a token. This is terminal for
+        // both router replay and manual handoffs that already carry the anchor.
+        Some(openinfer_core::engine::FinishReason::Stop)
+    } else if plan.replay_to_client && max_tokens == 1 {
+        Some(openinfer_core::engine::FinishReason::Length)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use openinfer_core::engine::FinishReason;
     use openinfer_sample::SamplingParams;
 
     use super::*;
+    use crate::scheduler::testkit::EOS;
     use crate::scheduler::testkit::request;
     use crate::scheduler::testkit::sampled;
 
@@ -371,7 +589,7 @@ mod tests {
         for params in cases {
             let req = request(vec![10], params, 4);
             assert!(
-                validate_request(&req, 4096, false).is_err(),
+                validate_request(&req, 4096, false, false).is_err(),
                 "params must be rejected at intake: {params:?}"
             );
         }
@@ -385,7 +603,7 @@ mod tests {
             },
             4,
         );
-        assert!(validate_request(&req, 4096, false).is_ok());
+        assert!(validate_request(&req, 4096, false, false).is_ok());
     }
 
     #[test]
@@ -394,7 +612,7 @@ mod tests {
 
         let mut bound = request(vec![10], SamplingParams::default(), 4);
         bound.data_parallel_rank = Some(2);
-        intake(bound, &mut pending, &[0, 0, 0], 4096, false);
+        intake(bound, &mut pending, &[0, 0, 0], 4096, false, false);
         assert_eq!(
             pending.iter().map(VecDeque::len).collect::<Vec<_>>(),
             [0, 0, 1]
@@ -405,6 +623,7 @@ mod tests {
             &mut pending,
             &[2, 1, 2],
             4096,
+            false,
             false,
         );
         assert_eq!(
@@ -419,6 +638,7 @@ mod tests {
             &mut pending,
             &[2, 1, 2],
             4096,
+            false,
             false,
         );
         assert_eq!(
@@ -439,12 +659,123 @@ mod tests {
     }
 
     #[test]
+    fn native_pd_admission_counts_the_internal_anchor_position() {
+        let manual = request(vec![10; PAGE], SamplingParams::default(), PAGE);
+        let manual_anchor = offload::NativeAnchorPlan {
+            token: 10,
+            replay_to_client: false,
+            emitted_by_prefill: true,
+        };
+        assert_eq!(
+            admission_lifetime_blocks(&manual, Some(manual_anchor)).unwrap(),
+            3,
+            "manual v2 needs one internal output position beyond the client budget"
+        );
+
+        let router = request(vec![10; PAGE], SamplingParams::default(), PAGE);
+        let router_anchor = offload::NativeAnchorPlan {
+            token: 11,
+            replay_to_client: true,
+            emitted_by_prefill: true,
+        };
+        assert_eq!(
+            admission_lifetime_blocks(&router, Some(router_anchor)).unwrap(),
+            3,
+            "router replay appends the anchor to the KV input shape"
+        );
+
+        assert_eq!(
+            admission_lifetime_blocks(&manual, None).unwrap(),
+            2,
+            "ordinary requests retain their existing lifetime geometry"
+        );
+    }
+
+    #[test]
     fn prefill_only_accepts_exactly_one_output_token() {
         let one = request(vec![10, 11], SamplingParams::default(), 1);
-        assert!(validate_request(&one, 4096, true).is_ok());
+        assert!(validate_request(&one, 4096, true, false).is_ok());
 
         let many = request(vec![10, 11], SamplingParams::default(), 2);
-        let error = validate_request(&many, 4096, true).expect_err("decode must be rejected");
+        let error =
+            validate_request(&many, 4096, true, false).expect_err("decode must be rejected");
         assert!(error.contains("requires max_tokens=1"), "{error}");
+    }
+
+    #[test]
+    fn native_mtp_prefill_reserves_the_fixed_proposal_positions() {
+        let fits = request(vec![10; 4092], SamplingParams::default(), 1);
+        assert!(validate_request(&fits, 4096, true, true).is_ok());
+
+        let overflows = request(vec![10; 4093], SamplingParams::default(), 1);
+        let error = validate_request(&overflows, 4096, true, true)
+            .expect_err("fixed MTP proposal must fit inside the context cap");
+        assert!(
+            error.contains("4 positions of proposal headroom"),
+            "{error}"
+        );
+
+        assert!(
+            validate_request(&overflows, 4096, true, false).is_ok(),
+            "plain TP4 prefill does not execute the native-MTP proposal loop"
+        );
+    }
+
+    #[test]
+    fn native_pd_restore_error_rejects_only_the_request() {
+        let mut req = request(vec![10], SamplingParams::default(), 1);
+        let (token_tx, mut token_rx) = openinfer_core::engine::TokenSink::standalone();
+        req.token_tx = token_tx;
+        let mut state = offload::NativePdState::new(1);
+
+        reject_native_pd_error(&mut state, 0, &req, &anyhow::anyhow!("invalid handoff"));
+
+        assert!(matches!(
+            token_rx.try_recv().map(|(_, event)| event),
+            Ok(TokenEvent::Scheduled { .. })
+        ));
+        assert!(matches!(
+            token_rx.try_recv().map(|(_, event)| event),
+            Ok(TokenEvent::Rejected { message, .. })
+                if message.contains("invalid handoff")
+        ));
+    }
+
+    #[test]
+    fn suppressed_eos_stops_router_and_manual_native_handoffs() {
+        let manual_eos = offload::NativeAnchorPlan {
+            token: EOS[0],
+            replay_to_client: false,
+            emitted_by_prefill: false,
+        };
+        assert_eq!(
+            native_anchor_finish_reason(manual_eos, 8),
+            Some(FinishReason::Stop)
+        );
+
+        let router_eos = offload::NativeAnchorPlan {
+            replay_to_client: true,
+            ..manual_eos
+        };
+        assert_eq!(
+            native_anchor_finish_reason(router_eos, 8),
+            Some(FinishReason::Stop)
+        );
+
+        let visible_manual = offload::NativeAnchorPlan {
+            emitted_by_prefill: true,
+            ..manual_eos
+        };
+        assert_eq!(native_anchor_finish_reason(visible_manual, 1), None);
+
+        let visible_router = offload::NativeAnchorPlan {
+            replay_to_client: true,
+            ..visible_manual
+        };
+        assert_eq!(
+            native_anchor_finish_reason(visible_router, 1),
+            Some(FinishReason::Length)
+        );
+        assert_eq!(native_anchor_finish_reason(visible_router, 8), None);
     }
 }

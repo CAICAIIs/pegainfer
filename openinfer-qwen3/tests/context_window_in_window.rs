@@ -78,6 +78,7 @@ fn in_window_prompt_past_old_rope_table_is_served() {
             params: SamplingParams::default(),
             max_tokens: 1,
             lora_adapter: None,
+            kv_transfer_params: None,
             token_tx,
             logprobs: 0,
             echo: false,
@@ -88,7 +89,11 @@ fn in_window_prompt_past_old_rope_table_is_served() {
     loop {
         match rx.blocking_recv().map(|(_, event)| event) {
             Some(TokenEvent::Token { .. }) => generated += 1,
-            Some(TokenEvent::PromptTokens { .. } | TokenEvent::Scheduled { .. }) => {}
+            Some(
+                TokenEvent::PromptTokens { .. }
+                | TokenEvent::Scheduled { .. }
+                | TokenEvent::KvTransfer { .. },
+            ) => {}
             Some(TokenEvent::Finished { .. }) => break,
             Some(TokenEvent::Error { message, .. }) => {
                 panic!("in-window prompt errored (resized RoPE cache not exercised?): {message}")

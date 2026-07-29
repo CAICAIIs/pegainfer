@@ -178,6 +178,7 @@ pub(crate) struct Glm52RankWeightPlan {
     pub(crate) rank: usize,
     pub(crate) expert_range: std::ops::Range<usize>,
     pub(crate) tensor_count: usize,
+    pub(crate) native_mtp: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -311,6 +312,7 @@ impl Glm52WeightManifest {
                 rank,
                 expert_range,
                 tensor_count,
+                native_mtp,
             },
             shards: by_shard
                 .into_iter()
@@ -365,10 +367,9 @@ impl Glm52WeightManifest {
                 push_routed_experts(&mut names, GLM52_MTP_LAYER, expert_range);
             }
         } else {
-            ensure!(
-                !native_mtp,
-                "GLM5.2 native MTP resident loading currently requires an EP topology"
-            );
+            if native_mtp {
+                self.push_mtp_non_expert_names(&mut names, false);
+            }
         }
         Ok(names)
     }
@@ -860,13 +861,24 @@ mod tests {
     }
 
     #[test]
-    fn native_mtp_resident_plan_rejects_non_ep_topologies() {
+    fn native_mtp_tp4_plan_loads_bookends_and_tp_slice_layer() {
         let manifest = Glm52WeightManifest {
             weight_map: BTreeMap::new(),
         };
-        manifest
-            .rank_resident_tensor_names(0, crate::Glm52MoeTopo::Tp8, true)
-            .expect_err("native MTP must not construct a TP resident plan");
+        let names = manifest
+            .rank_resident_tensor_names(0, crate::Glm52MoeTopo::Tp4, true)
+            .unwrap();
+        let prefix = format!("model.layers.{GLM52_MTP_LAYER}.");
+        assert!(
+            names
+                .iter()
+                .any(|name| name == &format!("{prefix}eh_proj.weight"))
+        );
+        assert!(
+            names
+                .iter()
+                .all(|name| !name.starts_with(&format!("{prefix}mlp.experts.")))
+        );
     }
 
     #[test]

@@ -141,8 +141,23 @@ impl BlockPool {
         max_output_tokens: usize,
         lora_name: Option<&str>,
     ) -> RequestKv {
-        let salt_hash = compute_salt_hash(None, lora_name)
-            .expect("compute_salt_hash is infallible for (None, lora_name)");
+        self.new_request_with_cache_salt(prompt_tokens, max_output_tokens, None, lora_name)
+    }
+
+    /// Construct a request whose prefix-cache identity is additionally scoped
+    /// by `cache_salt`. Use this when identical token blocks can produce
+    /// different KV bytes because of state outside that block. `lora_name`
+    /// remains a separate weight identity; callers must not overload it with
+    /// request-local cache semantics.
+    pub fn new_request_with_cache_salt(
+        &self,
+        prompt_tokens: Vec<u32>,
+        max_output_tokens: usize,
+        cache_salt: Option<&str>,
+        lora_name: Option<&str>,
+    ) -> RequestKv {
+        let salt_hash = compute_salt_hash(cache_salt, lora_name)
+            .expect("compute_salt_hash is infallible for string cache/lora identities");
         let seq = SchedulableSequence::new(
             prompt_tokens,
             max_output_tokens,
@@ -168,8 +183,20 @@ impl BlockPool {
     /// `lora_name` must match the request's adapter — it salts the block
     /// hashes, so probing under the wrong adapter would query unrelated keys.
     pub fn probe_prefix(&self, prompt_tokens: Vec<u32>, lora_name: Option<&str>) -> PrefixProbe {
+        self.probe_prefix_with_cache_salt(prompt_tokens, None, lora_name)
+    }
+
+    /// [`Self::probe_prefix`] with the same additional cache scope accepted by
+    /// [`Self::new_request_with_cache_salt`]. The producer request and every
+    /// restore probe must derive the identical salt.
+    pub fn probe_prefix_with_cache_salt(
+        &self,
+        prompt_tokens: Vec<u32>,
+        cache_salt: Option<&str>,
+        lora_name: Option<&str>,
+    ) -> PrefixProbe {
         let num_input = prompt_tokens.len();
-        let rkv = self.new_request(prompt_tokens, 0, lora_name);
+        let rkv = self.new_request_with_cache_salt(prompt_tokens, 0, cache_salt, lora_name);
         let seq_hashes = rkv.seq.inner().sequence().all_sequence_hashes();
         // match_and_add_prefix leaves >=1 prompt token uncached, so a request
         // can reuse at most this many leading blocks — the CPU load must not
@@ -419,6 +446,15 @@ impl RequestKv {
             .map_err(|e| anyhow::anyhow!("apply_prefill_chunk: {e}"))
     }
 
+    /// Convert the one uncomputed final input token left by an external
+    /// prefill restore into the normal dangling-token state expected by
+    /// decode/speculative scheduling. Does not advance `kv_position`.
+    pub fn adopt_external_prefill_anchor(&mut self) -> anyhow::Result<()> {
+        self.seq
+            .adopt_external_prefill_anchor()
+            .map_err(|e| anyhow::anyhow!("adopt_external_prefill_anchor: {e}"))
+    }
+
     pub fn apply_decode(&mut self, token: u32, pool: &BlockPool) -> anyhow::Result<DecodeOutcome> {
         self.seq
             .apply_decode(token, &pool.block_manager)
@@ -477,6 +513,19 @@ impl RequestKv {
         self.seq.generated_tokens()
     }
 
+    /// Full input-plus-output page capacity fixed when this request was
+    /// created. Admission uses this value for already-active requests so any
+    /// internal tokens added by a protocol remain accounted for.
+    pub fn lifetime_blocks(&self) -> usize {
+        (self.seq.num_input_tokens() + self.seq.max_output_tokens()).div_ceil(self.seq.block_size())
+    }
+
+    /// Physical blocks currently held by this request, including registered,
+    /// staged, and eagerly allocated dangling blocks.
+    pub fn resident_blocks(&self) -> usize {
+        self.seq.assigned_blocks() + self.seq.staged_blocks() + self.seq.unassigned_blocks()
+    }
+
     /// Physical page IDs assigned to this request, in sequence order.
     /// Includes every block the request currently holds — which can be one
     /// more than the KV tokens need (see `step_page_indices`).
@@ -487,6 +536,14 @@ impl RequestKv {
             .all_block_ids()
             .map(|&id| id as i32)
             .collect()
+    }
+
+    /// Physical pages covering the KV tokens currently committed to this
+    /// request, in logical sequence order.
+    pub fn current_page_indices(&self) -> Vec<i32> {
+        let mut pages = self.page_indices();
+        pages.truncate(self.seq.kv_position().div_ceil(self.seq.block_size()));
+        pages
     }
 
     /// Page IDs covering exactly the KV tokens present after this step
@@ -647,6 +704,60 @@ mod tests {
             ha[0],
             "salt (lora) must scope the prefix cache"
         );
+    }
+
+    #[test]
+    fn cache_salt_isolates_request_and_probe_prefixes() {
+        let pool = BlockPool::new(16, 32).unwrap();
+        let prompt = vec![7u32; 48]; // 3 full blocks
+
+        let mut first =
+            pool.new_request_with_cache_salt(prompt.clone(), 4, Some("native-mtp-prompt-a"), None);
+        first
+            .schedule_prefill(48, &pool)
+            .expect("first prefill schedule");
+        first.apply_prefill(42, &pool).expect("first prefill apply");
+        first.release().expect("first release");
+
+        let other_probe =
+            pool.probe_prefix_with_cache_salt(prompt.clone(), Some("native-mtp-prompt-b"), None);
+        assert_eq!(
+            other_probe.gpu_hit_blocks(),
+            0,
+            "the offload probe must use the same cache-salt isolation"
+        );
+        drop(other_probe);
+
+        let repeated_probe =
+            pool.probe_prefix_with_cache_salt(prompt.clone(), Some("native-mtp-prompt-a"), None);
+        assert_eq!(repeated_probe.gpu_hit_blocks(), 3);
+        drop(repeated_probe);
+
+        let mut other =
+            pool.new_request_with_cache_salt(prompt.clone(), 4, Some("native-mtp-prompt-b"), None);
+        assert_eq!(
+            other.match_and_add_prefix(&pool).expect("other match"),
+            0,
+            "a distinct cache salt must isolate identical token blocks"
+        );
+
+        let mut repeated =
+            pool.new_request_with_cache_salt(prompt, 4, Some("native-mtp-prompt-a"), None);
+        assert_eq!(
+            repeated
+                .match_and_add_prefix(&pool)
+                .expect("repeated match"),
+            32,
+            "the same cache salt must preserve ordinary prefix reuse"
+        );
+    }
+
+    #[test]
+    fn request_reports_the_lifetime_capacity_it_was_created_with() {
+        let pool = BlockPool::new(16, 8).unwrap();
+        let req = pool.new_request(vec![1; 16], 17, None);
+
+        assert_eq!(req.lifetime_blocks(), 3);
     }
 
     fn complete_non_retained_speculative_request(

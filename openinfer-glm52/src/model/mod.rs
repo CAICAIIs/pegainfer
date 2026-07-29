@@ -69,6 +69,7 @@ use crate::moe_ep_wo::Glm52MoeEpState;
 use crate::moe_tp::Glm52MoeTpRank;
 use crate::prefill_tp::Glm52TpPrefillExecutor;
 use crate::prefill_tp::Glm52TpPrefillModelView;
+use crate::prefill_tp::Glm52TpPrefillMtpView;
 use crate::scratch::Glm52DecodeScratch;
 use crate::weights::Glm52RankGpuWeights;
 use crate::weights::retype_owned;
@@ -488,6 +489,9 @@ impl Glm52RankModel {
                 });
             }
         }
+        if let Some(mtp) = &self.mtp {
+            arenas.extend(mtp.kv_arenas(stream)?);
+        }
         Ok(arenas)
     }
 
@@ -632,7 +636,7 @@ impl Glm52RankModel {
         }
         let mtp = drafter
             .is_mtp()
-            .then(|| Glm52NativeMtp::build(ctx, w, max_model_len, moe_topo))
+            .then(|| Glm52NativeMtp::build(ctx, w, max_model_len, moe_topo, attn_shard))
             .transpose()?;
 
         let embed_raw = w.take_tensor("model.embed_tokens.weight")?;
@@ -875,9 +879,10 @@ impl Glm52RankModel {
     pub(crate) fn prefill_chunk(
         &mut self,
         ctx: &DeviceContext,
+        aux: &DeviceContext,
         batch: &crate::runner::Glm52PrefillBatch,
         tp: Option<&mut Glm52MoeTpRank>,
-    ) -> Result<Vec<u32>> {
+    ) -> Result<crate::prefill_tp::Glm52PrefillOutput> {
         let executor = self
             .prefill
             .as_mut()
@@ -891,7 +896,16 @@ impl Glm52RankModel {
             .decode_lm_head
             .as_ref()
             .context("GLM5.2 TP4 prefill is missing its vocabulary shard")?;
-        executor.forward(
+        let mtp = self.mtp.as_mut().map(|mtp| {
+            let (bookend, layer, transfer_cache, proposal_cache) = mtp.prefill_parts();
+            Glm52TpPrefillMtpView {
+                bookend,
+                layer,
+                transfer_cache,
+                proposal_cache,
+            }
+        });
+        let mut output = executor.forward(
             ctx,
             batch,
             tp,
@@ -906,8 +920,84 @@ impl Glm52RankModel {
                 full_lm_head: &self.lm_head,
                 vocab_start: self.decode_vocab_start,
                 sampling_scratch,
+                mtp,
             },
-        )
+        )?;
+        let Some(mtp) = self.mtp.as_mut() else {
+            return Ok(output);
+        };
+        if batch.output_rows.is_empty() {
+            return Ok(output);
+        }
+        let mut appends = Vec::with_capacity(batch.output_rows.len());
+        let mut proposal_slots = Vec::with_capacity(batch.output_rows.len());
+        let mut boundary = 0usize;
+        for request in 0..batch.mtp_next_tokens.len() {
+            if batch.mtp_next_tokens[request].is_some() {
+                continue;
+            }
+            let end = batch.request_indptr[request + 1] as usize;
+            ensure!(
+                batch.output_rows.get(boundary).copied() == Some((end - 1) as u32),
+                "GLM5.2 MTP boundary row order drifted from request ranges"
+            );
+            let block_start = batch.block_indptr[request] as usize;
+            let block_end = batch.block_indptr[request + 1] as usize;
+            let slot = batch.request_slots[request];
+            appends.push(crate::runner::Glm52MtpAppend {
+                target_row: boundary,
+                slot,
+                input_token: output.target_tokens[boundary],
+                position: batch.positions[end - 1] as usize,
+                pages: batch.block_ids[block_start..block_end].to_vec(),
+            });
+            proposal_slots.push(slot);
+            boundary += 1;
+        }
+        ensure!(
+            boundary == output.target_tokens.len(),
+            "GLM5.2 MTP boundary metadata count {boundary} != target outputs {}",
+            output.target_tokens.len()
+        );
+        let bucket = GLM52_DECODE_BUCKETS
+            .into_iter()
+            .find(|&bucket| bucket >= appends.len())
+            .context("GLM5.2 TP4 prefill proposal exceeds decode bucket capacity")?;
+        mtp.reset_slots(&proposal_slots)?;
+        mtp.resume_reset_slots(&proposal_slots, &appends)?;
+        let round = crate::runner::Glm52MtpRound::Propose {
+            source_bucket: bucket,
+            context_bucket: bucket,
+            draft_bucket: bucket,
+            resets: Vec::new(),
+            appends,
+            proposal_slots,
+        };
+        output.mtp_drafts = mtp.propose(
+            ctx,
+            aux,
+            None,
+            Some(tp),
+            &self.embed,
+            &self.lm_head,
+            &self.cos_table,
+            &self.sin_table,
+            executor.mtp_target_boundary(),
+            &round,
+            Some(mtp::Glm52MtpProposalSeed {
+                previous: executor.mtp_proposal_boundary(),
+                draft1: &output.mtp_draft1,
+            }),
+        )?;
+        ensure!(
+            output
+                .mtp_drafts
+                .iter()
+                .zip(&output.mtp_draft1)
+                .all(|(span, &draft1)| span[0] == draft1),
+            "GLM5.2 TP4 large-M and proposal-loop draft-1 diverged"
+        );
+        Ok(output)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -915,7 +1005,8 @@ impl Glm52RankModel {
         &mut self,
         ctx: &DeviceContext,
         aux: &DeviceContext,
-        ep: &mut Glm52MoeEpState,
+        ep: Option<&mut Glm52MoeEpState>,
+        tp: Option<&mut Glm52MoeTpRank>,
         round: &crate::runner::Glm52MtpRound,
     ) -> Result<Vec<[u32; crate::mtp::GLM52_MTP_DRAFTS]>> {
         let Some(source_bucket) = round.source_bucket() else {
@@ -944,16 +1035,19 @@ impl Glm52RankModel {
             .as_mut()
             .context("GLM5.2 native MTP command reached a model without MTP weights")?;
         mtp.reset_slots(round.resets())?;
+        mtp.resume_reset_slots(round.resets(), round.appends())?;
         mtp.propose(
             ctx,
             aux,
             ep,
+            tp,
             &self.embed,
             &self.lm_head,
             &self.cos_table,
             &self.sin_table,
             target_final_normed,
             round,
+            None,
         )
     }
 

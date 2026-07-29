@@ -61,6 +61,7 @@ fn native_mtp_uses_final_normalized_target_hidden() -> Result<()> {
         },
         max_tokens: 256,
         lora_adapter: None,
+        kv_transfer_params: None,
         token_tx,
         logprobs: 0,
         echo: false,
@@ -82,7 +83,9 @@ fn native_mtp_uses_final_normalized_target_hidden() -> Result<()> {
             TokenEvent::Error { message, .. } | TokenEvent::Rejected { message, .. } => {
                 anyhow::bail!("GLM5.2 production gate failed: {message}")
             }
-            TokenEvent::Scheduled { .. } | TokenEvent::PromptTokens { .. } => {}
+            TokenEvent::Scheduled { .. }
+            | TokenEvent::PromptTokens { .. }
+            | TokenEvent::KvTransfer { .. } => {}
         }
     }
     assert_eq!(completion.len(), 256);
@@ -117,6 +120,7 @@ fn native_mtp_uses_final_normalized_target_hidden() -> Result<()> {
             },
             max_tokens: output_lengths[rank],
             lora_adapter: None,
+            kv_transfer_params: None,
             token_tx,
             logprobs: 0,
             echo: false,
@@ -143,7 +147,9 @@ fn native_mtp_uses_final_normalized_target_hidden() -> Result<()> {
                         "GLM5.2 multi-rank production gate failed on rank {rank}: {message}"
                     )
                 }
-                TokenEvent::Scheduled { .. } | TokenEvent::PromptTokens { .. } => {}
+                TokenEvent::Scheduled { .. }
+                | TokenEvent::PromptTokens { .. }
+                | TokenEvent::KvTransfer { .. } => {}
             }
         }
     }

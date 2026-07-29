@@ -67,6 +67,7 @@ fn generate_text(
             params: SamplingParams::default(),
             max_tokens,
             lora_adapter: None,
+            kv_transfer_params: None,
             token_tx,
             logprobs: 0,
             echo: false,
@@ -77,7 +78,11 @@ fn generate_text(
     loop {
         match rx.blocking_recv().map(|(_, event)| event) {
             Some(TokenEvent::Token { id, .. }) => tokens.push(id),
-            Some(TokenEvent::PromptTokens { .. } | TokenEvent::Scheduled { .. }) => {}
+            Some(
+                TokenEvent::PromptTokens { .. }
+                | TokenEvent::Scheduled { .. }
+                | TokenEvent::KvTransfer { .. },
+            ) => {}
             Some(TokenEvent::Finished { .. }) => break,
             Some(TokenEvent::Error { message, .. }) => panic!("generation failed: {message}"),
             Some(TokenEvent::Rejected { message, .. }) => panic!("generation rejected: {message}"),
@@ -136,6 +141,7 @@ fn scheduler_survives_consumer_drop() {
             params: SamplingParams::default(),
             max_tokens: 10,
             lora_adapter: None,
+            kv_transfer_params: None,
             token_tx,
             logprobs: 0,
             echo: false,

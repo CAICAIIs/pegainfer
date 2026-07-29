@@ -104,6 +104,7 @@ impl Harness {
                 },
                 max_tokens: output.0,
                 lora_adapter: None,
+                kv_transfer_params: None,
                 token_tx,
                 logprobs: output.1,
                 echo: false,
@@ -125,7 +126,7 @@ impl Harness {
                 trace.token_orders.push(self.order);
             }
             TokenEvent::Finished { .. } => trace.terminal = true,
-            TokenEvent::PromptTokens { .. } => {}
+            TokenEvent::PromptTokens { .. } | TokenEvent::KvTransfer { .. } => {}
             TokenEvent::Error { message, .. } => panic!("request {tag} failed: {message}"),
             TokenEvent::Rejected { message, .. } => panic!("request {tag} rejected: {message}"),
         }

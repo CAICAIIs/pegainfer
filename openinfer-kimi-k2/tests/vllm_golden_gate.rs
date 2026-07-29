@@ -347,6 +347,7 @@ fn submit(
             },
             max_tokens,
             lora_adapter: None,
+            kv_transfer_params: None,
             token_tx: tx,
             logprobs,
             echo: false,
@@ -382,7 +383,11 @@ impl PendingRequest {
                 Ok(TokenEvent::Rejected { message, .. }) => {
                     panic!("[{}] request rejected: {message}", self.label)
                 }
-                Ok(TokenEvent::Scheduled { .. } | TokenEvent::PromptTokens { .. }) => {}
+                Ok(
+                    TokenEvent::Scheduled { .. }
+                    | TokenEvent::PromptTokens { .. }
+                    | TokenEvent::KvTransfer { .. },
+                ) => {}
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
                     assert!(
                         Instant::now() < deadline,

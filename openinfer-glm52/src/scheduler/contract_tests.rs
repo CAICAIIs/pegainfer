@@ -53,7 +53,12 @@ fn load_snapshots_keep_rank_ownership() {
     let mut kv = pools[0].new_request(req.prompt_tokens.clone(), req.max_tokens, None);
     kv.schedule_prefill(1, &pools[0])
         .expect("rank 0 owns one live KV block");
-    slots[0][0] = Some(ActiveRequest { req, state, kv });
+    slots[0][0] = Some(ActiveRequest {
+        req,
+        state,
+        client_prompt_tokens: 2,
+        kv,
+    });
 
     let mut pending: Vec<VecDeque<GenerateRequest>> = (0..2).map(|_| VecDeque::new()).collect();
     pending[1].push_back(request(vec![20], SamplingParams::default(), 4));
@@ -102,6 +107,7 @@ fn admission_never_moves_a_rank_bound_request() {
         &[7, 7],
         None,
         &mut None,
+        &mut None,
         &[],
         false,
         false,
@@ -141,6 +147,7 @@ fn prefill_only_admits_multiple_requests_within_pool_capacity() {
         &[15],
         None,
         &mut None,
+        &mut None,
         &[],
         true,
         true,
@@ -153,6 +160,66 @@ fn prefill_only_admits_multiple_requests_within_pool_capacity() {
 
     assert_eq!(slots[0].iter().flatten().count(), 2);
     assert!(pending[0].is_empty());
+}
+
+#[test]
+fn admission_defers_while_physical_pages_are_temporarily_held() {
+    let pools = vec![BlockPool::new(PAGE, 6).expect("pool")];
+    let mut held = pools[0].new_request(vec![1; 2 * PAGE], 1, None);
+    held.schedule_prefill(2 * PAGE, &pools[0])
+        .expect("temporarily hold two physical pages");
+
+    let mut slots: Vec<RankSlots> = vec![std::array::from_fn(|_| None)];
+    let mut pending: Vec<VecDeque<GenerateRequest>> = vec![VecDeque::new()];
+    let mut req = request(vec![2; 3 * PAGE], SamplingParams::default(), 1);
+    let (token_tx, _token_rx) = TokenSink::standalone();
+    req.token_tx = token_tx;
+    pending[0].push_back(req);
+    let mut pending_resets = vec![Vec::new()];
+    let mut slots_changed = false;
+
+    admit_from_queue(
+        &mut pending,
+        &mut slots,
+        &pools,
+        &[5],
+        None,
+        &mut None,
+        &mut None,
+        &[],
+        true,
+        true,
+        false,
+        true,
+        &mut pending_resets,
+        &mut slots_changed,
+    )
+    .expect("temporary pressure is not an admission error");
+
+    assert_eq!(pending[0].len(), 1, "request stays queued");
+    assert!(slots[0].iter().all(Option::is_none));
+
+    held.revert_schedule().expect("release temporary pages");
+    admit_from_queue(
+        &mut pending,
+        &mut slots,
+        &pools,
+        &[5],
+        None,
+        &mut None,
+        &mut None,
+        &[],
+        true,
+        true,
+        false,
+        true,
+        &mut pending_resets,
+        &mut slots_changed,
+    )
+    .expect("admit after pressure clears");
+
+    assert!(pending[0].is_empty());
+    assert_eq!(slots[0].iter().flatten().count(), 1);
 }
 
 /// Drive one request end to end through the coordinator's exact

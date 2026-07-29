@@ -42,11 +42,23 @@ impl Demux {
 
     /// Register a request as `start_request` does and return its abort reason.
     fn add(&mut self, id: &str) -> Arc<AtomicU8> {
+        self.add_with_stop_sentinel(id, None)
+    }
+
+    fn add_with_eos(&mut self, id: &str, eos_token_id: Option<u32>) -> Arc<AtomicU8> {
+        self.add_with_stop_sentinel(id, eos_token_id)
+    }
+
+    fn add_with_stop_sentinel(&mut self, id: &str, stop_sentinel_id: Option<u32>) -> Arc<AtomicU8> {
         let tag: RequestTag = Arc::from(id);
         let abort_reason = Arc::new(AtomicU8::new(RequestAbortReason::None as u8));
         self.streams.insert(
             Arc::clone(&tag),
-            RequestStreamState::new(Arc::clone(&abort_reason), fastrace::Span::noop()),
+            RequestStreamState::new(
+                Arc::clone(&abort_reason),
+                fastrace::Span::noop(),
+                stop_sentinel_id,
+            ),
         );
         abort_reason
     }
@@ -156,6 +168,66 @@ fn token_and_finish_in_one_burst_coalesce() {
     assert!(d.next_output().is_none());
 }
 
+/// OpenInfer suppresses EOS at the scheduler boundary, but vLLM's text decoder
+/// removes the final token of every Stop output as the terminal stop token.
+/// Reinsert EOS so a speculative [visible token, EOS] commit does not truncate
+/// the visible suffix.
+#[test]
+fn stop_output_appends_eos_for_vllm_decoder() {
+    let mut d = Demux::new();
+    d.add_with_eos("req-stop-eos", Some(2));
+    d.emit(
+        "req-stop-eos",
+        TokenEvent::Token {
+            id: 11,
+            logprob: None,
+        },
+    );
+    d.emit(
+        "req-stop-eos",
+        TokenEvent::Finished {
+            finish_reason: FinishReason::Stop,
+            prompt_tokens: 16,
+            completion_tokens: 3,
+        },
+    );
+    assert!(d.drain());
+
+    let batch = d.next_output().expect("terminal output");
+    let output = &batch.outputs[0];
+    assert_eq!(output.new_token_ids, vec![11, 2]);
+    assert_eq!(output.finish_reason, Some(EngineCoreFinishReason::Stop));
+}
+
+#[test]
+fn explicit_stop_token_is_used_as_sentinel_when_eos_is_absent() {
+    assert_eq!(stop_sentinel_id(None, &[42, 43]), Some(42));
+
+    let mut d = Demux::new();
+    d.add_with_stop_sentinel("req-stop-token", Some(42));
+    d.emit(
+        "req-stop-token",
+        TokenEvent::Token {
+            id: 11,
+            logprob: None,
+        },
+    );
+    d.emit(
+        "req-stop-token",
+        TokenEvent::Finished {
+            finish_reason: FinishReason::Stop,
+            prompt_tokens: 16,
+            completion_tokens: 2,
+        },
+    );
+    assert!(d.drain());
+
+    let batch = d.next_output().expect("terminal output");
+    let output = &batch.outputs[0];
+    assert_eq!(output.new_token_ids, vec![11, 42]);
+    assert_eq!(output.finish_reason, Some(EngineCoreFinishReason::Stop));
+}
+
 /// A lone `Scheduled` (no token yet) emits nothing; its metadata waits in the
 /// stream state across bursts and flushes onto the first real output. This is
 /// the reason `RequestStreamState` holds `first_token_*` between bursts.
@@ -190,6 +262,39 @@ fn lone_scheduled_defers_until_first_token() {
         output.outputs[0].events.is_some(),
         "deferred scheduled events flush onto the first token"
     );
+}
+
+/// P/D metadata can be the only event in one ready burst. It must survive
+/// until the terminal output rather than disappearing with that empty burst.
+#[test]
+fn lone_kv_transfer_defers_until_terminal_output() {
+    let mut d = Demux::new();
+    d.add("req-handoff");
+    let params = serde_json::json!({"openinfer_pd": {"version": 1}});
+    d.emit(
+        "req-handoff",
+        TokenEvent::KvTransfer {
+            params: params.clone(),
+        },
+    );
+    assert!(d.drain());
+    assert!(d.next_output().is_none(), "KV transfer alone emits nothing");
+    assert!(
+        d.streams["req-handoff"].kv_transfer_params.is_some(),
+        "handoff metadata remains attached to the live request"
+    );
+
+    d.emit(
+        "req-handoff",
+        TokenEvent::Finished {
+            finish_reason: FinishReason::Stop,
+            prompt_tokens: 4,
+            completion_tokens: 1,
+        },
+    );
+    assert!(d.drain());
+    let output = d.next_output().expect("terminal output");
+    assert_eq!(output.outputs[0].kv_transfer_params, Some(params));
 }
 
 /// First-token metadata (queued/scheduled events + prefill stats) rides the

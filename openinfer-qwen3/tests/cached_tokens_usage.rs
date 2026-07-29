@@ -52,6 +52,7 @@ fn run_and_capture_cached(handle: &EngineHandle, prompt_tokens: Vec<u32>) -> usi
             params: SamplingParams::default(),
             max_tokens: 4,
             lora_adapter: None,
+            kv_transfer_params: None,
             token_tx,
             logprobs: 0,
             echo: false,
@@ -67,7 +68,11 @@ fn run_and_capture_cached(handle: &EngineHandle, prompt_tokens: Vec<u32>) -> usi
                     "Scheduled must be emitted exactly once per request"
                 );
             }
-            Some(TokenEvent::Token { .. } | TokenEvent::PromptTokens { .. }) => {}
+            Some(
+                TokenEvent::Token { .. }
+                | TokenEvent::PromptTokens { .. }
+                | TokenEvent::KvTransfer { .. },
+            ) => {}
             Some(TokenEvent::Finished { .. }) => break,
             Some(TokenEvent::Error { message, .. }) => panic!("generation failed: {message}"),
             Some(TokenEvent::Rejected { message, .. }) => panic!("generation rejected: {message}"),

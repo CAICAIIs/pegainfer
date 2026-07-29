@@ -290,6 +290,7 @@ impl LLMEngine for OpeninferBackend {
             params,
             max_tokens,
             lora_adapter: None,
+            kv_transfer_params: None,
             token_tx: sink,
             // M1 does not surface per-token logprobs (the Dynamo `log_probs`
             // slot stays None), so pin 0 rather than make openinfer pay the

@@ -353,6 +353,24 @@ impl<T: BlockMetadata> RequestSequence<T> {
         completed_block
     }
 
+    /// Reclassify the final input token as the first generated token.
+    ///
+    /// The token sequence itself is unchanged. This is used when an external
+    /// prefill worker supplied KV for every preceding input token and emitted
+    /// the final token without computing its KV on this worker.
+    pub(crate) fn promote_last_input_to_generated(&mut self) {
+        assert!(
+            self.num_input_tokens > 0,
+            "Cannot promote an input token from an empty prompt"
+        );
+        assert!(
+            self.generated_tokens < self.max_output_tokens,
+            "Cannot promote input token: reached max_output_tokens limit"
+        );
+        self.num_input_tokens -= 1;
+        self.generated_tokens += 1;
+    }
+
     /// Whether `generated_tokens >= max_output_tokens`.
     pub fn is_complete(&self) -> bool {
         self.generated_tokens >= self.max_output_tokens

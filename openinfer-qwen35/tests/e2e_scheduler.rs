@@ -143,6 +143,7 @@ fn generate_tokens_with_logprobs(
             params: SamplingParams::default(),
             max_tokens,
             lora_adapter: None,
+            kv_transfer_params: None,
             token_tx,
             logprobs,
             echo: false,
@@ -193,7 +194,11 @@ fn collect_generation(
                 tokens.push(id);
                 token_logprobs.push(logprob);
             }
-            Some(TokenEvent::PromptTokens { .. } | TokenEvent::Scheduled { .. }) => {}
+            Some(
+                TokenEvent::PromptTokens { .. }
+                | TokenEvent::Scheduled { .. }
+                | TokenEvent::KvTransfer { .. },
+            ) => {}
             Some(TokenEvent::Finished { finish_reason, .. }) => {
                 return GenerationResult {
                     tokens,
@@ -234,6 +239,7 @@ fn expect_context_window_rejection(handle: &EngineHandle, max_context_tokens: us
             params: SamplingParams::default(),
             max_tokens: 1,
             lora_adapter: None,
+            kv_transfer_params: None,
             token_tx,
             logprobs: 0,
             echo: false,
@@ -446,6 +452,7 @@ fn run_full_scheduler_e2e(
                     params: concurrent_params(case_idx),
                     max_tokens: case.max_new_tokens,
                     lora_adapter: None,
+                    kv_transfer_params: None,
                     token_tx,
                     logprobs: 0,
                     echo: false,
@@ -487,6 +494,7 @@ fn run_full_scheduler_e2e(
                     params: SamplingParams::default(),
                     max_tokens: 8,
                     lora_adapter: None,
+                    kv_transfer_params: None,
                     token_tx,
                     logprobs,
                     echo: false,
@@ -529,6 +537,7 @@ fn run_full_scheduler_e2e(
                 params: SamplingParams::default(),
                 max_tokens: 10,
                 lora_adapter: None,
+                kv_transfer_params: None,
                 token_tx,
                 logprobs: 0,
                 echo: false,
