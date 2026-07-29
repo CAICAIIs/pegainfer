@@ -421,27 +421,23 @@ pub(super) fn admit_from_queue(
                 prompt_tokens: client_prompt_tokens,
                 cached_tokens,
             });
-            if let Some(plan) = native_anchor.filter(|plan| plan.replay_to_client) {
-                let mut finished = !plan.emitted_by_prefill;
-                if plan.emitted_by_prefill
+            if let Some(plan) = native_anchor {
+                let replay_failed = plan.replay_to_client
+                    && plan.emitted_by_prefill
                     && req
                         .token_tx
                         .send(TokenEvent::Token {
                             id: plan.token,
                             logprob: None,
                         })
-                        .is_err()
-                {
-                    finished = true;
-                }
-                if finished || req.max_tokens == 1 {
-                    if !req.token_tx.is_closed() {
+                        .is_err();
+                let finish_reason = native_anchor_finish_reason(plan, req.max_tokens);
+                if replay_failed || finish_reason.is_some() {
+                    if let Some(finish_reason) = finish_reason
+                        && !req.token_tx.is_closed()
+                    {
                         let _ = req.token_tx.send(TokenEvent::Finished {
-                            finish_reason: if plan.emitted_by_prefill {
-                                openinfer_core::engine::FinishReason::Length
-                            } else {
-                                openinfer_core::engine::FinishReason::Stop
-                            },
+                            finish_reason,
                             prompt_tokens: client_prompt_tokens,
                             completion_tokens: 1,
                         });
@@ -492,11 +488,28 @@ pub(super) fn admit_from_queue(
     Ok(())
 }
 
+fn native_anchor_finish_reason(
+    plan: offload::NativeAnchorPlan,
+    max_tokens: usize,
+) -> Option<openinfer_core::engine::FinishReason> {
+    if !plan.emitted_by_prefill {
+        // P consumed EOS without exposing it as a token. This is terminal for
+        // both router replay and manual handoffs that already carry the anchor.
+        Some(openinfer_core::engine::FinishReason::Stop)
+    } else if plan.replay_to_client && max_tokens == 1 {
+        Some(openinfer_core::engine::FinishReason::Length)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use openinfer_core::engine::FinishReason;
     use openinfer_sample::SamplingParams;
 
     use super::*;
+    use crate::scheduler::testkit::EOS;
     use crate::scheduler::testkit::request;
     use crate::scheduler::testkit::sampled;
 
@@ -648,5 +661,43 @@ mod tests {
             Ok(TokenEvent::Rejected { message, .. })
                 if message.contains("invalid handoff")
         ));
+    }
+
+    #[test]
+    fn suppressed_eos_stops_router_and_manual_native_handoffs() {
+        let manual_eos = offload::NativeAnchorPlan {
+            token: EOS[0],
+            replay_to_client: false,
+            emitted_by_prefill: false,
+        };
+        assert_eq!(
+            native_anchor_finish_reason(manual_eos, 8),
+            Some(FinishReason::Stop)
+        );
+
+        let router_eos = offload::NativeAnchorPlan {
+            replay_to_client: true,
+            ..manual_eos
+        };
+        assert_eq!(
+            native_anchor_finish_reason(router_eos, 8),
+            Some(FinishReason::Stop)
+        );
+
+        let visible_manual = offload::NativeAnchorPlan {
+            emitted_by_prefill: true,
+            ..manual_eos
+        };
+        assert_eq!(native_anchor_finish_reason(visible_manual, 1), None);
+
+        let visible_router = offload::NativeAnchorPlan {
+            replay_to_client: true,
+            ..visible_manual
+        };
+        assert_eq!(
+            native_anchor_finish_reason(visible_router, 1),
+            Some(FinishReason::Length)
+        );
+        assert_eq!(native_anchor_finish_reason(visible_router, 8), None);
     }
 }

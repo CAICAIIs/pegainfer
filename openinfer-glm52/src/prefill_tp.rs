@@ -778,6 +778,8 @@ impl Glm52TpPrefillExecutor {
             .index_k_cache
             .as_mut()
             .context("GLM5.2 MTP transfer layer 78 is missing index-K cache")?;
+        // Native MTP disables prefix matching and host-tier restore, so the
+        // wire cache cannot contain restored pages that this mirror overwrites.
         // TODO: Copy only the committed or newly written page range. Mirroring
         // the full index-K buffer costs about 17 MiB per chunk at a 16K cap.
         ctx.stream.memcpy_dtod(index_k, transfer_index_k)?;
