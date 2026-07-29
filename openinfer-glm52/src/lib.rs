@@ -664,6 +664,7 @@ fn glm52_cap_bytes(
     max_model_len: usize,
     drafter: &Glm52Drafter,
     prefill_only: bool,
+    moe_topo: Glm52MoeTopo,
 ) -> Result<usize> {
     let pool_slots = if prefill_only {
         1
@@ -674,7 +675,7 @@ fn glm52_cap_bytes(
         + if drafter.is_dspark() {
             crate::dspark::glm52_dspark_arena_bytes(max_model_len)
         } else if drafter.is_mtp() {
-            crate::mtp::glm52_mtp_arena_bytes(max_model_len)?
+            crate::mtp::glm52_mtp_arena_bytes(max_model_len, moe_topo)?
         } else {
             0
         })
@@ -705,6 +706,7 @@ fn derive_max_model_len(
     drafter: &Glm52Drafter,
     prefill_scratch_bytes: usize,
     prefill_only: bool,
+    moe_topo: Glm52MoeTopo,
 ) -> Result<Glm52ContextBudget> {
     let reserve_bytes = GLM52_VRAM_RESERVE_BYTES
         + if drafter.is_dspark() {
@@ -731,7 +733,7 @@ fn derive_max_model_len(
             requested / GLM52_MODEL_LEN_ALIGN * GLM52_MODEL_LEN_ALIGN,
             requested.next_multiple_of(GLM52_MODEL_LEN_ALIGN),
         );
-        let required = glm52_cap_bytes(requested, drafter, prefill_only)?;
+        let required = glm52_cap_bytes(requested, drafter, prefill_only, moe_topo)?;
         ensure!(
             required <= budget_bytes,
             "GLM5.2 --max-model-len {requested} needs {} of cache per rank but only {} \
@@ -748,7 +750,8 @@ fn derive_max_model_len(
         let (mut lo, mut hi) = (0, GLM52_MAX_CONTEXT / GLM52_MODEL_LEN_ALIGN);
         while lo < hi {
             let mid = (lo + hi).div_ceil(2);
-            if glm52_cap_bytes(mid * GLM52_MODEL_LEN_ALIGN, drafter, prefill_only)? <= budget_bytes
+            if glm52_cap_bytes(mid * GLM52_MODEL_LEN_ALIGN, drafter, prefill_only, moe_topo)?
+                <= budget_bytes
             {
                 lo = mid;
             } else {
@@ -768,7 +771,7 @@ fn derive_max_model_len(
     };
     Ok(Glm52ContextBudget {
         max_model_len,
-        arena_bytes: glm52_cap_bytes(max_model_len, drafter, prefill_only)?,
+        arena_bytes: glm52_cap_bytes(max_model_len, drafter, prefill_only, moe_topo)?,
         reserve_bytes,
         budget_bytes,
     })
@@ -846,6 +849,7 @@ fn start_engine(
         &drafter,
         glm52_prefill_scratch_reservation(prefill_only)?,
         prefill_only.is_some(),
+        moe_topo,
     )?;
     if let Some(prefill) = prefill_only {
         ensure!(
@@ -1498,6 +1502,8 @@ fn format_bytes(values: &[usize]) -> Vec<String> {
 mod max_model_len_tests {
     use super::*;
 
+    const TEST_TOPO: Glm52MoeTopo = Glm52MoeTopo::Ep8;
+
     /// Free VRAM that budgets exactly a `cap`-token context (exact ledger +
     /// reserve) — inverted through the same `glm52_cap_bytes` the derivation
     /// uses, so the tests exercise the policy, not a parallel formula.
@@ -1509,7 +1515,7 @@ mod max_model_len_tests {
                 0
             }
             + prefill_scratch_bytes;
-        reserve + glm52_cap_bytes(cap, drafter, false).expect("cap bytes")
+        reserve + glm52_cap_bytes(cap, drafter, false, TEST_TOPO).expect("cap bytes")
     }
 
     #[test]
@@ -1520,6 +1526,7 @@ mod max_model_len_tests {
             &Glm52Drafter::None,
             0,
             false,
+            TEST_TOPO,
         )
         .expect("derive")
         .max_model_len;
@@ -1531,6 +1538,7 @@ mod max_model_len_tests {
             &Glm52Drafter::None,
             0,
             false,
+            TEST_TOPO,
         )
         .expect("derive")
         .max_model_len;
@@ -1540,10 +1548,11 @@ mod max_model_len_tests {
     #[test]
     fn dspark_lane_shrinks_the_derived_cap() {
         let free = free_for(50_048, &Glm52Drafter::None, 0);
-        let plain =
-            derive_max_model_len(None, free, &Glm52Drafter::None, 0, false).expect("derive");
+        let plain = derive_max_model_len(None, free, &Glm52Drafter::None, 0, false, TEST_TOPO)
+            .expect("derive");
         let dspark_drafter = Glm52Drafter::Dspark(PathBuf::from("draft"));
-        let dspark = derive_max_model_len(None, free, &dspark_drafter, 0, false).expect("derive");
+        let dspark =
+            derive_max_model_len(None, free, &dspark_drafter, 0, false, TEST_TOPO).expect("derive");
         assert!(
             dspark.max_model_len < plain.max_model_len,
             "dspark cap-scaled cost must shrink the cap"
@@ -1553,25 +1562,48 @@ mod max_model_len_tests {
     #[test]
     fn native_mtp_lane_shrinks_the_derived_cap() {
         let free = free_for(50_048, &Glm52Drafter::None, 0);
-        let plain =
-            derive_max_model_len(None, free, &Glm52Drafter::None, 0, false).expect("derive");
+        let plain = derive_max_model_len(None, free, &Glm52Drafter::None, 0, false, TEST_TOPO)
+            .expect("derive");
         let native_mtp =
-            derive_max_model_len(None, free, &Glm52Drafter::NativeMtp, 0, false).expect("derive");
+            derive_max_model_len(None, free, &Glm52Drafter::NativeMtp, 0, false, TEST_TOPO)
+                .expect("derive");
         assert!(
             native_mtp.max_model_len < plain.max_model_len,
             "native MTP cap-scaled KV must shrink the target context cap"
         );
         assert!(
-            glm52_cap_bytes(50_048, &Glm52Drafter::NativeMtp, false).expect("MTP cap bytes")
-                > glm52_cap_bytes(50_048, &Glm52Drafter::None, false).expect("plain cap bytes"),
+            glm52_cap_bytes(50_048, &Glm52Drafter::NativeMtp, false, TEST_TOPO)
+                .expect("MTP cap bytes")
+                > glm52_cap_bytes(50_048, &Glm52Drafter::None, false, TEST_TOPO)
+                    .expect("plain cap bytes"),
             "native MTP must be represented in the exact memory ledger"
         );
     }
 
     #[test]
+    fn tp4_native_mtp_charges_the_execution_and_wire_caches() {
+        let cap = 16_384;
+        let tp4 = glm52_cap_bytes(cap, &Glm52Drafter::NativeMtp, true, Glm52MoeTopo::Tp4)
+            .expect("TP4 cap bytes");
+        let ep4 = glm52_cap_bytes(cap, &Glm52Drafter::NativeMtp, true, Glm52MoeTopo::Ep4)
+            .expect("EP4 cap bytes");
+        assert!(
+            tp4 > ep4,
+            "TP4 must charge its additional execution-layout cache"
+        );
+    }
+
+    #[test]
     fn derived_cap_never_exceeds_the_checkpoint_ceiling() {
-        let budget = derive_max_model_len(None, usize::MAX / 2, &Glm52Drafter::None, 0, false)
-            .expect("derive");
+        let budget = derive_max_model_len(
+            None,
+            usize::MAX / 2,
+            &Glm52Drafter::None,
+            0,
+            false,
+            TEST_TOPO,
+        )
+        .expect("derive");
         assert_eq!(budget.max_model_len, GLM52_MAX_CONTEXT);
     }
 
@@ -1583,6 +1615,7 @@ mod max_model_len_tests {
             &Glm52Drafter::None,
             0,
             false,
+            TEST_TOPO,
         )
         .expect_err("sub-minimum cap must fail");
         assert!(err.to_string().contains("context cap"), "{err}");
@@ -1596,6 +1629,7 @@ mod max_model_len_tests {
             &Glm52Drafter::None,
             0,
             false,
+            TEST_TOPO,
         )
         .expect_err("unaligned cap must fail, not silently round");
         let message = err.to_string();
@@ -1613,6 +1647,7 @@ mod max_model_len_tests {
             &Glm52Drafter::None,
             0,
             false,
+            TEST_TOPO,
         )
         .expect_err("over-budget cap must fail");
         assert!(err.to_string().contains("--max-model-len"), "{err}");
@@ -1626,6 +1661,7 @@ mod max_model_len_tests {
             &Glm52Drafter::None,
             0,
             false,
+            TEST_TOPO,
         )
         .expect_err("sub-minimum cap must fail");
     }
@@ -1638,10 +1674,11 @@ mod max_model_len_tests {
         let scratch =
             glm52_prefill_scratch_reservation(Some(prefill)).expect("prefill reservation");
         let free = free_for(100_032, &Glm52Drafter::None, 0);
-        let decode =
-            derive_max_model_len(None, free, &Glm52Drafter::None, 0, false).expect("decode budget");
-        let prefill = derive_max_model_len(None, free, &Glm52Drafter::None, scratch, true)
-            .expect("prefill budget");
+        let decode = derive_max_model_len(None, free, &Glm52Drafter::None, 0, false, TEST_TOPO)
+            .expect("decode budget");
+        let prefill =
+            derive_max_model_len(None, free, &Glm52Drafter::None, scratch, true, TEST_TOPO)
+                .expect("prefill budget");
         assert!(
             prefill.max_model_len > decode.max_model_len,
             "one shared prefill pool must fit a larger per-request cap than eight decode maxima"

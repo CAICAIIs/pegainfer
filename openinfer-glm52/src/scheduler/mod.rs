@@ -107,6 +107,24 @@ const PAGE: usize = GLM52_MODEL_LEN_ALIGN;
 /// seed suffices; per-request `seed` params replay through `mix_seed`).
 const GLM52_SAMPLE_SEED: u64 = 42;
 
+fn prefix_cache_enabled(drafter: &crate::Glm52Drafter, no_prefix_cache: bool) -> bool {
+    !drafter.enabled() && !no_prefix_cache
+}
+
+#[cfg(test)]
+mod prefix_cache_policy_tests {
+    use super::*;
+
+    #[test]
+    fn native_mtp_never_matches_target_only_prefix_state() {
+        assert!(!prefix_cache_enabled(
+            &crate::Glm52Drafter::NativeMtp,
+            false
+        ));
+        assert!(prefix_cache_enabled(&crate::Glm52Drafter::None, false));
+    }
+}
+
 struct ActiveRequest {
     req: GenerateRequest,
     state: Glm52SlotState,
@@ -233,12 +251,11 @@ pub(crate) fn run_dp8_coordinator(
     // page) — constant for the engine's lifetime.
     let usable_blocks: Vec<usize> = pools.iter().map(|pool| pool.total_blocks() - 1).collect();
     // A cache-hit prefix skips state required by either speculative lane:
-    // DSpark loses the aux-hidden captures it consumes, while native MTP
-    // loses target hidden rows and continuity in its separate KV cache.
-    // Prefix matching therefore stays off while any drafter is active.
-    // `--no-prefix-cache` remains the explicit kill switch.
-    let prefix_cache_enabled =
-        (!drafter.enabled() || (prefill_only && drafter.is_mtp())) && !no_prefix_cache;
+    // DSpark loses the aux-hidden captures it consumes. Native MTP loses
+    // continuity in its separate KV cache; TP4 P additionally restores only
+    // the 656-byte wire cache, not its 576-byte local proposal cache. Prefix
+    // matching therefore stays off while any drafter is active.
+    let prefix_cache_enabled = prefix_cache_enabled(&drafter, no_prefix_cache);
     if drafter.enabled() && !prefix_cache_enabled && !no_prefix_cache {
         log::info!("GLM5.2 prefix cache disabled: speculative decoding is on");
     }

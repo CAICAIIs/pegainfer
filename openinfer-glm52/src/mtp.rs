@@ -45,24 +45,46 @@ use crate::rows::Rows;
 const MTP_FUSED_INPUT: usize = 2 * GLM52_HIDDEN;
 pub(crate) const GLM52_MTP_DRAFTS: usize = 5;
 
-/// Context-scaled device memory owned by the native MTP lane: one layer of
-/// MLA + index-K cache and one set of per-bucket indexer logits/block tables.
-/// Fixed-size weights and scratch are accounted by the post-build headroom
-/// probe; this function is the exact monotone term used to derive the context
-/// cap before those arenas are allocated.
-pub(crate) fn glm52_mtp_arena_bytes(max_model_len: usize) -> Result<usize> {
+/// Context-scaled device memory owned by the native MTP lane: one execution
+/// cache, TP4's additional P/D wire cache, and one set of per-bucket indexer
+/// logits/block tables. Fixed-size weights and scratch are accounted by the
+/// post-build headroom probe; this function is the exact monotone term used to
+/// derive the context cap before those arenas are allocated.
+pub(crate) fn glm52_mtp_arena_bytes(
+    max_model_len: usize,
+    topology: crate::Glm52MoeTopo,
+) -> Result<usize> {
     // Two private pages per slot hold unverified proposal KV. Committed
     // layer-78 rows use the target BlockPool page IDs and are transferable;
     // scratch pages sit beyond that registered range.
     let blocks =
         glm52_pool_blocks(max_model_len, GLM52_MAX_BATCH_PER_RANK) + 2 * GLM52_MAX_BATCH_PER_RANK;
+    let execution_bytes_per_token = if topology == crate::Glm52MoeTopo::Tp4 {
+        openinfer_kernels::ops::GLM52_FLASHINFER_SPARSE_BYTES_PER_TOKEN
+    } else {
+        openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN
+    };
+    let wire_bytes_per_token = if topology == crate::Glm52MoeTopo::Tp4 {
+        openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN
+    } else {
+        0
+    };
+    let total_mla_bytes_per_token = execution_bytes_per_token
+        .checked_add(wire_bytes_per_token)
+        .context("GLM5.2 MTP MLA row byte count overflow")?;
     let mla = blocks
         .checked_mul(GLM52_MODEL_LEN_ALIGN)
-        .and_then(|v| v.checked_mul(openinfer_kernels::ops::GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN))
+        .and_then(|v| v.checked_mul(total_mla_bytes_per_token))
         .context("GLM5.2 MTP MLA arena byte count overflow")?;
+    let index_k_copies = if topology == crate::Glm52MoeTopo::Tp4 {
+        2
+    } else {
+        1
+    };
     let index_k = blocks
         .checked_mul(GLM52_MODEL_LEN_ALIGN)
         .and_then(|v| v.checked_mul(GLM52_INDEX_HEAD_DIM + size_of::<f32>()))
+        .and_then(|v| v.checked_mul(index_k_copies))
         .context("GLM5.2 MTP index-K arena byte count overflow")?;
     let rows: usize = GLM52_DECODE_BUCKETS.iter().sum();
     let indexer_logits = rows

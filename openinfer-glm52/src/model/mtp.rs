@@ -121,6 +121,22 @@ mod tests {
         assert_eq!(execution, 576);
         assert_eq!(wire, Some(656));
     }
+
+    #[test]
+    fn tp4_mtp_arena_ledger_charges_the_second_cache() {
+        let cap = 16_384;
+        let blocks =
+            glm52_pool_blocks(cap, GLM52_MAX_BATCH_PER_RANK) + 2 * GLM52_MAX_BATCH_PER_RANK;
+        let extra_execution_mla = blocks
+            * GLM52_FLASHMLA_SPARSE_PAGE_SIZE
+            * openinfer_kernels::ops::GLM52_FLASHINFER_SPARSE_BYTES_PER_TOKEN;
+        let extra_index_k = blocks * INDEX_CACHE_BLOCK * (GLM52_INDEX_HEAD_DIM + size_of::<f32>());
+        let tp4 = crate::mtp::glm52_mtp_arena_bytes(cap, crate::Glm52MoeTopo::Tp4)
+            .expect("TP4 arena bytes");
+        let ep4 = crate::mtp::glm52_mtp_arena_bytes(cap, crate::Glm52MoeTopo::Ep4)
+            .expect("EP4 arena bytes");
+        assert_eq!(tp4 - ep4, extra_execution_mla + extra_index_k);
+    }
 }
 
 const MTP_SCRATCH_PAGES_PER_SLOT: usize = 2;
