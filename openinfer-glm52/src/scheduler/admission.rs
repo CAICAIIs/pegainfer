@@ -104,6 +104,20 @@ pub(super) fn lifetime_blocks(prompt_tokens: usize, max_tokens: usize) -> usize 
     (prompt_tokens + max_tokens).div_ceil(PAGE)
 }
 
+fn admission_lifetime_blocks(
+    req: &GenerateRequest,
+    native_anchor: Option<offload::NativeAnchorPlan>,
+) -> anyhow::Result<usize> {
+    let (input_tokens, max_output_tokens) = match native_anchor {
+        Some(anchor) => {
+            let shape = offload::native_kv_shape(req, anchor)?;
+            (shape.input_tokens, shape.max_output_tokens)
+        }
+        None => (req.prompt_tokens.len(), req.max_tokens),
+    };
+    Ok(lifetime_blocks(input_tokens, max_output_tokens))
+}
+
 /// Pick a rank for a direct, unbound request. Waiting carries the same 4x
 /// weight as vLLM's DP load balancer; ties go to the lowest rank. Frontend
 /// requests bypass this function because their selected engine index is the
@@ -198,7 +212,7 @@ pub(super) fn admit_from_queue(
     mirrored: bool,
     prefix_cache_enabled: bool,
     drafter_enabled: bool,
-    _prefill_only: bool,
+    native_mtp_prefill: bool,
     pending_resets: &mut [Vec<usize>],
     slots_changed: &mut bool,
 ) -> anyhow::Result<()> {
@@ -209,7 +223,7 @@ pub(super) fn admit_from_queue(
             rank_slots
                 .iter()
                 .flatten()
-                .map(|active| lifetime_blocks(active.client_prompt_tokens, active.req.max_tokens))
+                .map(|active| active.kv.lifetime_blocks())
                 .sum()
         })
         .collect();
@@ -231,7 +245,49 @@ pub(super) fn admit_from_queue(
             let Some(front) = pending[rank].front() else {
                 break;
             };
-            let need_blocks = lifetime_blocks(front.prompt_tokens.len(), front.max_tokens);
+            // Drop a disconnected FIFO front before it can block valid work
+            // behind an admission budget it will never consume.
+            if front.token_tx.is_closed() {
+                pending[rank].pop_front();
+                if let Some(pd) = vllm_pd.as_mut() {
+                    pd.clear_parked(rank);
+                }
+                if let Some(pd) = native_pd.as_mut() {
+                    pd.clear(rank);
+                }
+                continue;
+            }
+            // Parse the native contract before budgeting: it changes the
+            // logical input/output capacity of the RequestKv created below.
+            // Invalid metadata must be rejected, not left at the FIFO head.
+            let native_handoff = match offload::native_mtp_handoff(front) {
+                Ok(handoff) => handoff,
+                Err(err) => {
+                    let req = pending[rank].pop_front().expect("checked non-empty");
+                    reject(&req, format!("{err:#}"));
+                    continue;
+                }
+            };
+            let native_anchor = match native_handoff
+                .as_ref()
+                .map(|handoff| offload::native_anchor_plan(front, handoff))
+                .transpose()
+            {
+                Ok(plan) => plan,
+                Err(err) => {
+                    let req = pending[rank].pop_front().expect("checked non-empty");
+                    reject(&req, format!("{err:#}"));
+                    continue;
+                }
+            };
+            let need_blocks = match admission_lifetime_blocks(front, native_anchor) {
+                Ok(blocks) => blocks,
+                Err(err) => {
+                    let req = pending[rank].pop_front().expect("checked non-empty");
+                    reject(&req, format!("{err:#}"));
+                    continue;
+                }
+            };
             // `usable` accounts for the block classes the scheduler knows
             // about. The allocator is the final authority: duplicate
             // primaries, restore probes, or another guard lifetime can make
@@ -253,32 +309,6 @@ pub(super) fn admit_from_queue(
 
             let mut req = pending[rank].pop_front().expect("checked non-empty");
             let client_prompt_tokens = req.prompt_tokens.len();
-            // The client left while the request sat in the queue — admitting
-            // it would burn a slot (and whole global steps) on a dead sink.
-            if req.token_tx.is_closed() {
-                if let Some(pd) = vllm_pd.as_mut() {
-                    pd.clear_parked(rank);
-                }
-                continue;
-            }
-            let native_handoff = match offload::native_mtp_handoff(&req) {
-                Ok(handoff) => handoff,
-                Err(err) => {
-                    reject(&req, format!("{err:#}"));
-                    continue;
-                }
-            };
-            let native_anchor = match native_handoff
-                .as_ref()
-                .map(|handoff| offload::native_anchor_plan(&req, handoff))
-                .transpose()
-            {
-                Ok(plan) => plan,
-                Err(err) => {
-                    reject(&req, format!("{err:#}"));
-                    continue;
-                }
-            };
             let native_admitted = if let Some(handoff) = native_handoff.as_ref() {
                 let Some(state) = native_pd.as_mut() else {
                     reject(
@@ -376,8 +406,17 @@ pub(super) fn admit_from_queue(
             let (mut kv, cached_tokens) = if let Some(admitted) = pd_admitted {
                 admitted
             } else {
-                let mut kv =
-                    pools[rank].new_request(req.prompt_tokens.clone(), req.max_tokens, None);
+                let mut kv = if native_mtp_prefill {
+                    let cache_salt = super::native_mtp_cache_salt(&req.prompt_tokens);
+                    pools[rank].new_request_with_cache_salt(
+                        req.prompt_tokens.clone(),
+                        req.max_tokens,
+                        Some(&cache_salt),
+                        None,
+                    )
+                } else {
+                    pools[rank].new_request(req.prompt_tokens.clone(), req.max_tokens, None)
+                };
                 // Host-tier restore first, so the GPU prefix match sees the union
                 // of HBM-resident and freshly-restored blocks. The probe stays
                 // alive across the match to close the eviction window.
@@ -475,6 +514,12 @@ pub(super) fn admit_from_queue(
             if drafter_enabled {
                 pending_resets[rank].push(slot);
             }
+            anyhow::ensure!(
+                kv.lifetime_blocks() == need_blocks,
+                "GLM5.2 admission budget drift: planned {need_blocks} blocks, RequestKv owns \
+                 lifetime capacity for {}",
+                kv.lifetime_blocks()
+            );
             slots[rank][slot] = Some(ActiveRequest {
                 req,
                 state,
@@ -611,6 +656,39 @@ mod tests {
         assert_eq!(lifetime_blocks(63, 1), 1);
         assert_eq!(lifetime_blocks(64, 64), 2);
         assert_eq!(lifetime_blocks(64, 65), 3);
+    }
+
+    #[test]
+    fn native_pd_admission_counts_the_internal_anchor_position() {
+        let manual = request(vec![10; PAGE], SamplingParams::default(), PAGE);
+        let manual_anchor = offload::NativeAnchorPlan {
+            token: 10,
+            replay_to_client: false,
+            emitted_by_prefill: true,
+        };
+        assert_eq!(
+            admission_lifetime_blocks(&manual, Some(manual_anchor)).unwrap(),
+            3,
+            "manual v2 needs one internal output position beyond the client budget"
+        );
+
+        let router = request(vec![10; PAGE], SamplingParams::default(), PAGE);
+        let router_anchor = offload::NativeAnchorPlan {
+            token: 11,
+            replay_to_client: true,
+            emitted_by_prefill: true,
+        };
+        assert_eq!(
+            admission_lifetime_blocks(&router, Some(router_anchor)).unwrap(),
+            3,
+            "router replay appends the anchor to the KV input shape"
+        );
+
+        assert_eq!(
+            admission_lifetime_blocks(&manual, None).unwrap(),
+            2,
+            "ordinary requests retain their existing lifetime geometry"
+        );
     }
 
     #[test]

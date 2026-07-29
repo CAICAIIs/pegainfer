@@ -371,7 +371,7 @@ pub(crate) fn run_dp8_coordinator(
             mirrored,
             prefix_cache_enabled,
             drafter.enabled(),
-            prefill_only,
+            prefill_only && mtp_enabled,
             &mut pending_resets,
             &mut slots_changed,
         ) {
@@ -991,6 +991,21 @@ fn take_boundary_drafts<'a>(
     if boundary { drafts.next() } else { None }
 }
 
+/// Scope every lineage-hashed page in one native-MTP P/D request by its full
+/// committed prompt. Layer 78 consumes shifted tokens, so the last row of a
+/// page depends on the first token of the following page; token-only per-page
+/// hashes would otherwise alias MTP bytes across diverging continuations.
+fn native_mtp_cache_salt(committed_prompt: &[u32]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"openinfer-glm52-native-mtp-pages-v1");
+    hasher.update((committed_prompt.len() as u64).to_le_bytes());
+    for token in committed_prompt {
+        hasher.update(token.to_le_bytes());
+    }
+    let digest = hasher.finalize();
+    hex::encode(&digest[..16])
+}
+
 fn native_mtp_tail_key(committed_prompt: &[u32], anchor_token: u32) -> [u8; 16] {
     let mut hasher = Sha256::new();
     hasher.update(b"openinfer-glm52-native-mtp-tail-v1");
@@ -1009,6 +1024,8 @@ fn native_mtp_tail_key(committed_prompt: &[u32], anchor_token: u32) -> [u8; 16] 
 
 #[cfg(test)]
 mod tp_prefill_output_tests {
+    use super::PAGE;
+    use super::native_mtp_cache_salt;
     use super::native_mtp_tail_key;
     use super::take_boundary_drafts;
 
@@ -1035,6 +1052,25 @@ mod tp_prefill_output_tests {
         assert_eq!(
             native_mtp_tail_key(&prompt, 10),
             native_mtp_tail_key(&prompt, 10)
+        );
+    }
+
+    #[test]
+    fn token_after_a_full_page_is_part_of_the_native_mtp_page_identity() {
+        let mut first = vec![7; PAGE + 1];
+        let mut second = first.clone();
+        first[PAGE] = 10;
+        second[PAGE] = 11;
+
+        assert_ne!(
+            native_mtp_cache_salt(&first),
+            native_mtp_cache_salt(&second),
+            "the last MTP row in page 0 consumes token PAGE through shifted input"
+        );
+        assert_eq!(
+            native_mtp_cache_salt(&first),
+            native_mtp_cache_salt(&first),
+            "P and D must derive the same cache scope from the committed prompt"
         );
     }
 }

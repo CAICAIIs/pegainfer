@@ -255,6 +255,37 @@ pub(super) fn native_anchor_plan(
     })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct NativeKvShape {
+    pub(super) input_tokens: usize,
+    pub(super) max_output_tokens: usize,
+}
+
+/// Exact kvbm geometry of a native-MTP D request. Router handoffs append P's
+/// anchor to the logical input; manual handoffs already carry it and instead
+/// need one extra internal output position because that anchor did not consume
+/// the D request's client-visible output budget.
+pub(super) fn native_kv_shape(
+    req: &GenerateRequest,
+    anchor_plan: NativeAnchorPlan,
+) -> anyhow::Result<NativeKvShape> {
+    let input_tokens = req
+        .prompt_tokens
+        .len()
+        .checked_add(usize::from(anchor_plan.replay_to_client))
+        .context("native-MTP P/D KV input length overflow")?;
+    let anchor_counts_against_client_budget =
+        anchor_plan.replay_to_client && anchor_plan.emitted_by_prefill;
+    let max_output_tokens = req
+        .max_tokens
+        .checked_add(usize::from(!anchor_counts_against_client_budget))
+        .context("native-MTP P/D KV output budget overflow")?;
+    Ok(NativeKvShape {
+        input_tokens,
+        max_output_tokens,
+    })
+}
+
 pub(super) struct NativePdState {
     parked: Vec<Option<NativeParked>>,
 }
@@ -719,8 +750,9 @@ pub(super) fn admit_native_mtp_pd(
 
     let query_key = state.parked(rank, req).query_key.clone();
     let prompt_kv = &req.prompt_tokens[..handoff.committed_len];
+    let cache_salt = super::native_mtp_cache_salt(prompt_kv);
     let full_len = handoff.committed_len - handoff.tail_len;
-    let mut probe = pool.probe_prefix(prompt_kv.to_vec(), None);
+    let mut probe = pool.probe_prefix_with_cache_salt(prompt_kv.to_vec(), Some(&cache_salt), None);
     let hashes = probe.cpu_query_hashes();
     if !hashes.is_empty() {
         match offload.engine.query(&format!("{query_key}-full"), &hashes) {
@@ -768,16 +800,18 @@ pub(super) fn admit_native_mtp_pd(
         logical_prompt.push(anchor_plan.token);
     }
     let logical_prompt_len = logical_prompt.len();
-    // A router-replayed anchor consumes one client output position. In the
-    // manual v2 contract it does not, so give kvbm one extra internal output
-    // position before promoting the anchor from input to generated below.
-    let anchor_counts_against_client_budget =
-        anchor_plan.replay_to_client && anchor_plan.emitted_by_prefill;
-    let kv_max_output_tokens = req
-        .max_tokens
-        .checked_add(usize::from(!anchor_counts_against_client_budget))
-        .context("native-MTP P/D KV output budget overflow")?;
-    let mut kv = pool.new_request(logical_prompt, kv_max_output_tokens, None);
+    let kv_shape = native_kv_shape(req, anchor_plan)?;
+    anyhow::ensure!(
+        logical_prompt_len == kv_shape.input_tokens,
+        "native-MTP P/D KV input shape drift: built {logical_prompt_len}, planned {}",
+        kv_shape.input_tokens
+    );
+    let mut kv = pool.new_request_with_cache_salt(
+        logical_prompt,
+        kv_shape.max_output_tokens,
+        Some(&cache_salt),
+        None,
+    );
     let mut cached_tokens = kv.match_and_add_prefix(pool)?;
     if cached_tokens < full_len {
         return native_pd_wait(state, rank, req, "full-page rematch");
