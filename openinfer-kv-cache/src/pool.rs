@@ -419,6 +419,15 @@ impl RequestKv {
             .map_err(|e| anyhow::anyhow!("apply_prefill_chunk: {e}"))
     }
 
+    /// Convert the one uncomputed final input token left by an external
+    /// prefill restore into the normal dangling-token state expected by
+    /// decode/speculative scheduling. Does not advance `kv_position`.
+    pub fn adopt_external_prefill_anchor(&mut self) -> anyhow::Result<()> {
+        self.seq
+            .adopt_external_prefill_anchor()
+            .map_err(|e| anyhow::anyhow!("adopt_external_prefill_anchor: {e}"))
+    }
+
     pub fn apply_decode(&mut self, token: u32, pool: &BlockPool) -> anyhow::Result<DecodeOutcome> {
         self.seq
             .apply_decode(token, &pool.block_manager)

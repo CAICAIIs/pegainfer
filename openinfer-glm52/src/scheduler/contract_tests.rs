@@ -53,7 +53,12 @@ fn load_snapshots_keep_rank_ownership() {
     let mut kv = pools[0].new_request(req.prompt_tokens.clone(), req.max_tokens, None);
     kv.schedule_prefill(1, &pools[0])
         .expect("rank 0 owns one live KV block");
-    slots[0][0] = Some(ActiveRequest { req, state, kv });
+    slots[0][0] = Some(ActiveRequest {
+        req,
+        state,
+        client_prompt_tokens: 2,
+        kv,
+    });
 
     let mut pending: Vec<VecDeque<GenerateRequest>> = (0..2).map(|_| VecDeque::new()).collect();
     pending[1].push_back(request(vec![20], SamplingParams::default(), 4));

@@ -128,6 +128,9 @@ mod prefix_cache_policy_tests {
 struct ActiveRequest {
     req: GenerateRequest,
     state: Glm52SlotState,
+    /// Prompt length from the client request. Native P/D v2 appends P's
+    /// anchor internally, but OpenAI usage must still report the original.
+    client_prompt_tokens: usize,
     /// The request's page assignments in the rank's pool. Block RAII: blocks
     /// return to the pool (registered ones as matchable prefix-cache entries)
     /// when this drops or `release()`s.
@@ -878,7 +881,7 @@ fn submit_join_apply_prefill(
         if boundary {
             span_outputs[span - 1] = *boundary_output.next().expect("validated output count");
         }
-        let prompt_tokens = active.req.prompt_tokens.len();
+        let prompt_tokens = active.client_prompt_tokens;
         let outcome = active.state.advance_span(&span_outputs, eos_token_ids);
         let freed = match outcome {
             Glm52StepOutcome::Prefilling => {
@@ -933,13 +936,15 @@ fn submit_join_apply_prefill(
                     let _ = active.req.token_tx.send(TokenEvent::KvTransfer {
                         params: serde_json::json!({
                             "openinfer_pd": {
-                                "version": 1,
+                                "version": 2,
                                 "native_mtp": {
                                     "draft_tokens": drafts,
                                     "committed_len": committed_len,
                                     "arena_count": 101,
                                     "tail_len": tail_len,
-                                    "tail_key": tail_key
+                                    "tail_key": tail_key,
+                                    "anchor_token_id": committed[0],
+                                    "anchor_emitted": emit == 1
                                 }
                             }
                         }),
@@ -1017,7 +1022,7 @@ fn apply_step_outputs(
             let Some(active) = slot.as_mut() else {
                 continue;
             };
-            let prompt_tokens = active.req.prompt_tokens.len();
+            let prompt_tokens = active.client_prompt_tokens;
             let outcome = active.state.advance_span(span_outputs, eos_token_ids);
             // Commit the span's KV bookkeeping under the exact kind the
             // submit phase scheduled — a mispairing is a coordinator bug
@@ -1250,7 +1255,7 @@ fn fail_step(slots: &mut [RankSlots], err: &anyhow::Error) {
         };
         let _ = active.req.token_tx.send(TokenEvent::Error {
             message: format!("{err:#}"),
-            prompt_tokens: active.req.prompt_tokens.len(),
+            prompt_tokens: active.client_prompt_tokens,
             completion_tokens: active.state.completion_tokens(),
         });
     }

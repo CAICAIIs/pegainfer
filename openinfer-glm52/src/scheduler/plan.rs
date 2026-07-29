@@ -322,7 +322,12 @@ mod tests {
         ));
         let kv = test_kv(req.prompt_tokens.clone(), req.max_tokens);
         let mut slots: RankSlots = std::array::from_fn(|_| None);
-        slots[0] = Some(ActiveRequest { req, state, kv });
+        slots[0] = Some(ActiveRequest {
+            req,
+            state,
+            client_prompt_tokens: 1,
+            kv,
+        });
         vec![slots]
     }
 
@@ -389,6 +394,7 @@ mod tests {
         rank_slots[0] = Some(ActiveRequest {
             req: request(vec![10], sampled(0.8), 8),
             state: decode_state,
+            client_prompt_tokens: 1,
             kv: test_kv(vec![10], 8),
         });
 
@@ -400,6 +406,7 @@ mod tests {
         rank_slots[1] = Some(ActiveRequest {
             req: request(vec![10, 11, 12, 13, 14], sampled(0.8), 8),
             state: boundary_state,
+            client_prompt_tokens: 5,
             kv: test_kv(vec![10, 11, 12, 13, 14], 8),
         });
 
@@ -411,12 +418,14 @@ mod tests {
         rank_slots[2] = Some(ActiveRequest {
             req: request(vec![10], openinfer_sample::SamplingParams::default(), 8),
             state: greedy_state,
+            client_prompt_tokens: 1,
             kv: test_kv(vec![10], 8),
         });
 
         rank_slots[3] = Some(ActiveRequest {
             req: request(vec![30; 10], sampled(0.8), 8),
             state: state(vec![30; 10], 8, false),
+            client_prompt_tokens: 10,
             kv: test_kv(vec![30; 10], 8),
         });
 
@@ -454,6 +463,7 @@ mod tests {
                 8,
             ),
             state,
+            client_prompt_tokens: 1,
             kv: test_kv(vec![10], 8),
         });
         assert!(collect_sampling_rows(&shape, &rank_slots).is_empty());

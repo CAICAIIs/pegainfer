@@ -209,9 +209,7 @@ pub(super) fn admit_from_queue(
             rank_slots
                 .iter()
                 .flatten()
-                .map(|active| {
-                    lifetime_blocks(active.req.prompt_tokens.len(), active.req.max_tokens)
-                })
+                .map(|active| lifetime_blocks(active.client_prompt_tokens, active.req.max_tokens))
                 .sum()
         })
         .collect();
@@ -238,7 +236,8 @@ pub(super) fn admit_from_queue(
                 break;
             }
 
-            let req = pending[rank].pop_front().expect("checked non-empty");
+            let mut req = pending[rank].pop_front().expect("checked non-empty");
+            let client_prompt_tokens = req.prompt_tokens.len();
             // The client left while the request sat in the queue — admitting
             // it would burn a slot (and whole global steps) on a dead sink.
             if req.token_tx.is_closed() {
@@ -249,6 +248,17 @@ pub(super) fn admit_from_queue(
             }
             let native_handoff = match offload::native_mtp_handoff(&req) {
                 Ok(handoff) => handoff,
+                Err(err) => {
+                    reject(&req, format!("{err:#}"));
+                    continue;
+                }
+            };
+            let native_anchor = match native_handoff
+                .as_ref()
+                .map(|handoff| offload::native_anchor_plan(&req, handoff))
+                .transpose()
+            {
+                Ok(plan) => plan.flatten(),
                 Err(err) => {
                     reject(&req, format!("{err:#}"));
                     continue;
@@ -348,7 +358,7 @@ pub(super) fn admit_from_queue(
                     None => None,
                 }
             };
-            let (kv, cached_tokens) = if let Some(admitted) = pd_admitted {
+            let (mut kv, cached_tokens) = if let Some(admitted) = pd_admitted {
                 admitted
             } else {
                 let mut kv =
@@ -387,12 +397,44 @@ pub(super) fn admit_from_queue(
                 (kv, cached_tokens)
             };
             let queued_at_unix_s = req.queued_at_unix_s.unwrap_or_else(unix_now_s);
+            if let Some(plan) = native_anchor.filter(|plan| plan.replay_to_client) {
+                req.prompt_tokens.push(plan.token);
+            }
             let _ = req.token_tx.send(TokenEvent::Scheduled {
                 queued_at_unix_s,
                 scheduled_at_unix_s: unix_now_s(),
-                prompt_tokens: req.prompt_tokens.len(),
+                prompt_tokens: client_prompt_tokens,
                 cached_tokens,
             });
+            if let Some(plan) = native_anchor.filter(|plan| plan.replay_to_client) {
+                let mut finished = !plan.emitted_by_prefill;
+                if plan.emitted_by_prefill
+                    && req
+                        .token_tx
+                        .send(TokenEvent::Token {
+                            id: plan.token,
+                            logprob: None,
+                        })
+                        .is_err()
+                {
+                    finished = true;
+                }
+                if finished || req.max_tokens == 1 {
+                    if !req.token_tx.is_closed() {
+                        let _ = req.token_tx.send(TokenEvent::Finished {
+                            finish_reason: if plan.emitted_by_prefill {
+                                openinfer_core::engine::FinishReason::Length
+                            } else {
+                                openinfer_core::engine::FinishReason::Stop
+                            },
+                            prompt_tokens: client_prompt_tokens,
+                            completion_tokens: 1,
+                        });
+                    }
+                    kv.release()?;
+                    continue;
+                }
+            }
             let mut state = Glm52SlotState::new(
                 req.prompt_tokens.clone(),
                 req.max_tokens,
@@ -406,7 +448,11 @@ pub(super) fn admit_from_queue(
                     cached_tokens,
                     handoff.committed_len
                 );
-                state.seed_native_pd_anchor();
+                if native_anchor.is_some_and(|plan| plan.replay_to_client) {
+                    state.seed_native_pd_replayed_anchor();
+                } else {
+                    state.seed_native_pd_anchor();
+                }
                 state.set_drafts(handoff.draft_tokens.to_vec(), crate::mtp::GLM52_MTP_DRAFTS);
                 log::info!(
                     "GLM5.2 native P/D admitted: rank={rank} slot={slot} \
@@ -418,7 +464,12 @@ pub(super) fn admit_from_queue(
             if drafter_enabled {
                 pending_resets[rank].push(slot);
             }
-            slots[rank][slot] = Some(ActiveRequest { req, state, kv });
+            slots[rank][slot] = Some(ActiveRequest {
+                req,
+                state,
+                client_prompt_tokens,
+                kv,
+            });
             committed[rank] += need_blocks;
             *slots_changed = true;
         }

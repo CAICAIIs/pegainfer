@@ -176,6 +176,10 @@ pub(super) struct NativeMtpHandoff {
     pub(super) arena_count: usize,
     pub(super) tail_len: usize,
     pub(super) tail_key: Option<String>,
+    #[serde(default)]
+    pub(super) anchor_token_id: Option<u32>,
+    #[serde(default)]
+    pub(super) anchor_emitted: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -195,19 +199,77 @@ pub(super) fn native_mtp_handoff(
     let Some(value) = req.kv_transfer_params.clone() else {
         return Ok(None);
     };
+    if value.get("openinfer_pd").is_none() {
+        return Ok(None);
+    }
     let envelope: OpenInferPdEnvelope =
         serde_json::from_value(value).context("invalid openinfer native-MTP P/D metadata")?;
+    let version = envelope.openinfer_pd.version;
     anyhow::ensure!(
-        envelope.openinfer_pd.version == 1,
-        "unsupported openinfer P/D metadata version {}",
-        envelope.openinfer_pd.version
+        matches!(version, 1 | 2),
+        "unsupported openinfer P/D metadata version {version}"
     );
+    let handoff = envelope.openinfer_pd.native_mtp;
     anyhow::ensure!(
-        envelope.openinfer_pd.native_mtp.arena_count == 101,
+        handoff.arena_count == 101,
         "native-MTP P/D requires 101 arenas, got {}",
-        envelope.openinfer_pd.native_mtp.arena_count
+        handoff.arena_count
     );
-    Ok(Some(envelope.openinfer_pd.native_mtp))
+    anyhow::ensure!(
+        (version == 1 && handoff.anchor_token_id.is_none() && handoff.anchor_emitted.is_none())
+            || (version == 2
+                && handoff.anchor_token_id.is_some()
+                && handoff.anchor_emitted.is_some()),
+        "openinfer P/D metadata version {version} has inconsistent anchor fields"
+    );
+    Ok(Some(handoff))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct NativeAnchorPlan {
+    pub(super) token: u32,
+    pub(super) replay_to_client: bool,
+    pub(super) emitted_by_prefill: bool,
+}
+
+/// Resolve the v2 router contract without mutating the queued request.
+///
+/// vLLM Router forwards the original request unchanged, so D must append and
+/// replay P's anchor. The older/manual harness already appends the anchor and
+/// combines P+D output itself; keep accepting that shape without replay.
+pub(super) fn native_anchor_plan(
+    req: &GenerateRequest,
+    handoff: &NativeMtpHandoff,
+) -> anyhow::Result<Option<NativeAnchorPlan>> {
+    let Some(token) = handoff.anchor_token_id else {
+        anyhow::ensure!(
+            req.prompt_tokens.len() == handoff.committed_len + 1,
+            "native-MTP P/D v1 expects prompt = committed KV + anchor ({} != {} + 1)",
+            req.prompt_tokens.len(),
+            handoff.committed_len
+        );
+        return Ok(None);
+    };
+    let emitted_by_prefill = handoff
+        .anchor_emitted
+        .expect("v2 metadata validation requires anchor_emitted");
+    if req.prompt_tokens.len() == handoff.committed_len {
+        return Ok(Some(NativeAnchorPlan {
+            token,
+            replay_to_client: true,
+            emitted_by_prefill,
+        }));
+    }
+    anyhow::ensure!(
+        req.prompt_tokens.len() == handoff.committed_len + 1
+            && req.prompt_tokens.last() == Some(&token),
+        "native-MTP P/D v2 expects the original prompt or committed KV + anchor"
+    );
+    Ok(Some(NativeAnchorPlan {
+        token,
+        replay_to_client: false,
+        emitted_by_prefill,
+    }))
 }
 
 pub(super) struct NativePdState {
@@ -660,12 +722,7 @@ pub(super) fn admit_native_mtp_pd(
     req: &GenerateRequest,
     handoff: &NativeMtpHandoff,
 ) -> anyhow::Result<VllmAdmitOutcome> {
-    anyhow::ensure!(
-        req.prompt_tokens.len() == handoff.committed_len + 1,
-        "native-MTP P/D expects prompt = committed KV + anchor ({} != {} + 1)",
-        req.prompt_tokens.len(),
-        handoff.committed_len
-    );
+    let anchor_plan = native_anchor_plan(req, handoff)?;
     anyhow::ensure!(
         handoff.tail_len == native_pd_tail_len(handoff.committed_len),
         "native-MTP P/D tail length {} disagrees with committed length {}",
@@ -723,7 +780,21 @@ pub(super) fn admit_native_mtp_pd(
         }
     }
 
-    let mut kv = pool.new_request(req.prompt_tokens.clone(), req.max_tokens, None);
+    let mut logical_prompt = req.prompt_tokens.clone();
+    if let Some(plan) = anchor_plan.filter(|plan| plan.replay_to_client) {
+        logical_prompt.push(plan.token);
+    }
+    let logical_prompt_len = logical_prompt.len();
+    // A router-replayed anchor consumes one client output position. In the
+    // manual/v1 contract it does not, so give kvbm one extra internal output
+    // position before promoting the anchor from input to generated below.
+    let anchor_counts_against_client_budget =
+        anchor_plan.is_some_and(|plan| plan.replay_to_client && plan.emitted_by_prefill);
+    let kv_max_output_tokens = req
+        .max_tokens
+        .checked_add(usize::from(!anchor_counts_against_client_budget))
+        .context("native-MTP P/D KV output budget overflow")?;
+    let mut kv = pool.new_request(logical_prompt, kv_max_output_tokens, None);
     let mut cached_tokens = kv.match_and_add_prefix(pool)?;
     if cached_tokens < full_len {
         return native_pd_wait(state, rank, req, "full-page rematch");
@@ -785,9 +856,11 @@ pub(super) fn admit_native_mtp_pd(
             }
         }
     }
-    if cached_tokens != handoff.committed_len || req.prompt_tokens.len() - kv.kv_position() != 1 {
+    if cached_tokens != handoff.committed_len || logical_prompt_len - kv.kv_position() != 1 {
         return native_pd_wait(state, rank, req, "complete-prefix install");
     }
+    kv.adopt_external_prefill_anchor()
+        .context("native-MTP P/D anchor adoption")?;
     state.clear(rank);
     Ok(VllmAdmitOutcome::Admit {
         kv: Box::new(kv),
@@ -1006,5 +1079,83 @@ mod tests {
     fn native_pd_reuses_an_already_cached_aligned_tail() {
         assert!(!native_pd_needs_tail_load(PAGE, PAGE, PAGE));
         assert!(native_pd_needs_tail_load(0, PAGE, PAGE));
+    }
+
+    #[test]
+    fn native_pd_v2_installs_and_replays_the_router_anchor() {
+        let mut req = testkit::request(vec![1, 2, 3], testkit::sampled(0.0), 8);
+        req.kv_transfer_params = Some(serde_json::json!({
+            "openinfer_pd": {
+                "version": 2,
+                "native_mtp": {
+                    "draft_tokens": [5, 6, 7, 8, 9],
+                    "committed_len": 3,
+                    "arena_count": 101,
+                    "tail_len": 3,
+                    "tail_key": "00000000000000000000000000000000",
+                    "anchor_token_id": 4,
+                    "anchor_emitted": true
+                }
+            }
+        }));
+        let handoff = native_mtp_handoff(&req)
+            .expect("valid v2 envelope")
+            .expect("native handoff");
+        assert_eq!(
+            native_anchor_plan(&req, &handoff).expect("router plan"),
+            Some(NativeAnchorPlan {
+                token: 4,
+                replay_to_client: true,
+                emitted_by_prefill: true,
+            })
+        );
+
+        req.prompt_tokens.push(4);
+        assert_eq!(
+            native_anchor_plan(&req, &handoff).expect("manual plan"),
+            Some(NativeAnchorPlan {
+                token: 4,
+                replay_to_client: false,
+                emitted_by_prefill: true,
+            })
+        );
+    }
+
+    #[test]
+    fn native_pd_v1_keeps_the_manual_prompt_contract() {
+        let mut req = testkit::request(vec![1, 2, 3, 4], testkit::sampled(0.0), 8);
+        req.kv_transfer_params = Some(serde_json::json!({
+            "openinfer_pd": {
+                "version": 1,
+                "native_mtp": {
+                    "draft_tokens": [5, 6, 7, 8, 9],
+                    "committed_len": 3,
+                    "arena_count": 101,
+                    "tail_len": 3,
+                    "tail_key": "00000000000000000000000000000000"
+                }
+            }
+        }));
+        let handoff = native_mtp_handoff(&req)
+            .expect("valid v1 envelope")
+            .expect("native handoff");
+        assert_eq!(
+            native_anchor_plan(&req, &handoff).expect("legacy plan"),
+            None
+        );
+    }
+
+    #[test]
+    fn native_pd_ignores_router_prefill_connector_metadata() {
+        let mut req = testkit::request(vec![1, 2, 3], testkit::sampled(0.0), 1);
+        req.kv_transfer_params = Some(serde_json::json!({
+            "do_remote_prefill": true,
+            "do_remote_decode": false
+        }));
+        assert!(
+            native_mtp_handoff(&req)
+                .expect("unrelated connector metadata is not malformed")
+                .is_none()
+        );
     }
 }

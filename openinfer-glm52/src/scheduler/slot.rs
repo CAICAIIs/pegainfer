@@ -182,6 +182,21 @@ impl Glm52SlotState {
             .expect("native P/D prompt contains an anchor");
     }
 
+    /// Resume a v2 router handoff after replaying P's anchor to the client.
+    ///
+    /// The anchor remains the first verifier input but already consumes one
+    /// output-token budget position. Removing it from the state's prompt
+    /// keeps that input at the original prompt length.
+    pub(super) fn seed_native_pd_replayed_anchor(&mut self) {
+        debug_assert_eq!(self.fed + 1, self.prompt.len());
+        self.last_token = self
+            .prompt
+            .pop()
+            .expect("native P/D prompt contains an anchor");
+        debug_assert_eq!(self.fed, self.prompt.len());
+        self.completion = 1;
+    }
+
     #[cfg(test)]
     pub(super) fn record_mtp_production_gate(&self, request_id: Option<&str>) {
         if !matches!(
@@ -666,6 +681,28 @@ mod tests {
             state.advance_span(&[21, 22, 30, 0, 0, 0], EOS),
             commit(&[21, 22, 30], 3, None, 3)
         );
+        assert_eq!(state.decode_anchor(), Some((30, 5)));
+    }
+
+    #[test]
+    fn native_pd_replayed_anchor_counts_against_the_router_budget() {
+        let mut state = Glm52SlotState::new(vec![10, 11, 20], 8, false, 2);
+        state.seed_native_pd_replayed_anchor();
+        state.set_drafts(vec![21, 22, 99, 98, 97], GLM52_MTP_DRAFTS);
+
+        assert_eq!(state.completion_tokens(), 1);
+        assert_eq!(
+            state.next_input_at(0),
+            Glm52StepInput {
+                token: 20,
+                position: 2
+            }
+        );
+        assert_eq!(
+            state.advance_span(&[21, 22, 30, 0, 0, 0], EOS),
+            commit(&[21, 22, 30], 3, None, 3)
+        );
+        assert_eq!(state.completion_tokens(), 4);
         assert_eq!(state.decode_anchor(), Some((30, 5)));
     }
 
