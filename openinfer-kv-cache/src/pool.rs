@@ -486,6 +486,12 @@ impl RequestKv {
         self.seq.generated_tokens()
     }
 
+    /// Physical blocks currently held by this request, including registered,
+    /// staged, and eagerly allocated dangling blocks.
+    pub fn resident_blocks(&self) -> usize {
+        self.seq.assigned_blocks() + self.seq.staged_blocks() + self.seq.unassigned_blocks()
+    }
+
     /// Physical page IDs assigned to this request, in sequence order.
     /// Includes every block the request currently holds — which can be one
     /// more than the KV tokens need (see `step_page_indices`).

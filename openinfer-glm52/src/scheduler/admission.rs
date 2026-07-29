@@ -232,7 +232,22 @@ pub(super) fn admit_from_queue(
                 break;
             };
             let need_blocks = lifetime_blocks(front.prompt_tokens.len(), front.max_tokens);
-            if committed[rank] + need_blocks > usable[rank] {
+            // `usable` accounts for the block classes the scheduler knows
+            // about. The allocator is the final authority: duplicate
+            // primaries, restore probes, or another guard lifetime can make
+            // fewer pages physically allocatable than that bookkeeping
+            // predicts. Add back only pages held by active requests (already
+            // represented in `committed`) and defer the FIFO front if the
+            // resulting physical lifetime budget is smaller.
+            let active_resident: usize = slots[rank]
+                .iter()
+                .flatten()
+                .map(|active| active.kv.resident_blocks())
+                .sum();
+            let physical_usable = pools[rank]
+                .available_blocks()
+                .saturating_add(active_resident);
+            if committed[rank] + need_blocks > usable[rank].min(physical_usable) {
                 break;
             }
 
@@ -258,7 +273,7 @@ pub(super) fn admit_from_queue(
                 .map(|handoff| offload::native_anchor_plan(&req, handoff))
                 .transpose()
             {
-                Ok(plan) => plan.flatten(),
+                Ok(plan) => plan,
                 Err(err) => {
                     reject(&req, format!("{err:#}"));
                     continue;

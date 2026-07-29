@@ -162,6 +162,66 @@ fn prefill_only_admits_multiple_requests_within_pool_capacity() {
     assert!(pending[0].is_empty());
 }
 
+#[test]
+fn admission_defers_while_physical_pages_are_temporarily_held() {
+    let pools = vec![BlockPool::new(PAGE, 6).expect("pool")];
+    let mut held = pools[0].new_request(vec![1; 2 * PAGE], 1, None);
+    held.schedule_prefill(2 * PAGE, &pools[0])
+        .expect("temporarily hold two physical pages");
+
+    let mut slots: Vec<RankSlots> = vec![std::array::from_fn(|_| None)];
+    let mut pending: Vec<VecDeque<GenerateRequest>> = vec![VecDeque::new()];
+    let mut req = request(vec![2; 3 * PAGE], SamplingParams::default(), 1);
+    let (token_tx, _token_rx) = TokenSink::standalone();
+    req.token_tx = token_tx;
+    pending[0].push_back(req);
+    let mut pending_resets = vec![Vec::new()];
+    let mut slots_changed = false;
+
+    admit_from_queue(
+        &mut pending,
+        &mut slots,
+        &pools,
+        &[5],
+        None,
+        &mut None,
+        &mut None,
+        &[],
+        true,
+        true,
+        false,
+        true,
+        &mut pending_resets,
+        &mut slots_changed,
+    )
+    .expect("temporary pressure is not an admission error");
+
+    assert_eq!(pending[0].len(), 1, "request stays queued");
+    assert!(slots[0].iter().all(Option::is_none));
+
+    held.revert_schedule().expect("release temporary pages");
+    admit_from_queue(
+        &mut pending,
+        &mut slots,
+        &pools,
+        &[5],
+        None,
+        &mut None,
+        &mut None,
+        &[],
+        true,
+        true,
+        false,
+        true,
+        &mut pending_resets,
+        &mut slots_changed,
+    )
+    .expect("admit after pressure clears");
+
+    assert!(pending[0].is_empty());
+    assert_eq!(slots[0].iter().flatten().count(), 1);
+}
+
 /// Drive one request end to end through the coordinator's exact
 /// schedule/apply sequence against `pool` — the offline replica of the
 /// two engine-fatal submit-walk assertions (span start == `kv_position`,

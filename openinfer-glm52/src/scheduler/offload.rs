@@ -176,10 +176,10 @@ pub(super) struct NativeMtpHandoff {
     pub(super) arena_count: usize,
     pub(super) tail_len: usize,
     pub(super) tail_key: Option<String>,
-    #[serde(default)]
-    pub(super) anchor_token_id: Option<u32>,
-    #[serde(default)]
-    pub(super) anchor_emitted: Option<bool>,
+    pub(super) anchor_token_id: u32,
+    /// Whether the anchor is client-visible; false only when it is an EOS
+    /// consumed by P but suppressed from the response, so D must not replay it.
+    pub(super) anchor_emitted: bool,
 }
 
 #[derive(Deserialize)]
@@ -206,7 +206,7 @@ pub(super) fn native_mtp_handoff(
         serde_json::from_value(value).context("invalid openinfer native-MTP P/D metadata")?;
     let version = envelope.openinfer_pd.version;
     anyhow::ensure!(
-        matches!(version, 1 | 2),
+        version == 2,
         "unsupported openinfer P/D metadata version {version}"
     );
     let handoff = envelope.openinfer_pd.native_mtp;
@@ -214,13 +214,6 @@ pub(super) fn native_mtp_handoff(
         handoff.arena_count == 101,
         "native-MTP P/D requires 101 arenas, got {}",
         handoff.arena_count
-    );
-    anyhow::ensure!(
-        (version == 1 && handoff.anchor_token_id.is_none() && handoff.anchor_emitted.is_none())
-            || (version == 2
-                && handoff.anchor_token_id.is_some()
-                && handoff.anchor_emitted.is_some()),
-        "openinfer P/D metadata version {version} has inconsistent anchor fields"
     );
     Ok(Some(handoff))
 }
@@ -235,41 +228,31 @@ pub(super) struct NativeAnchorPlan {
 /// Resolve the v2 router contract without mutating the queued request.
 ///
 /// vLLM Router forwards the original request unchanged, so D must append and
-/// replay P's anchor. The older/manual harness already appends the anchor and
-/// combines P+D output itself; keep accepting that shape without replay.
+/// replay P's anchor. A manual v2 harness may already append the anchor and
+/// combine P+D output itself; keep accepting that shape without replay.
 pub(super) fn native_anchor_plan(
     req: &GenerateRequest,
     handoff: &NativeMtpHandoff,
-) -> anyhow::Result<Option<NativeAnchorPlan>> {
-    let Some(token) = handoff.anchor_token_id else {
-        anyhow::ensure!(
-            req.prompt_tokens.len() == handoff.committed_len + 1,
-            "native-MTP P/D v1 expects prompt = committed KV + anchor ({} != {} + 1)",
-            req.prompt_tokens.len(),
-            handoff.committed_len
-        );
-        return Ok(None);
-    };
-    let emitted_by_prefill = handoff
-        .anchor_emitted
-        .expect("v2 metadata validation requires anchor_emitted");
+) -> anyhow::Result<NativeAnchorPlan> {
+    let token = handoff.anchor_token_id;
+    let emitted_by_prefill = handoff.anchor_emitted;
     if req.prompt_tokens.len() == handoff.committed_len {
-        return Ok(Some(NativeAnchorPlan {
+        return Ok(NativeAnchorPlan {
             token,
             replay_to_client: true,
             emitted_by_prefill,
-        }));
+        });
     }
     anyhow::ensure!(
         req.prompt_tokens.len() == handoff.committed_len + 1
             && req.prompt_tokens.last() == Some(&token),
         "native-MTP P/D v2 expects the original prompt or committed KV + anchor"
     );
-    Ok(Some(NativeAnchorPlan {
+    Ok(NativeAnchorPlan {
         token,
         replay_to_client: false,
         emitted_by_prefill,
-    }))
+    })
 }
 
 pub(super) struct NativePdState {
@@ -781,15 +764,15 @@ pub(super) fn admit_native_mtp_pd(
     }
 
     let mut logical_prompt = req.prompt_tokens.clone();
-    if let Some(plan) = anchor_plan.filter(|plan| plan.replay_to_client) {
-        logical_prompt.push(plan.token);
+    if anchor_plan.replay_to_client {
+        logical_prompt.push(anchor_plan.token);
     }
     let logical_prompt_len = logical_prompt.len();
     // A router-replayed anchor consumes one client output position. In the
-    // manual/v1 contract it does not, so give kvbm one extra internal output
+    // manual v2 contract it does not, so give kvbm one extra internal output
     // position before promoting the anchor from input to generated below.
     let anchor_counts_against_client_budget =
-        anchor_plan.is_some_and(|plan| plan.replay_to_client && plan.emitted_by_prefill);
+        anchor_plan.replay_to_client && anchor_plan.emitted_by_prefill;
     let kv_max_output_tokens = req
         .max_tokens
         .checked_add(usize::from(!anchor_counts_against_client_budget))
@@ -1103,26 +1086,26 @@ mod tests {
             .expect("native handoff");
         assert_eq!(
             native_anchor_plan(&req, &handoff).expect("router plan"),
-            Some(NativeAnchorPlan {
+            NativeAnchorPlan {
                 token: 4,
                 replay_to_client: true,
                 emitted_by_prefill: true,
-            })
+            }
         );
 
         req.prompt_tokens.push(4);
         assert_eq!(
             native_anchor_plan(&req, &handoff).expect("manual plan"),
-            Some(NativeAnchorPlan {
+            NativeAnchorPlan {
                 token: 4,
                 replay_to_client: false,
                 emitted_by_prefill: true,
-            })
+            }
         );
     }
 
     #[test]
-    fn native_pd_v1_keeps_the_manual_prompt_contract() {
+    fn native_pd_rejects_v1_metadata() {
         let mut req = testkit::request(vec![1, 2, 3, 4], testkit::sampled(0.0), 8);
         req.kv_transfer_params = Some(serde_json::json!({
             "openinfer_pd": {
@@ -1132,16 +1115,18 @@ mod tests {
                     "committed_len": 3,
                     "arena_count": 101,
                     "tail_len": 3,
-                    "tail_key": "00000000000000000000000000000000"
+                    "tail_key": "00000000000000000000000000000000",
+                    "anchor_token_id": 4,
+                    "anchor_emitted": true
                 }
             }
         }));
-        let handoff = native_mtp_handoff(&req)
-            .expect("valid v1 envelope")
-            .expect("native handoff");
-        assert_eq!(
-            native_anchor_plan(&req, &handoff).expect("legacy plan"),
-            None
+        let error = native_mtp_handoff(&req).expect_err("v1 must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported openinfer P/D metadata version 1"),
+            "{error:#}"
         );
     }
 

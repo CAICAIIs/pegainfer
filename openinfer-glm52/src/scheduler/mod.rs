@@ -873,6 +873,10 @@ fn submit_join_apply_prefill(
     let mut boundary_output = outputs[0].target_tokens.iter();
     let mut boundary_drafts = outputs[0].mtp_drafts.iter();
     for (slot_id, span, boundary) in scheduled {
+        // Proposals are positional batch outputs: consume one for every
+        // boundary even if that request's client disconnected. Whether the
+        // proposal is published must not shift later requests' mapping.
+        let drafts = take_boundary_drafts(boundary, &mut boundary_drafts);
         let slot = &mut slots[0][slot_id];
         let active = slot
             .as_mut()
@@ -910,10 +914,7 @@ fn submit_join_apply_prefill(
                         break;
                     }
                 }
-                if boundary
-                    && !freed
-                    && let Some(drafts) = boundary_drafts.next()
-                {
+                if !freed && let Some(drafts) = drafts {
                     let committed_len = active.kv.kv_position();
                     let tail_len = offload::native_pd_tail_len(committed_len);
                     let tail_key = if tail_len > 0 {
@@ -974,6 +975,31 @@ fn submit_join_apply_prefill(
         }
     }
     Ok(())
+}
+
+fn take_boundary_drafts<'a>(
+    boundary: bool,
+    drafts: &mut std::slice::Iter<'a, [u32; crate::mtp::GLM52_MTP_DRAFTS]>,
+) -> Option<&'a [u32; crate::mtp::GLM52_MTP_DRAFTS]> {
+    if boundary { drafts.next() } else { None }
+}
+
+#[cfg(test)]
+mod tp_prefill_output_tests {
+    use super::take_boundary_drafts;
+
+    #[test]
+    fn disconnected_boundary_does_not_shift_the_next_requests_drafts() {
+        let proposals = [
+            [11; crate::mtp::GLM52_MTP_DRAFTS],
+            [22; crate::mtp::GLM52_MTP_DRAFTS],
+        ];
+        let mut drafts = proposals.iter();
+
+        let _discarded_after_disconnect = take_boundary_drafts(true, &mut drafts);
+        assert_eq!(take_boundary_drafts(false, &mut drafts), None);
+        assert_eq!(take_boundary_drafts(true, &mut drafts), Some(&proposals[1]));
+    }
 }
 
 /// Fold every rank's span of outputs into its slot state, commit the span's
