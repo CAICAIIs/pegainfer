@@ -16,6 +16,7 @@ use fastrace::collector::SpanContext;
 use log::info;
 use log::warn;
 use openinfer_engine::engine::EngineHandle;
+use openinfer_engine::engine::FinishReason;
 use openinfer_engine::engine::GenerateRequest;
 use openinfer_engine::engine::LoadSnapshot;
 use openinfer_engine::engine::RequestAbortReason;
@@ -375,6 +376,7 @@ impl LocalEngineBridge {
             .as_ref()
             .and_then(|args| args.get("kv_transfer_params"))
             .cloned();
+        let eos_token_id = sampling_params.eos_token_id;
 
         let tag: RequestTag = Arc::from(request_id.as_str());
         let abort_reason = Arc::new(AtomicU8::new(RequestAbortReason::None as u8));
@@ -411,7 +413,10 @@ impl LocalEngineBridge {
             })
             .context("failed to submit request to scheduler")?;
 
-        streams.insert(tag, RequestStreamState::new(abort_reason, trace_root));
+        streams.insert(
+            tag,
+            RequestStreamState::new(abort_reason, trace_root, eos_token_id),
+        );
         Ok(())
     }
 }
@@ -427,6 +432,9 @@ struct RequestStreamState {
     /// P/D handoff metadata can arrive in a burst with no token or terminal
     /// event, so retain it until the next output carries it to the router.
     kv_transfer_params: Option<serde_json::Value>,
+    /// The vLLM text decoder expects a stop-finished output to end with the
+    /// terminal EOS token and removes that token from visible text.
+    eos_token_id: Option<u32>,
     abort_reason: Arc<AtomicU8>,
     has_emitted_tokens: bool,
     /// Request-lifetime root span (submit → finish). The scheduler opens
@@ -441,11 +449,12 @@ struct RequestStreamState {
 }
 
 impl RequestStreamState {
-    fn new(abort_reason: Arc<AtomicU8>, trace_root: Span) -> Self {
+    fn new(abort_reason: Arc<AtomicU8>, trace_root: Span, eos_token_id: Option<u32>) -> Self {
         Self {
             first_token_events: None,
             first_token_prefill_stats: None,
             kv_transfer_params: None,
+            eos_token_id,
             abort_reason,
             has_emitted_tokens: false,
             trace_root,
@@ -592,6 +601,19 @@ fn reduce_request(
             TokenEvent::Finished {
                 finish_reason: fr, ..
             } => {
+                // OpenInfer suppresses EOS before emitting TokenEvents, while
+                // vLLM's text decoder expects the terminal Stop output to
+                // contain EOS and unconditionally removes its final token.
+                // Without this protocol token, a speculative step that commits
+                // [visible token, EOS] loses the visible token at the frontend.
+                if fr == FinishReason::Stop
+                    && let Some(eos_token_id) = state.eos_token_id
+                {
+                    token_ids.push(eos_token_id);
+                    positions.push(PositionLogprobs {
+                        entries: Vec::new(),
+                    });
+                }
                 finish_reason = Some(convert_finish_reason(fr));
                 terminated = true;
             }

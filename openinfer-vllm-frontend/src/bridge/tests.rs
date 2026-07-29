@@ -42,11 +42,19 @@ impl Demux {
 
     /// Register a request as `start_request` does and return its abort reason.
     fn add(&mut self, id: &str) -> Arc<AtomicU8> {
+        self.add_with_eos(id, None)
+    }
+
+    fn add_with_eos(&mut self, id: &str, eos_token_id: Option<u32>) -> Arc<AtomicU8> {
         let tag: RequestTag = Arc::from(id);
         let abort_reason = Arc::new(AtomicU8::new(RequestAbortReason::None as u8));
         self.streams.insert(
             Arc::clone(&tag),
-            RequestStreamState::new(Arc::clone(&abort_reason), fastrace::Span::noop()),
+            RequestStreamState::new(
+                Arc::clone(&abort_reason),
+                fastrace::Span::noop(),
+                eos_token_id,
+            ),
         );
         abort_reason
     }
@@ -154,6 +162,37 @@ fn token_and_finish_in_one_burst_coalesce() {
     assert_eq!(direct.positions[1].entries[0].token_id, 21);
 
     assert!(d.next_output().is_none());
+}
+
+/// OpenInfer suppresses EOS at the scheduler boundary, but vLLM's text decoder
+/// removes the final token of every Stop output as the terminal stop token.
+/// Reinsert EOS so a speculative [visible token, EOS] commit does not truncate
+/// the visible suffix.
+#[test]
+fn stop_output_appends_eos_for_vllm_decoder() {
+    let mut d = Demux::new();
+    d.add_with_eos("req-stop-eos", Some(2));
+    d.emit(
+        "req-stop-eos",
+        TokenEvent::Token {
+            id: 11,
+            logprob: None,
+        },
+    );
+    d.emit(
+        "req-stop-eos",
+        TokenEvent::Finished {
+            finish_reason: FinishReason::Stop,
+            prompt_tokens: 16,
+            completion_tokens: 3,
+        },
+    );
+    assert!(d.drain());
+
+    let batch = d.next_output().expect("terminal output");
+    let output = &batch.outputs[0];
+    assert_eq!(output.new_token_ids, vec![11, 2]);
+    assert_eq!(output.finish_reason, Some(EngineCoreFinishReason::Stop));
 }
 
 /// A lone `Scheduled` (no token yet) emits nothing; its metadata waits in the
