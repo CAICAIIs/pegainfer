@@ -234,7 +234,7 @@ prepare() {
 
     ssh "$D_HOST" "docker exec $D_CONTAINER bash -lc \
         'nm -D /usr/lib/aarch64-linux-gnu/libnccl.so.2 | grep -q ncclCommQueryProperties'"
-    ssh "$D_HOST" "test -x $D_REPO/target/release/openinfer"
+    ssh "$D_HOST" "docker exec $D_CONTAINER test -x $D_REPO/target/release/openinfer"
     ssh "$P_HOST" "test -x $ROUTER_BIN"
     printf 'prepare complete\n'
 }

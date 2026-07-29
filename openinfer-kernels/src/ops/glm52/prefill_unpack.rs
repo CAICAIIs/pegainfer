@@ -80,7 +80,7 @@ mod tests {
         let packed = ctx.stream.clone_htod(&packed)?;
         let blocks = ctx.stream.clone_htod(&[0i32])?;
         let mut unpacked = ctx.stream.alloc_zeros::<bf16>(PAGE * LATENT)?;
-        glm52_prefill_unpack_pages_launch(&ctx, &packed, 576, &blocks, 1, &mut unpacked)?;
+        glm52_prefill_unpack_pages_launch(&ctx, &packed, PACKED_BYTES, &blocks, 1, &mut unpacked)?;
         let unpacked = ctx.stream.clone_dtoh(&unpacked)?;
         for token in 0..PAGE {
             for dim in 0..512 {
@@ -99,7 +99,7 @@ mod tests {
         let packed = ctx.stream.clone_htod(&vec![0x38u8; PAGE * LATENT])?;
         let blocks = ctx.stream.clone_htod(&[0i32])?;
         let mut unpacked = ctx.stream.alloc_zeros::<bf16>(PAGE * LATENT)?;
-        glm52_prefill_unpack_pages_launch(&ctx, &packed, 656, &blocks, 1, &mut unpacked)?;
+        glm52_prefill_unpack_pages_launch(&ctx, &packed, LATENT, &blocks, 1, &mut unpacked)?;
         let unpacked = ctx.stream.clone_dtoh(&unpacked)?;
         ensure!(
             unpacked.iter().all(|value| value.to_f32() == 1.0),
