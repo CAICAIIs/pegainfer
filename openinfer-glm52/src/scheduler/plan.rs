@@ -1,8 +1,12 @@
-//! Per-step planning: the global batch bucket and every rank's row list
+//! Per-step planning: each rank's own bucket and row list
 //! ([`plan_step_shapes`]), the all-ranks-or-none launch-ahead decision
 //! ([`launch_ahead_flags`]), and the rows the sampler owns instead of the
-//! fused argmax ([`collect_sampling_rows`]) — pure functions over the same
-//! fleet snapshot, so the collective-visible shapes can never disagree.
+//! fused argmax ([`collect_sampling_rows`]) — pure functions over the
+//! fleet snapshot. Buckets are rank-local (the collectives take rank-local
+//! row counts and the conservative protocol-max bound; see
+//! `docs/models/glm52/free-running-dp.md` §2); the launch-ahead lease is
+//! the one decision that must stay fleet-wide until the coordinator is
+//! split (see [`launch_ahead_flags`]).
 
 use openinfer_sample::SamplingParams;
 
@@ -35,21 +39,24 @@ pub(super) fn padding_step_kv(
     }
 }
 
-/// Every rank's forward shape for one step, decided together from the same
-/// feed-want snapshot (`wants[rank][slot]` = rows that slot can usefully
-/// fill: 0 free, 1 decode, remaining-prompt while mid-prefill).
+/// Every rank's forward shape for one step, decided from the same feed-want
+/// snapshot (`wants[rank][slot]` = rows that slot can usefully fill: 0 free,
+/// 1 decode, remaining-prompt while mid-prefill).
 ///
-/// The bucket is the smallest [`GLM52_DECODE_BUCKETS`] member covering the
-/// hungriest rank's row demand (each rank's demand = Σ wants, capped at the
-/// max bucket; never smaller than its active count — a smaller bucket would
-/// silently drop rows). Per rank, every active slot first gets one row
-/// (liveness), then the leftover bucket capacity extends mid-prefill slots
-/// into *spans* (consecutive prompt positions batched through one step),
-/// round-robin across the hungry slots so co-resident prefills drain in
-/// parallel; padding rows ride the free slots. Span rows are emitted as one
+/// Each rank's bucket is the smallest [`GLM52_DECODE_BUCKETS`] member
+/// covering ITS OWN row demand (Σ wants, capped at the max bucket; never
+/// smaller than its active count — a smaller bucket would silently drop
+/// rows). Buckets are rank-local: the MoE collectives take each rank's
+/// real row count and the conservative protocol-max GEMM bound
+/// (`ep_ranks × GLM52_MAX_BATCH_PER_RANK`), so no rank pays compute for
+/// another rank's demand (the free-running gates measured the conservative
+/// bound at zero cost — `docs/models/glm52/free-running-dp.md` §8).
+/// Per rank, every active slot first gets one row (liveness), then the
+/// leftover bucket capacity extends mid-prefill slots into *spans*
+/// (consecutive prompt positions batched through one step), round-robin
+/// across the hungry slots so co-resident prefills drain in parallel;
+/// padding rows ride the free slots. Span rows are emitted as one
 /// contiguous run per slot — the [`Glm52StepShape`] contract.
-/// Deriving the bucket and every rank's row list from the same data in one
-/// place is what keeps them consistent.
 /// `full_bucket` pins the bucket to `GLM52_MAX_BATCH_PER_RANK` regardless of
 /// demand: the TP8 replicated topology serves exactly one graph shape (the
 /// MoE phase kernels are fixed 8-row), so solo decode rides 7 padding rows
@@ -58,22 +65,18 @@ pub(super) fn plan_step_shapes(
     wants: &[[usize; GLM52_MAX_BATCH_PER_RANK]],
     full_bucket: bool,
 ) -> Vec<Glm52StepShape> {
-    let hungriest = wants
-        .iter()
-        .map(|row| row.iter().sum::<usize>().min(GLM52_MAX_BATCH_PER_RANK))
-        .max()
-        .unwrap_or(0);
-    let bucket = if full_bucket {
-        GLM52_MAX_BATCH_PER_RANK
-    } else {
-        *GLM52_DECODE_BUCKETS
-            .iter()
-            .find(|&&rows| rows >= hungriest.max(1))
-            .expect("the largest bucket covers every demand by construction")
-    };
     wants
         .iter()
         .map(|row| {
+            let demand = row.iter().sum::<usize>().min(GLM52_MAX_BATCH_PER_RANK);
+            let bucket = if full_bucket {
+                GLM52_MAX_BATCH_PER_RANK
+            } else {
+                *GLM52_DECODE_BUCKETS
+                    .iter()
+                    .find(|&&rows| rows >= demand.max(1))
+                    .expect("the largest bucket covers every demand by construction")
+            };
             let spans = plan_prefill_spans(row, bucket);
             let mut slots: [u8; GLM52_MAX_BATCH_PER_RANK] = std::array::from_fn(|slot| slot as u8);
             let mut dst = 0usize;
@@ -111,9 +114,15 @@ pub(super) fn plan_step_shapes(
 /// the current page, and the advanced step's page must already be in the
 /// uploaded block table; breaking the streak at every active row's boundary
 /// also bounds padding rows — reset to position 0 by each full prologue —
-/// inside the padding page), nothing queued, no draft round. Both are global
-/// claims: a speculative replay is a full set of collectives, so per-rank
-/// discretion would desync the pairing.
+/// inside the padding page), nothing queued, no draft round.
+///
+/// Both claims stay fleet-wide even though buckets are per-rank now: a
+/// NON-consumed speculation re-runs the step, i.e. a second full collective
+/// chain for that step, which pairs only if every rank speculated together.
+/// The lease becomes a rank-local bit only when the stale-replay-rerun path
+/// itself goes away (a free-running engine always consumes its own
+/// speculation and admits newcomers a step later) — that is migration step
+/// 2, not this one.
 ///
 /// `offload_enabled` kills the lease outright: a leased replay keeps writing
 /// KV on the rank stream for ~a step after the coordinator joined its
@@ -537,7 +546,7 @@ mod tests {
     }
 
     #[test]
-    fn bucket_is_the_smallest_covering_the_hungriest_rank() {
+    fn bucket_is_the_smallest_covering_each_ranks_own_demand() {
         assert_eq!(
             forwarded(&plan_step_shapes(&decode_wants(&[0, 0]), false)),
             vec![(1, vec![0]), (1, vec![0])]
@@ -546,15 +555,16 @@ mod tests {
             forwarded(&plan_step_shapes(&decode_wants(&[1; 8]), false)),
             vec![(1, vec![0]); 8]
         );
-        // One rank at two requests lifts EVERY rank to the 2-row bucket —
-        // idle ranks pad with free slots.
+        // Buckets are rank-local: one rank at two requests does NOT lift its
+        // idle peer — the collectives take rank-local row counts under the
+        // protocol-max bound, so nobody pays for another rank's demand.
         assert_eq!(
             forwarded(&plan_step_shapes(&decode_wants(&[2, 1]), false)),
-            vec![(2, vec![0, 1]), (2, vec![0, 1])]
+            vec![(2, vec![0, 1]), (1, vec![0])]
         );
         assert_eq!(
-            forwarded(&plan_step_shapes(&decode_wants(&[3, 1]), false))[0],
-            (4, vec![0, 1, 2, 3])
+            forwarded(&plan_step_shapes(&decode_wants(&[3, 1]), false)),
+            vec![(4, vec![0, 1, 2, 3]), (1, vec![0])]
         );
         // Past the 4-row bucket the full batch takes over.
         assert_eq!(
@@ -565,14 +575,15 @@ mod tests {
 
     #[test]
     fn partial_buckets_pack_actives_first() {
-        // A rank holding slots {1, 5} forwards them in rows 0..2; the padding
-        // rows (bucket 4) ride on the lowest free slots.
+        // A rank holding slots {1, 5} forwards them in rows 0..2 in its own
+        // bucket-2 shape; its peer's 3 actives ride a bucket-4 shape whose
+        // padding row lands on the lowest free slot.
         let mut holey = decode_wants(&[0, 3]);
         holey[0][1] = 1;
         holey[0][5] = 1;
         assert_eq!(
             forwarded(&plan_step_shapes(&holey, false)),
-            vec![(4, vec![1, 5, 0, 2]), (4, vec![0, 1, 2, 3])]
+            vec![(2, vec![1, 5]), (4, vec![0, 1, 2, 3])]
         );
         let mut deep = decode_wants(&[5, 0]);
         deep[0][0] = 0;
@@ -586,7 +597,8 @@ mod tests {
     #[test]
     fn prefill_want_extends_one_slot_into_a_span() {
         // A lone mid-prefill request with plenty of prompt left fills the
-        // whole max bucket with its span; idle ranks pad.
+        // whole max bucket with its span; the idle rank keeps its own
+        // bucket-1 shape.
         let mut wants = decode_wants(&[0, 0]);
         wants[0][2] = 3000;
         let shapes = plan_step_shapes(&wants, false);
@@ -595,10 +607,7 @@ mod tests {
             (8, vec![2, 2, 2, 2, 2, 2, 2, 2]),
             "one hungry slot owns every row of the max bucket"
         );
-        assert_eq!(
-            forwarded(&shapes)[1],
-            (8, (0..8).map(|s| s as u8).collect())
-        );
+        assert_eq!(forwarded(&shapes)[1], (1, vec![0]));
 
         // A short prompt remainder only lifts the bucket as far as needed.
         let mut wants = decode_wants(&[0, 0]);

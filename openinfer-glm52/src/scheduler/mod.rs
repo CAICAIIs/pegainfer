@@ -11,19 +11,21 @@
 //! can never run out of pages mid-request, and released requests' sealed
 //! blocks stay matchable as the prefix cache.
 //!
-//! Every global step ALL ranks run the full-model forward simultaneously with
-//! the SAME batch bucket — ranks feed each active slot's *span* of next
-//! tokens (mid-prefill slots batch up to a bucket of consecutive prompt
+//! Every global step ALL ranks run the full-model forward simultaneously,
+//! each with its OWN batch bucket — ranks feed each active slot's *span* of
+//! next tokens (mid-prefill slots batch up to a bucket of consecutive prompt
 //! positions through one step; decode slots feed one row), idle slots feed a
-//! padding row whose output is discarded. This satisfies the DeepEP contract
-//! that every rank enters every MoE layer's dispatch/combine collective with
-//! the agreed global row count. The bucket is the smallest member of
-//! `GLM52_DECODE_BUCKETS` covering the hungriest rank's row demand, so the
-//! fleet pays for prefill only while someone is prefilling and returns to the
-//! cheap 1-row bucket for pure decode. Requests join and leave slots at step
-//! boundaries (continuous batching). The vLLM frontend assigns HTTP requests
-//! least-load-first to rank-owned queues, so decode-only fleets leave the
-//! 1-row bucket only past `GLM52_EP_RANKS` concurrent requests.
+//! padding row whose output is discarded. The DeepEP contract is that every
+//! rank enters every MoE layer's dispatch/combine collective — the pairing
+//! is by count, not by shape: dispatch takes rank-local row counts, and the
+//! GEMM tile bound is the conservative protocol max (measured at zero cost —
+//! `docs/models/glm52/free-running-dp.md` §8). Each rank's bucket is the
+//! smallest member of `GLM52_DECODE_BUCKETS` covering ITS row demand, so a
+//! rank pays for prefill only while it is prefilling and no rank pays for
+//! another's. Requests join and leave slots at step boundaries (continuous
+//! batching). The vLLM frontend assigns HTTP requests least-load-first to
+//! rank-owned queues, so decode-only fleets leave the 1-row bucket only past
+//! `GLM52_EP_RANKS` concurrent requests.
 //!
 //! The per-request decisions (what to feed next, what a step's output means)
 //! live in [`Glm52SlotState`] as pure data transitions, and the
@@ -423,10 +425,10 @@ pub(crate) fn run_dp8_coordinator(
             continue;
         }
 
-        // One lock-step step: every rank forwards the SAME bucket — each
+        // One lock-step step: every rank forwards its OWN bucket — each
         // active slot's span of consecutive next tokens, padding rows on the
-        // free slots — and all responses are joined before any output is
-        // interpreted.
+        // free slots; the collectives pair on count, not shape — and all
+        // responses are joined before any output is interpreted.
         let shapes = plan_step_shapes(&feed_wants(&slots), full_bucket);
         let flags = if prefill_only {
             Glm52StepFlags {

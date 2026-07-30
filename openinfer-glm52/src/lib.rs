@@ -14,6 +14,8 @@ mod dspark;
 #[cfg(test)]
 mod dspark_smoke;
 mod fp8;
+#[cfg(test)]
+mod freerun_probe;
 mod indexer;
 #[cfg(test)]
 mod indexer_smoke;

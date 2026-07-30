@@ -59,9 +59,10 @@ pub(crate) struct Glm52RankWeightLoadReport {
     pub(crate) free_vram_bytes: usize,
 }
 
-/// The coordinator's launch-ahead directives for one step — both are GLOBAL
-/// claims (a speculative replay is a full set of collectives, so ranks must
-/// act on them together or not at all).
+/// The coordinator's launch-ahead directives for one step — both stay
+/// fleet-wide until the coordinator split: a NON-consumed speculation
+/// re-runs the step (a second full collective chain), which pairs only if
+/// every rank speculated together (see `plan::launch_ahead_flags`).
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Glm52StepFlags {
     /// This step IS the speculative replay every rank enqueued last step.
@@ -180,54 +181,23 @@ pub(crate) struct Glm52MtpAppend {
     pub(crate) pages: Vec<i32>,
 }
 
-/// One rank's work in a fleet-wide native-MTP round. The coordinator selects
-/// the same variant for every EP rank, including empty ranks, so no worker can
-/// skip a collective entered by its peers.
+/// One rank's work in one native-MTP round. Native MTP is an EP collective
+/// (layer 78 is a MoE layer), and its collective chain is FIXED: every rank
+/// runs one context forward plus `GLM52_MTP_DRAFTS - 1` proposal forwards
+/// every round — rank-local buckets, deterministic padding rows for work it
+/// doesn't have — so the per-step collective count never depends on host
+/// state (the free-running fixed-chain discipline,
+/// `docs/models/glm52/free-running-dp.md` §4).
 #[derive(Debug)]
-pub(crate) enum Glm52MtpRound {
-    Reset {
-        resets: Vec<usize>,
-    },
-    Context {
-        source_bucket: usize,
-        context_bucket: usize,
-        resets: Vec<usize>,
-        appends: Vec<Glm52MtpAppend>,
-    },
-    Propose {
-        source_bucket: usize,
-        context_bucket: usize,
-        draft_bucket: usize,
-        resets: Vec<usize>,
-        appends: Vec<Glm52MtpAppend>,
-        proposal_slots: Vec<usize>,
-    },
-}
-
-impl Glm52MtpRound {
-    pub(crate) fn resets(&self) -> &[usize] {
-        match self {
-            Self::Reset { resets }
-            | Self::Context { resets, .. }
-            | Self::Propose { resets, .. } => resets,
-        }
-    }
-
-    pub(crate) fn source_bucket(&self) -> Option<usize> {
-        match self {
-            Self::Reset { .. } => None,
-            Self::Context { source_bucket, .. } | Self::Propose { source_bucket, .. } => {
-                Some(*source_bucket)
-            }
-        }
-    }
-
-    pub(crate) fn appends(&self) -> &[Glm52MtpAppend] {
-        match self {
-            Self::Reset { .. } => &[],
-            Self::Context { appends, .. } | Self::Propose { appends, .. } => appends,
-        }
-    }
+pub(crate) struct Glm52MtpRound {
+    /// Bucket of the target step this rank just ran — selects the retained
+    /// final-normalized hidden buffer the appends read from.
+    pub(crate) source_bucket: usize,
+    pub(crate) context_bucket: usize,
+    pub(crate) draft_bucket: usize,
+    pub(crate) resets: Vec<usize>,
+    pub(crate) appends: Vec<Glm52MtpAppend>,
+    pub(crate) proposal_slots: Vec<usize>,
 }
 
 enum Glm52RankCommand {
@@ -262,10 +232,10 @@ enum Glm52RankCommand {
     /// One lock-step full-model step (75 MoE collectives inside): feed
     /// `inputs[row]` per forwarded row (a slot's span rows walk consecutive
     /// positions), reply with the next token per ROW (greedy argmax, or a
-    /// sampling pass for the rows in `sampling`). The coordinator
-    /// sends this to every rank each global step with the SAME batch bucket
-    /// in `shape` (the collectives require every rank to agree on the step's
-    /// global row count) — padding rows ride free slots and their outputs
+    /// sampling pass for the rows in `sampling`). The coordinator sends this
+    /// to every rank each global step; `shape.bucket` is rank-local (the MoE
+    /// collectives take rank-local row counts under the conservative
+    /// protocol-max bound) — padding rows ride free slots and their outputs
     /// are discarded.
     Step {
         inputs: Box<[(u32, usize); GLM52_MAX_BATCH_PER_RANK]>,
@@ -1154,7 +1124,7 @@ impl Glm52RankThreadState {
             .runtime
             .as_mut()
             .context("GLM5.2 step before build_model")?;
-        runtime.model.decode_step(
+        let outputs = runtime.model.decode_step(
             &dev_ctx,
             &runtime.aux_ctx,
             runtime.ep8.as_mut(),
@@ -1165,7 +1135,20 @@ impl Glm52RankThreadState {
             flags,
             sampling,
             seed,
-        )
+        )?;
+        #[cfg(test)]
+        if crate::freerun_probe::enabled() {
+            let (topk_idx, topk_weight_bits) =
+                runtime.model.probe_step_route(&dev_ctx, shape.bucket)?;
+            crate::freerun_probe::record_step_route(crate::freerun_probe::StepRouteRecord {
+                rank: self.placement.rank,
+                bucket: shape.bucket,
+                active_rows: shape.active_rows,
+                topk_idx,
+                topk_weight_bits,
+            });
+        }
+        Ok(outputs)
     }
 
     fn prefill_chunk(&mut self, batch: &Glm52PrefillBatch) -> Result<Glm52PrefillOutput> {

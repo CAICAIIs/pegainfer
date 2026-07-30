@@ -325,8 +325,8 @@ pub(crate) struct Glm52RankModel {
     /// bytes; TP4 FlashInfer uses the standard 576-byte E4M3 layout.
     mla_cache_bytes_per_token: usize,
     /// EP rank count of the launch topology (8 for EP8, 4 for EP4, 1 for the
-    /// tensor-replicated topologies): the factor between a step's per-rank
-    /// bucket and the MoE collectives' agreed `global_tokens`.
+    /// tensor-replicated topologies): the factor between the per-rank batch
+    /// cap and the MoE collectives' protocol-max `global_tokens` bound.
     ep_ranks: usize,
     /// Built with `--moe-topo tp`: every MoE arm is `MoeTp`, bucket-8
     /// steps are span steps (all 8 rows one owner rank), and the
@@ -965,7 +965,7 @@ impl Glm52RankModel {
             .context("GLM5.2 TP4 prefill proposal exceeds decode bucket capacity")?;
         mtp.reset_slots(&proposal_slots)?;
         mtp.resume_reset_slots(&proposal_slots, &appends)?;
-        let round = crate::runner::Glm52MtpRound::Propose {
+        let round = crate::runner::Glm52MtpRound {
             source_bucket: bucket,
             context_bucket: bucket,
             draft_bucket: bucket,
@@ -1009,21 +1009,14 @@ impl Glm52RankModel {
         tp: Option<&mut Glm52MoeTpRank>,
         round: &crate::runner::Glm52MtpRound,
     ) -> Result<Vec<[u32; crate::mtp::GLM52_MTP_DRAFTS]>> {
-        let Some(source_bucket) = round.source_bucket() else {
-            self.mtp
-                .as_mut()
-                .context("GLM5.2 native MTP command reached a model without MTP weights")?
-                .reset_slots(round.resets())?;
-            return Ok(Vec::new());
-        };
         let source_index = self
             .buckets
             .iter()
-            .position(|bucket| bucket.rows == source_bucket)
+            .position(|bucket| bucket.rows == round.source_bucket)
             .with_context(|| {
                 format!(
-                    "GLM5.2 MTP source bucket {source_bucket} is not in \
-                     {GLM52_DECODE_BUCKETS:?}"
+                    "GLM5.2 MTP source bucket {} is not in {GLM52_DECODE_BUCKETS:?}",
+                    round.source_bucket
                 )
             })?;
         // Official vLLM feeds MTP the target model return, which is after
@@ -1034,8 +1027,8 @@ impl Glm52RankModel {
             .mtp
             .as_mut()
             .context("GLM5.2 native MTP command reached a model without MTP weights")?;
-        mtp.reset_slots(round.resets())?;
-        mtp.resume_reset_slots(round.resets(), round.appends())?;
+        mtp.reset_slots(&round.resets)?;
+        mtp.resume_reset_slots(&round.resets, &round.appends)?;
         mtp.propose(
             ctx,
             aux,
@@ -1246,6 +1239,38 @@ impl Glm52RankModel {
         Ok(())
     }
 
+    /// Test probe (free-running gate 4): D2H the last routed MoE layer's
+    /// top-k output for one bucket's rows. The decode scratch is shared by
+    /// every layer, so this is the layer-77 routing — a byte-constancy
+    /// witness that transitively covers the whole step upstream of it
+    /// (indexer seq_len=1, fp8 quant, attention, all 74 earlier routers).
+    #[cfg(test)]
+    pub(crate) fn probe_step_route(
+        &self,
+        ctx: &DeviceContext,
+        bucket_rows: usize,
+    ) -> Result<(Vec<i32>, Vec<u32>)> {
+        let bucket = self
+            .buckets
+            .iter()
+            .find(|bucket| bucket.rows == bucket_rows)
+            .with_context(|| format!("GLM5.2 route probe: unknown bucket {bucket_rows}"))?;
+        let rows = bucket_rows * crate::config::GLM52_TOPK;
+        let idx = ctx
+            .stream
+            .clone_dtoh(&bucket.scratch.router.route.topk_idx)?;
+        let weight = ctx
+            .stream
+            .clone_dtoh(&bucket.scratch.router.route.topk_weight)?;
+        Ok((
+            idx[..rows.min(idx.len())].to_vec(),
+            weight[..rows.min(weight.len())]
+                .iter()
+                .map(|w| w.to_bits())
+                .collect(),
+        ))
+    }
+
     /// The non-leased step path: validate the shape, rewrite every per-step
     /// device input buffer from the coordinator's `inputs`, and run (or lazily
     /// capture) the whole-step graph for the step's bucket × tier.
@@ -1377,11 +1402,15 @@ impl Glm52RankModel {
             block_table: &bucket.block_table,
             seq_lens: &self.seq_lens,
         };
-        // Every rank must pass the same global token count into the MoE
-        // collectives — guaranteed by the coordinator agreeing the bucket.
-        // (`ep_ranks` is 1 on tensor-replicated topologies, where the value
-        // is never consumed.)
-        let global_tokens = self.ep_ranks * batch;
+        // The MoE collectives take this rank's real row count plus a GEMM
+        // tile bound that only has to be conservative — every rank passes the
+        // protocol max (`ep_ranks × GLM52_MAX_BATCH_PER_RANK`) so the bound
+        // never depends on other ranks' buckets. Measured at zero cost vs the
+        // tight bound (free-running gate 3, `docs/models/glm52/
+        // free-running-dp.md` §8); the recv-side truth comes from the device
+        // expert counts, not this value. (`ep_ranks` is 1 on
+        // tensor-replicated topologies, where the value is never consumed.)
+        let global_tokens = self.ep_ranks * GLM52_MAX_BATCH_PER_RANK;
 
         let s = &mut bucket.scratch;
         let decode_lm_head = self.decode_lm_head.as_ref().unwrap_or(&self.lm_head);

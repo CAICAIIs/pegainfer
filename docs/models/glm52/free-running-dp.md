@@ -1,14 +1,16 @@
 # GLM5.2 free-running DP:删除协调者的架构设计
 
-> **TL;DR:** 设计文档(未实现)。EP16 P/D 难支持暴露的不是 P/D 问题,是 DP 架构问题:现在的
+> **TL;DR:** EP16 P/D 难支持暴露的不是 P/D 问题,是 DP 架构问题:现在的
 > DP 只切了状态没切控制,每个 rank-local 异步事实(P/D pull、offload、断连)都要经协议送回中央
 > coordinator 才能生效,于是每个新 feature 都在给中心发明新协议(rank-host、Event plane)。
 > 本设计把 coordinator 删除:每个 DP rank 是完整独立 engine(自己的 scheduler/BlockPool/HTTP
 > endpoint),loop 无条件全速跑,唯一耦合是固定节拍的 DeepEP collective 链本身。换来的义务是
 > 三条静态纪律(固定链、保守 bound、padding 即协议)。**§8 gate 1–3 已在 GB300 tray03 全部
 > GO(2026-07-30):跨 rank 流量不变性 bit-exact、异构 token 数 graph 回放 bit-exact、
-> 保守 bound 税 = 0(180.9 vs 180.2 µs/层)。** 方向放行,进入 §10 迁移第 1 步。
-> 取代 `cross-node-scaling.md` 的 Event plane 与 SMR 方向(该文档的 NVL72 实测数据仍有效)。
+> 保守 bound 税 = 0(180.9 vs 180.2 µs/层)。§10 迁移第 1 步已实装(per-rank bucket、
+> 协议最大 global_tokens、MTP 固定链;lease 暂保持全局,理由见 §10),gate 4/5 待 GPU
+> 实测。** 取代 `cross-node-scaling.md` 的 Event plane 与 SMR 方向(该文档的 NVL72 实测
+> 数据仍有效)。
 >
 > **Last touched:** 2026-07
 
@@ -216,15 +218,21 @@ done
    device 侧 psum 决定)。原判读标准(≤0.5ms/step → go)以最强形式满足,"per-rank
    静态 bound 档位"退让方案不需要。EP16 复测仍保留(shim 常量不同),但 EP4 的零税
    使不同结论的先验概率很低。
-4. **Padding 字节恒定(未实现,需 engine 级 harness)。** 同一 rank 以
-   `GLM52_PADDING_STEP` 输入空转 N ≥ 64 步,每步 D2H 抓 router 输出。**验收:
-   `topk_idx`/`topk_weight` 字节逐步恒定**,覆盖 indexer seq_len=1 与 fp8 quant 环节。
-   实现挂在迁移第 1 步(whole-step 路径上加 probe),因为它测的是完整 step 的 padding
-   行,不是孤立 kernel。
-5. **MTP 固定链(未实现,需 layer-78 harness)。** per-rank context/draft 行数不等 +
-   空 rank padding 下 layer-78 五个 forward 的正确性(对 `oracle/mtp.rs` 既有 probe),
-   加 Reset/Context 工况强制跑满 5 forward 的开销测量。**验收:probe 过 + 空 round
-   开销 ≤ 0.5 ms**(预期是零头,须实测)。同样挂迁移第 1 步。
+4. **`freerun_padding_byte_constancy_gate` — padding 字节恒定(`oracle/freerun_step.rs`,
+   待 GPU 实测)。** EP4 引擎真实 launch:rank 0 跑一条 sampled 请求(sampled 挡住
+   launch-ahead lease,每步走完整 prologue——被测对象正是 `GLM52_PADDING_STEP` 契约),
+   rank 1–3 全程空转 ≥ 64 步。每步从生产 step 路径 D2H 最后一层 routed MoE 的
+   `topk_idx`/`topk_weight`(probe 挂在 `runner::step`,`freerun_probe.rs`)。**验收:
+   空 rank 每个 bucket 分组内字节逐步恒定**,覆盖 indexer seq_len=1 与 fp8 quant 环节。
+   (leased replay 的 padding 行按设计自喂,其 wire 字节演化由 lease 不变量守护,
+   不在本 gate 范围。)
+5. **`freerun_mtp_fixed_chain_gate` — MTP 固定链(`oracle/freerun_step.rs`,待 GPU
+   实测)。** 固定链已实装:`select_round_kind` 与全局 bucket 协商已删除,每 rank 每
+   round 无条件跑 context + 4 个 proposal forward,空 rank 以 padding 进场(零 append
+   的 round 会显式清零 `previous` padding 行——capture buffer 残值不上 wire)。gate 两
+   阶段:A 阶段 rank 0 独自 decode(rank 1–3 空,每 round 三个全 padding rank),B 阶段
+   四 rank 全忙且 rank 0 重复同一请求。**验收:rank 0 两阶段轨迹逐 token 相同(gate 1
+   流量不变性的 whole-step 版)+ 空 round 均值开销 ≤ 0.5 ms(对全忙基线)。**
 
 **Pitfall(实测踩中):DeepEP context 是一进程一次性的。** 三个 gate 在同一个 test
 进程串行时,第二个 gate 的 `ctx_create` 撞 NVLink barrier timeout →
@@ -250,8 +258,20 @@ return all hosted GPU state; process exit is the release mechanism")。gate 必�
 
 不 big-bang。gates 绿后两步:
 
-1. **协议先变,结构后变**:保留 coordinator 的壳,把 bucket、lease、MTP round 全部
-   per-rank 化(kernel 侧已按 gate 验证支持)。每步有现有 golden/e2e gate 兜底。
+1. **协议先变,结构后变(已实装,待 GPU 验证)**:保留 coordinator 的壳,协议全部
+   per-rank 化——
+   - `plan_step_shapes`:每 rank 的 bucket 只看自己的 demand(hungriest-rank max 删除;
+     TP8 的 `full_bucket` 钉死不变);
+   - `global_tokens`:`model/mod.rs` 与 `model/mtp.rs` 统一改为协议最大值
+     `ep_ranks × GLM52_MAX_BATCH_PER_RANK`(gate 3 的零税结果直接授权);
+   - MTP round:`select_round_kind` + `source_bucket` 跨 rank ensure + 全局 bucket max
+     删除;`Glm52MtpRound` 从三变体 enum 收敛为单结构体,每 rank 每 round 无条件跑
+     固定链,padding 行显式清零;
+   - launch-ahead lease/consume **保持全局**:未 consume 的 speculation 会把该步重跑
+     一遍(第二条完整 collective 链),只有全员一起投机才配对。lease 变 rank-local bit
+     的前提是"stale-replay 重跑路径消失",那是第 2 步拆壳后的事(自治 engine 永远
+     consume 自己的投机)。
+   每步有现有 golden/e2e gate 兜底;gate 4/5(§8)在 whole-step 路径上验收本步。
 2. **拆壳**:coordinator 循环拆成 N 个 engine 线程,各自挂 HTTP endpoint;bootstrap
    rendezvous 收编启动逻辑。跨节点 = 同一 binary 每节点一进程。
 
@@ -264,6 +284,6 @@ load-bearing。被本设计取代的部分:framed-TCP rank-host 作为**长期�
 
 ## Next step
 
-Gate 1–3 已 GO(§8)。下一步是 §10 迁移第 1 步:保留 coordinator 壳,把 bucket、
-lease、MTP round per-rank 化,并在 whole-step 路径上补 gate 4(padding 字节恒定)
-和 gate 5(MTP 固定链)的 probe。EP16 的 bound-tax 复测挂在第一次跨 tray 部署时顺带跑。
+迁移第 1 步已实装(§10)。下一步:tray03 跑既有 GPU gates(`hf_golden`/`mtp_production`/
+freerun 1–3 回归)+ 新 gate 4/5,全绿后进入 §10 第 2 步拆壳。EP16 的 bound-tax 复测挂在
+第一次跨 tray 部署时顺带跑。
