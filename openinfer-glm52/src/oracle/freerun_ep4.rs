@@ -20,6 +20,12 @@
 //!    The delta × 75 MoE layers is the per-step tax of deleting the global
 //!    bucket agreement; the number feeds the design's go/no-go, so this
 //!    probe prints measurements and never asserts.
+//!
+//! Run each gate in its OWN `cargo test` process: the DeepEP context is
+//! once-per-process on this shim (a second `ctx_create` after a destroy
+//! hits an NVLink barrier timeout — the rank-host contract's "process exit
+//! is the release mechanism"). Results 2026-07-30 on GB300 tray03 (all GO)
+//! are recorded in `docs/models/glm52/free-running-dp.md` §8.
 
 use std::sync::Arc;
 use std::time::Instant;

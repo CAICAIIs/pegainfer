@@ -5,8 +5,9 @@
 > coordinator 才能生效,于是每个新 feature 都在给中心发明新协议(rank-host、Event plane)。
 > 本设计把 coordinator 删除:每个 DP rank 是完整独立 engine(自己的 scheduler/BlockPool/HTTP
 > endpoint),loop 无条件全速跑,唯一耦合是固定节拍的 DeepEP collective 链本身。换来的义务是
-> 三条静态纪律(固定链、保守 bound、padding 即协议)和 §8 的 go/no-go gates——前三个已实现
-> (`oracle/freerun_ep4.rs`,EP4 单 tray 可跑),等 NVL72 出数。
+> 三条静态纪律(固定链、保守 bound、padding 即协议)。**§8 gate 1–3 已在 GB300 tray03 全部
+> GO(2026-07-30):跨 rank 流量不变性 bit-exact、异构 token 数 graph 回放 bit-exact、
+> 保守 bound 税 = 0(180.9 vs 180.2 µs/层)。** 方向放行,进入 §10 迁移第 1 步。
 > 取代 `cross-node-scaling.md` 的 Event plane 与 SMR 方向(该文档的 NVL72 实测数据仍有效)。
 >
 > **Last touched:** 2026-07
@@ -186,32 +187,35 @@ Free-running 后 padding row 从"本地丢弃的废行"升级为**协议表面**
 
 ## 8. Go/no-go kernel gates(先于任何架构代码)
 
-前三个 gate 已实现于 `openinfer-glm52/src/oracle/freerun_ep4.rs`,按 EP4 形状写(一个
-GB300 NVL72 tray = 4 GPU,走 weight-only 链——正是 NVL72 上的生产链)。运行:
+**结果(2026-07-30,GB300 tray03 单 tray 4 GPU,`susun-dev`,commit `16d95344`):
+gate 1–3 全部 GO。** 前三个 gate 实现于 `openinfer-glm52/src/oracle/freerun_ep4.rs`,
+按 EP4 形状写(一个 GB300 NVL72 tray = 4 GPU,走 weight-only 链——正是 NVL72 上的
+生产链)。运行(**每个 gate 必须单独一个进程**,见下面的 pitfall):
 
 ```bash
-OPENINFER_TEST_MODEL_PATH=/path/to/GLM-5.2-FP8 \
-  cargo test --release -p openinfer-glm52 --lib oracle::freerun_ep4 -- --ignored --nocapture --test-threads 1
+for g in freerun_hetero_traffic_gate freerun_hetero_graph_gate freerun_bound_tax_probe; do
+  OPENINFER_TEST_MODEL_PATH=/mnt/shared/weights/GLM-5.2-FP8 EP_DISABLE_GIN=1 \
+    cargo test --release -p openinfer-glm52 --lib "$g" -- --ignored --nocapture
+done
 ```
 
-1. **`freerun_hetero_traffic_gate` — 跨 rank 流量不变性。** 同一组 DeepEP context 跑两遍
-   layer-6 oracle walk:pass A 旁路 rank 全部 token-less(现有 oracle gate 的形状),
-   pass B 旁路 rank 每 position 推 0..=8 个变化的 token 数(混合 dispatch 与 token-less
-   entry)。**验收:rank 0 两遍都过 oracle probes,且两遍输出逐值 bit-identical**——
-   free-running 的核心主张"一个 rank 的行的计算与别人的流量无关"就是这一条。任何一个
-   bit 抖动都是 no-go(意味着 recv 残值或路由串扰会随流量泄漏)。
-2. **`freerun_hetero_graph_gate` — 异构 token 数的 graph 回放。** 4 个 rank 各自以
-   不同 token 数(1/2/4/8)capture routed 链(dispatch→tiles→GEMMs→combine)的 CUDA
-   graph 并回放 16 次。**验收:每次回放的 combined 行与该 rank 的 eager 参考
-   bit-identical。** 这是"不同 rank 回放不同 bucket 的 graph"主张的 kernel 层证明;
-   whole-step graph(含 attention/采样)的同类验证留到迁移第 1 步的 e2e gate。
-3. **`freerun_bound_tax_probe` — 保守 bound 的性能税,只测量不断言。** 每 rank 1 token
-   的 steady-decode 形状,`global_tokens` 分别取 tight(今日 bucket-1 协商值 = 4)与
-   protocol-max(32),各 256 次取每层调用均值,×75 层折算 per-step 税。**判读标准
-   (在此拍板):税 ≤ 0.5 ms/step(≈ 当前 ~23 ms step 的 2%)→ go,直接用保守 bound;
-   0.5–2 ms → go,但架构里保留一个"per-rank 静态 bound 档位"(按本 rank max batch 推,
-   仍无需协商);> 2 ms → no-go,回到本文档谈退让。** EP4 的 32-token bound 已是
-   EP16/EP32 更大 bound 的方向性信号,EP16 上须复测(shim 常量不同)。
+1. **`freerun_hetero_traffic_gate` — 跨 rank 流量不变性。✅ PASS。** 同一组 DeepEP
+   context 跑两遍 layer-6 oracle walk:pass A 旁路 rank 全 token-less,pass B 旁路
+   rank 每 position 推 0..=8 变化 token 数。验收:两遍都过 oracle probes,且 rank 0
+   两遍输出逐值 bit-identical。实测:quiet 与 hetero 各 63/64 probes(同一个已知
+   router tie-flip outlier,与既有 EP4 oracle gate 一致),200×6144 个输出值零 bit
+   抖动——"一个 rank 的行的计算与别人的流量无关"成立。
+2. **`freerun_hetero_graph_gate` — 异构 token 数的 graph 回放。✅ PASS。** 4 个 rank
+   各以不同 token 数(1/2/4/8)capture routed 链的 CUDA graph 并回放 16 次,每次
+   combined 输出与 eager 参考 bit-identical。whole-step graph(含 attention/采样)的
+   同类验证留到迁移第 1 步的 e2e gate。
+3. **`freerun_bound_tax_probe` — 保守 bound 的性能税。✅ GO,税 = 0。** 每 rank
+   1 token 的 steady-decode 形状,256 次均值:tight(`global_tokens=4`)180.9 µs/层,
+   protocol-max(=32)180.2 µs/层——**差异在噪声内,方向还是反的**。整条 weight-only
+   链对 `global_tokens` 不敏感(它只收紧 tiles kernel 的扫描上界,GEMM 工作量由
+   device 侧 psum 决定)。原判读标准(≤0.5ms/step → go)以最强形式满足,"per-rank
+   静态 bound 档位"退让方案不需要。EP16 复测仍保留(shim 常量不同),但 EP4 的零税
+   使不同结论的先验概率很低。
 4. **Padding 字节恒定(未实现,需 engine 级 harness)。** 同一 rank 以
    `GLM52_PADDING_STEP` 输入空转 N ≥ 64 步,每步 D2H 抓 router 输出。**验收:
    `topk_idx`/`topk_weight` 字节逐步恒定**,覆盖 indexer seq_len=1 与 fp8 quant 环节。
@@ -222,8 +226,12 @@ OPENINFER_TEST_MODEL_PATH=/path/to/GLM-5.2-FP8 \
    加 Reset/Context 工况强制跑满 5 forward 的开销测量。**验收:probe 过 + 空 round
    开销 ≤ 0.5 ms**(预期是零头,须实测)。同样挂迁移第 1 步。
 
-Gate 1–3 是 NVL72 上的第一批活;3 的数字出来前不写任何架构代码。任何一个 no-go
-(尤其 gate 3 的性能税)→ 回到本文档谈退让方案,不带着伤上路。
+**Pitfall(实测踩中):DeepEP context 是一进程一次性的。** 三个 gate 在同一个 test
+进程串行时,第二个 gate 的 `ctx_create` 撞 NVLink barrier timeout →
+`unspecified launch failure`——与 rank-host 契约记录一致("worker drop does not
+return all hosted GPU state; process exit is the release mechanism")。gate 必须
+每个单独一个 `cargo test` 进程。这也是 free-running 架构的一条部署事实:engine
+进程的生命周期 = DeepEP context 的生命周期,重启即换进程。
 
 ## 9. 代码映射(删多于加)
 
@@ -256,5 +264,6 @@ load-bearing。被本设计取代的部分:framed-TCP rank-host 作为**长期�
 
 ## Next step
 
-在 NVL72 上跑 gate 1–3(`oracle::freerun_ep4`,单 tray 4 GPU 即可,命令见 §8)。
-Gate 3 的税数字对照 §8 的判读标准拍板 go/no-go;go 则进入 §10 迁移第 1 步。
+Gate 1–3 已 GO(§8)。下一步是 §10 迁移第 1 步:保留 coordinator 壳,把 bucket、
+lease、MTP round per-rank 化,并在 whole-step 路径上补 gate 4(padding 字节恒定)
+和 gate 5(MTP 固定链)的 probe。EP16 的 bound-tax 复测挂在第一次跨 tray 部署时顺带跑。
