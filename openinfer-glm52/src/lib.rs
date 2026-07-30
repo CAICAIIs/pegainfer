@@ -1220,7 +1220,11 @@ fn build_rank_models(
         })
         .collect::<Result<Vec<_>>>()?;
     let mut rank_arenas = Vec::with_capacity(responses.len());
-    for (rank, response) in responses.into_iter().enumerate() {
+    for (local_index, response) in responses.into_iter().enumerate() {
+        // Label with the global rank, not the local worker slot — on a
+        // multi-process fleet every process would otherwise call its first
+        // worker "rank 0".
+        let rank = ranks.start + local_index;
         rank_arenas.push(
             response
                 .recv()
@@ -1257,7 +1261,8 @@ fn build_rank_models(
         .iter()
         .map(|worker| worker.setup_comm_async(unique_id, moe_topo, tp_exchange.clone()))
         .collect::<Result<Vec<_>>>()?;
-    for (rank, response) in responses.into_iter().enumerate() {
+    for (local_index, response) in responses.into_iter().enumerate() {
+        let rank = ranks.start + local_index;
         response
             .recv()
             .map_err(|_| anyhow::anyhow!("GLM5.2 rank {rank} dropped its comm-setup response"))??;
@@ -1519,7 +1524,11 @@ fn load_rank_weights_to_gpu(
         .map(|worker| worker.load_weights_async(model_path, moe_topo, weight_staging))
         .collect::<Result<Vec<_>>>()?;
     let mut reports = Vec::with_capacity(load_results.len());
-    for (rank, rx) in load_results.into_iter().enumerate() {
+    for (local_index, rx) in load_results.into_iter().enumerate() {
+        // `report.rank` is the global fleet rank; the enumerate index is only
+        // this process's worker slot, so recompute the rank from the hosted
+        // range before validating (matters when ranks.start != 0).
+        let rank = startup.ranks.start + local_index;
         let report = rx
             .recv()
             .map_err(|_| anyhow::anyhow!("GLM5.2 rank {rank} worker dropped load response"))??;
