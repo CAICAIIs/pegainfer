@@ -5,12 +5,12 @@
 > coordinator 才能生效,于是每个新 feature 都在给中心发明新协议(rank-host、Event plane)。
 > 本设计把 coordinator 删除:每个 DP rank 是完整独立 engine(自己的 scheduler/BlockPool/HTTP
 > endpoint),loop 无条件全速跑,唯一耦合是固定节拍的 DeepEP collective 链本身。换来的义务是
-> 三条静态纪律(固定链、保守 bound、padding 即协议)。**§8 gate 1–3 已在 GB300 tray03 全部
-> GO(2026-07-30):跨 rank 流量不变性 bit-exact、异构 token 数 graph 回放 bit-exact、
-> 保守 bound 税 = 0(180.9 vs 180.2 µs/层)。§10 迁移第 1 步已实装(per-rank bucket、
-> 协议最大 global_tokens、MTP 固定链;lease 暂保持全局,理由见 §10),gate 4/5 待 GPU
-> 实测。** 取代 `cross-node-scaling.md` 的 Event plane 与 SMR 方向(该文档的 NVL72 实测
-> 数据仍有效)。
+> 三条静态纪律(固定链、保守 bound、padding 即协议)。**§8 五个 gate 已全部 GO
+> (2026-07-30,GB300 tray03):跨 rank 流量不变性 bit-exact、异构 token 数 graph 回放
+> bit-exact、保守 bound 税 = 0、padding 字节逐步恒定、MTP 固定链轨迹相同且空 round
+> 开销 = 0。§10 迁移第 1 步已实装并验证(per-rank bucket、协议最大 global_tokens、
+> MTP 固定链;lease 暂保持全局,理由见 §10)。** 取代 `cross-node-scaling.md` 的
+> Event plane 与 SMR 方向(该文档的 NVL72 实测数据仍有效)。
 >
 > **Last touched:** 2026-07
 
@@ -218,21 +218,23 @@ done
    device 侧 psum 决定)。原判读标准(≤0.5ms/step → go)以最强形式满足,"per-rank
    静态 bound 档位"退让方案不需要。EP16 复测仍保留(shim 常量不同),但 EP4 的零税
    使不同结论的先验概率很低。
-4. **`freerun_padding_byte_constancy_gate` — padding 字节恒定(`oracle/freerun_step.rs`,
-   待 GPU 实测)。** EP4 引擎真实 launch:rank 0 跑一条 sampled 请求(sampled 挡住
-   launch-ahead lease,每步走完整 prologue——被测对象正是 `GLM52_PADDING_STEP` 契约),
-   rank 1–3 全程空转 ≥ 64 步。每步从生产 step 路径 D2H 最后一层 routed MoE 的
-   `topk_idx`/`topk_weight`(probe 挂在 `runner::step`,`freerun_probe.rs`)。**验收:
-   空 rank 每个 bucket 分组内字节逐步恒定**,覆盖 indexer seq_len=1 与 fp8 quant 环节。
+4. **`freerun_padding_byte_constancy_gate` — padding 字节恒定。✅ PASS(2026-07-30,
+   tray03,commit `7f7f4b93`)。** EP4 引擎真实 launch:rank 0 跑一条 sampled 请求
+   (sampled 挡住 launch-ahead lease,每步走完整 prologue——被测对象正是
+   `GLM52_PADDING_STEP` 契约),rank 1–3 全程空转。每步从生产 step 路径 D2H 最后一层
+   routed MoE 的 `topk_idx`/`topk_weight`(probe 挂在 `runner::step`,
+   `freerun_probe.rs`)。实测:460 个 route 快照,空 rank 每 bucket 分组内字节逐步
+   恒定——indexer seq_len=1 与 fp8 quant 两个此前未验证环节均为构造性确定。
    (leased replay 的 padding 行按设计自喂,其 wire 字节演化由 lease 不变量守护,
    不在本 gate 范围。)
-5. **`freerun_mtp_fixed_chain_gate` — MTP 固定链(`oracle/freerun_step.rs`,待 GPU
-   实测)。** 固定链已实装:`select_round_kind` 与全局 bucket 协商已删除,每 rank 每
-   round 无条件跑 context + 4 个 proposal forward,空 rank 以 padding 进场(零 append
-   的 round 会显式清零 `previous` padding 行——capture buffer 残值不上 wire)。gate 两
-   阶段:A 阶段 rank 0 独自 decode(rank 1–3 空,每 round 三个全 padding rank),B 阶段
-   四 rank 全忙且 rank 0 重复同一请求。**验收:rank 0 两阶段轨迹逐 token 相同(gate 1
-   流量不变性的 whole-step 版)+ 空 round 均值开销 ≤ 0.5 ms(对全忙基线)。**
+5. **`freerun_mtp_fixed_chain_gate` — MTP 固定链。✅ PASS(同上)。** 固定链已实装:
+   `select_round_kind` 与全局 bucket 协商已删除,每 rank 每 round 无条件跑 context +
+   4 个 proposal forward,空 rank 以 padding 进场(零 append 的 round 显式清零
+   `previous` padding 行——capture buffer 残值不上 wire)。两阶段:A 阶段 rank 0 独自
+   decode(rank 1–3 空,每 round 三个全 padding rank),B 阶段四 rank 全忙且 rank 0
+   重复同一请求。实测:rank 0 两阶段轨迹逐 token 相同(gate 1 流量不变性的 whole-step
+   版);空 round 开销 hetero 3.725 vs busy 3.809 ms/round,**delta −0.084 ms——
+   在噪声内,验收线 0.5 ms 以最强形式满足**。
 
 **Pitfall(实测踩中):DeepEP context 是一进程一次性的。** 三个 gate 在同一个 test
 进程串行时,第二个 gate 的 `ctx_create` 撞 NVLink barrier timeout →
@@ -284,6 +286,6 @@ load-bearing。被本设计取代的部分:framed-TCP rank-host 作为**长期�
 
 ## Next step
 
-迁移第 1 步已实装(§10)。下一步:tray03 跑既有 GPU gates(`hf_golden`/`mtp_production`/
-freerun 1–3 回归)+ 新 gate 4/5,全绿后进入 §10 第 2 步拆壳。EP16 的 bound-tax 复测挂在
-第一次跨 tray 部署时顺带跑。
+迁移第 1 步已实装并全绿(gate 1–3 回归 + gate 4/5 首跑,tray03,2026-07-30)。下一步是
+§10 第 2 步拆壳:coordinator 循环拆成 N 个 engine 线程 + 独立 HTTP endpoint + bootstrap
+rendezvous。EP16 的 bound-tax 复测挂在第一次跨 tray 部署时顺带跑。
