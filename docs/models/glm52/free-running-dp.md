@@ -285,7 +285,8 @@ return all hosted GPU state; process exit is the release mechanism")。gate 必�
      不进 collective、不炸协议,但多机部署应显式 `--max-model-len` 保持 fleet 口径一致。
    - **KV offload 跨节点自然解锁**:每节点只注册本地 arena 到自己的 pegaflow host
      (老 blocker "remote arena 指针过不了 wire" 随 rank-host 一起消失),namespace
-     推导确定、各节点一致。native MTP 保持单机限制。
+     推导确定、各节点一致。**native MTP 的单机限制已解除**(round 本就是固定链 +
+     rank-local bucket,跨进程配对机制与目标步同构;双 tray EP8+MTP 硬件验证待跑)。
    验收:全量单测 + clippy(本机,2026-07-30);EP4 五 gate 回归与 EP16 双 tray
    rendezvous 验证挂 GPU 执行(见 Next step)。
 

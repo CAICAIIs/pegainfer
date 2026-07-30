@@ -142,7 +142,9 @@ pub struct Glm52LaunchOptions {
     pub dp_size: usize,
     /// Optional speculative decoder. DSpark enables lossless speculative
     /// sampling from an external checkpoint; native MTP uses the checkpoint's
-    /// layer-78 decoder and currently supports single-node EP4 and EP8.
+    /// layer-78 decoder and supports EP decode (single- or multi-process —
+    /// the MTP round rides the same fixed chain and DeepEP context as the
+    /// target steps) and TP4 prefill-only.
     pub drafter: Glm52Drafter,
     /// Per-request context cap (`prompt + max_tokens - 1 <= max_model_len`).
     /// `None` sizes it from the post-weight-load free VRAM (fleet minimum);
@@ -486,10 +488,6 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
             moe_topo.uses_ep_expert_bundles()
                 || (moe_topo == Glm52MoeTopo::Tp4 && prefill_only.is_some()),
             "GLM5.2 native MTP requires EP decode or TP4 prefill-only"
-        );
-        ensure!(
-            !multi_process,
-            "GLM5.2 native MTP currently requires all EP ranks in one process"
         );
     }
     if let Some(path) = &dump_graph_png {
