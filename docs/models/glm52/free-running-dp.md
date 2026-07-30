@@ -12,7 +12,11 @@
 > MTP 固定链(gate 1–5 验证);第 2 步拆壳完成——coordinator 删除,每 DP rank 一个自治
 > engine 线程,lease 本地化(always-consume,stale-replay 路径消失),rank-host
 > (remote.rs,978 行)退役,跨节点 = 同一 binary 每节点一进程 + 一次性 bootstrap
-> rendezvous(rank0 进程分发 DeepEP unique id)。** 取代 `cross-node-scaling.md` 的
+> rendezvous(rank0 进程分发 DeepEP unique id)。**双 tray EP8 首验通过
+> (2026-07-30,tray03+tray13):rendezvous 一次成功(fetch attempt 1),两 endpoint
+> greedy 输出字节一致,多进程 native MTP 正常运行(mean_accepted_drafts≈1.2,两侧
+> 轨迹一致),fail-stop 实测符合设计——杀 peer 后首个请求触发 DeepEP NVLink barrier
+> ~17s 超时 → fatal ERROR log → 进程退出。** 取代 `cross-node-scaling.md` 的
 > Event plane 与 SMR 方向(该文档的 NVL72 实测数据仍有效)。
 >
 > **Last touched:** 2026-07
@@ -286,9 +290,10 @@ return all hosted GPU state; process exit is the release mechanism")。gate 必�
    - **KV offload 跨节点自然解锁**:每节点只注册本地 arena 到自己的 pegaflow host
      (老 blocker "remote arena 指针过不了 wire" 随 rank-host 一起消失),namespace
      推导确定、各节点一致。**native MTP 的单机限制已解除**(round 本就是固定链 +
-     rank-local bucket,跨进程配对机制与目标步同构;双 tray EP8+MTP 硬件验证待跑)。
-   验收:全量单测 + clippy(本机,2026-07-30);EP4 五 gate 回归与 EP16 双 tray
-   rendezvous 验证挂 GPU 执行(见 Next step)。
+     rank-local bucket,跨进程配对机制与目标步同构;双 tray EP8+MTP 已硬件验证,见
+     Next step)。
+   验收:全量单测 + clippy(本机,2026-07-30);双 tray EP8 rendezvous / 服务 /
+   fail-stop 已验(见 Next step);EP4 五 gate 回归与 EP16 验证仍挂 GPU 执行。
 
 ## 与 cross-node-scaling.md 的关系
 
@@ -302,7 +307,16 @@ load-bearing。被本设计取代并已随第 2 步删除的部分:framed-TCP ra
 迁移两步均已实装。挂 GPU 的验收序列:
 1. **EP4 五 gate 回归**(tray03):拆壳后单机路径不变的证明——逐 gate 单进程跑 §8 命令。
 2. **e2e/golden 回归**:qwen 系 golden gate 与 glm52 既有 e2e。
-3. **EP16 双 tray 首验**:rendezvous + 服务 + fail-stop(杀一个 rank 的进程,全 fleet
-   数秒内经 collective 超时退出)+ bound-tax 复测(EP16 shim 常量不同,§8 gate 3 注记)。
-4. per-rank step watchdog(§6 的去中心化收尸的最后一块)与每 rank 独立 HTTP endpoint
-   (router 对接时)仍是后续项。
+3. **双 tray 首验:EP8 已完成(2026-07-30,tray03 ranks 0..4 + tray13 ranks 4..8,
+   commit `22d7d047`)。** rendezvous 一次成功(peer checkin / fetch attempt 1 均有
+   日志);两进程各 4 engine 起服务,两个 HTTP endpoint 的 greedy 输出字节一致;多进程
+   native MTP 正常运行(56 round,mean_accepted_drafts=1.196,两侧进程轨迹一致——
+   `is_mtp → !multi_process` 限制已随 `6549b9be` 解除)。fail-stop 实测:杀 tray13
+   进程后,无流量时幸存进程不自知(per-rank watchdog 未做,见第 4 项),首个新请求
+   触发 DeepEP NVLink barrier 超时(~17s)→ `ERROR ... rank 0 fatal; the engine
+   process exits` → 进程退出,curl 空回——与 §6 设计一致,检测目前由流量触发。
+   本轮修出一个多进程专属 bug:weight-load/build 的错误标签与校验把局部 worker 下标
+   当全局 rank 用(`ranks.start != 0` 必炸),`22d7d047` 修复。**EP16 仍待首验**,
+   连同 bound-tax 复测(EP16 shim 常量不同,§8 gate 3 注记)。
+4. per-rank step watchdog(§6 的去中心化收尸的最后一块——实测确认无流量时 peer
+   死亡不会被察觉)与每 rank 独立 HTTP endpoint(router 对接时)仍是后续项。

@@ -5,8 +5,10 @@
 > TP4 P → EP4 D gates restore over RDMA; post-review state-machine coverage
 > now guarantees that the forwarded anchor starts directly in verify. In a
 > five-run cold-prefix A/B, P-to-D-first p50 was 82/386/1,465 ms versus EP4
-> local-prefill TTFT of 317/13,853/55,932 ms; hardware first-verify telemetry
-> must be rerun after the state fix.
+> local-prefill TTFT of 317/13,853/55,932 ms. First-verify telemetry was
+> rerun after the free-running-DP shell split (2026-07-30): 148-token and
+> 4,096-token gates are byte-identical with `first_step=verify` and a 5/5
+> first-round draft acceptance at 4K.
 >
 > **Last touched:** 2026-07
 
@@ -81,6 +83,28 @@
     gate.
 
 ## Execution Log
+
+### Post-shell-split replay: free-running DP architecture (2026-07-30)
+
+- Context: the DP coordinator was split into per-rank autonomous engines
+  (`free-running-dp.md` migration step 2, branch
+  `feat/glm52-free-running-dp-gates`, head `22d7d047`). The full P/D chain was
+  replayed on that code to confirm the handoff contract survived the
+  restructure: TP4 P on tray03 + EP4 D on tray04 + metaserver over
+  `mlx5_bond_0` (RoCE), native MTP on both sides.
+- **148-token gate: byte-identical.** P → D first 161 ms versus EP4
+  local-prefill TTFT 680 ms.
+- **4,096-token gate (64 pages): byte-identical.** First verify round accepted
+  all 5 forwarded drafts; D log confirmed `first_step=verify`. P → D first
+  104 ms versus EP4 local-prefill TTFT 15,339 ms (~147×).
+- One 75-token ambiguous prompt produced a deterministic fork (` point` vs
+  ` paragraph`) between the P/D and local-prefill paths. This is the top-1
+  near-tie class already declared in `native-mtp-accuracy.md` (logit-margin
+  level, movable by bucket/topology numerics), not a handoff defect; all
+  non-near-tie prompts matched byte-for-byte.
+- This replay settles the earlier outstanding item ("hardware first-verify
+  telemetry must be rerun after the state fix"): post-split, first-verify
+  admission and initial-proposal acceptance are confirmed on hardware.
 
 ### Post-review first-verify and context-cap fixes
 
@@ -297,5 +321,6 @@ The post-review state bug also showed that a log describing the intended next
 step is not evidence of the slot's actual span kind. First-verify gates must
 assert the state transition or observed speculative span.
 
-Next action: rerun the 89-token token-ID handoff gate against EP4, then EP16,
-and record observed first-verify telemetry here.
+Next action: the post-shell-split EP4 replay is done (see the 2026-07-30
+section above); rerun the same token-ID handoff contract against an EP16 D
+fleet when a 16-rank decode environment is available.
