@@ -11,6 +11,9 @@
 > {4,8,16,32,64} each get a constexpr shim instantiation + `Glm52MoeTopo` variant; the
 > weight-only expert chain is ABI-generic so a new width is a config header, not new code.
 > The GIN scale-out sections below remain the design for IB/RoCE clusters beyond one rack.
+> **架构方向更新(2026-07):** 本文的 Event plane(facts plane)与 SMR coordinator 方向被
+> `free-running-dp.md` 取代——长期架构是删除 coordinator 的 per-rank 独立 engine;本文的
+> NVL72 实测数据与 rank-host(短期已 shipped)仍有效。
 > Pitfalls that cost real time: the IMEX channel device must be passed into containers
 > (`--device /dev/nvidia-caps-imex-channels/channel0` — `--gpus` alone silently breaks
 > cross-tray LSA), and a remote-node teardown must `shutdown()` the socket, not just drop
