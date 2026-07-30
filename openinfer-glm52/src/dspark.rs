@@ -3,7 +3,7 @@
 //! dense backbone at GLM's hidden 6144 plus a rank-256 Markov head — proposing
 //! 7 greedy draft tokens per round from the target's captured aux hidden
 //! states. No collectives anywhere: the draft is replicated on every rank and
-//! runs between global steps, DP over that rank's slots.
+//! runs between that rank's steps, DP over its slots.
 //!
 //! Layout facts are pinned against the `vllm-project/speculators` source
 //! (docs/models/glm52/dspark-mtp.md "Layout pinned against speculators

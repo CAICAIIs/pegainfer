@@ -18,12 +18,14 @@ pub(super) type GraphDumpRequest = (
     crossbeam_channel::Sender<anyhow::Result<CudaGraphDumpSummary>>,
 );
 
-/// Pre-capture every whole-step bucket graph while the ranks are idle and
-/// trivially in lock-step. Launch-ahead speculation requires captured-ness
-/// to be UNIFORM across ranks — a lazily capturing rank would skip the
-/// speculative replay the others enqueued and desync the collectives — and
-/// pre-capturing also removes the old mid-serving capture stall. Every row
-/// is a padding write into the pool's padding page.
+/// Pre-capture every whole-step bucket graph at bootstrap, while the fleet
+/// is idle: every engine captures the same fixed bucket sequence, so the
+/// collectives inside capture pair across the fleet by entry order (the
+/// pre-capture IS the bootstrap rendezvous). A launch-ahead replay must
+/// always find its graph already captured — capture records without
+/// executing, so a leased replay that hit an uncaptured shape would execute
+/// nothing — and pre-capturing also removes the old mid-serving capture
+/// stall. Every row is a padding write into the pool's padding page.
 pub(super) fn precapture_step_graphs(
     workers: &[Glm52Worker],
     pools: &[BlockPool],

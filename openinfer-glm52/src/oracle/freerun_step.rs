@@ -16,8 +16,8 @@
 //!    unequal work (one rank decoding+proposing, three ranks empty), every
 //!    fleet round must run the fixed layer-78 chain on every rank, the
 //!    decode output must equal the plain-decode trajectory of the
-//!    production gate, and the empty ranks' rounds must not stretch the
-//!    coordinator round by more than 0.5 ms vs the all-busy baseline.
+//!    production gate, and the empty ranks' rounds must not stretch a
+//!    round by more than 0.5 ms vs the all-busy baseline.
 //!
 //! Run each gate in its OWN `cargo test` process (DeepEP context is
 //! once-per-process — see `freerun_ep4.rs`).
@@ -57,7 +57,8 @@ fn launch_ep4(drafter: crate::Glm52Drafter) -> Result<EngineHandle> {
             moe_topo: Glm52MoeTopo::Ep4,
             weight_staging: true,
             dump_graph_png: None,
-            rank_hosts: Vec::new(),
+            ranks: None,
+            rendezvous: None,
         },
     )
 }
@@ -215,8 +216,13 @@ fn freerun_mtp_fixed_chain_gate() -> Result<()> {
     assert!(
         hetero
             .iter()
-            .all(|round| round.rank_empty.iter().skip(1).all(|&empty| empty)),
+            .filter(|round| round.rank != 0)
+            .all(|round| round.empty),
         "phase A expected ranks 1-3 empty in every round"
+    );
+    assert!(
+        hetero.iter().any(|round| round.rank == 0 && !round.empty),
+        "phase A expected rank 0 to enter its rounds with proposals"
     );
 
     // Phase B: all-busy baseline; rank 0 repeats the identical request

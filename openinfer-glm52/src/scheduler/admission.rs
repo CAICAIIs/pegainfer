@@ -1,10 +1,11 @@
-//! Request intake and slot placement: [`validate_request`] fast-rejects at
-//! the door (past it, a bad value only surfaces inside a collective and tears
-//! the engine down), then binds every request to one rank queue. HTTP requests
-//! arrive with the vLLM frontend's DP choice; direct requests are placed once
-//! using the same waiting-weighted least-load policy. [`admit_from_queue`]
-//! then fills each rank's free slots at step boundaries under the
-//! full-lifetime KV budget.
+//! Request validation and slot placement for one rank: [`validate_request`]
+//! fast-rejects at the door (past it, a bad value only surfaces inside a
+//! collective and tears the engine down), then [`admit_from_queue`] fills the
+//! rank's free slots from its own FIFO queue at step boundaries under the
+//! full-lifetime KV budget. Requests arrive pre-bound to this rank — the
+//! `EngineHandle` routes by `data_parallel_rank` (the vLLM frontend's DP
+//! choice) and least-load-places unbound ones — so admission never moves a
+//! request and metrics/KV ownership agree with the frontend's engine index.
 
 use std::collections::VecDeque;
 
@@ -22,7 +23,7 @@ use super::offload::{self};
 use super::slot::Glm52SlotState;
 use crate::runner::Glm52Worker;
 
-fn validate_request(
+pub(super) fn validate_request(
     req: &GenerateRequest,
     max_model_len: usize,
     prefill_only: bool,
@@ -62,9 +63,9 @@ fn validate_request(
         ));
     }
     // Mirror the sampler kernel's parameter ensures HERE: past intake a bad
-    // value only surfaces as a failed step, and a failed step tears the whole
-    // EP8 engine down (`fail_step`) — user input must be rejected at the
-    // door, never inside a collective.
+    // value only surfaces as a failed step, and a failed step is fatal to the
+    // engine — user input must be rejected at the door, never inside a
+    // collective.
     if !req.params.is_greedy() {
         let p = &req.params;
         if !p.temperature.is_finite() {
@@ -118,21 +119,7 @@ fn admission_lifetime_blocks(
     Ok(lifetime_blocks(input_tokens, max_output_tokens))
 }
 
-/// Pick a rank for a direct, unbound request. Waiting carries the same 4x
-/// weight as vLLM's DP load balancer; ties go to the lowest rank. Frontend
-/// requests bypass this function because their selected engine index is the
-/// rank assignment.
-fn least_loaded_rank(running: &[usize], pending: &[VecDeque<GenerateRequest>]) -> usize {
-    assert_eq!(running.len(), pending.len());
-    running
-        .iter()
-        .enumerate()
-        .min_by_key(|&(rank, &running)| (running + pending[rank].len() * 4, rank))
-        .map(|(rank, _)| rank)
-        .expect("GLM5.2 must expose at least one logical rank")
-}
-
-fn reject(req: &GenerateRequest, message: String) {
+pub(super) fn reject(req: &GenerateRequest, message: String) {
     let prompt_tokens = req.prompt_tokens.len();
     let queued_at_unix_s = req.queued_at_unix_s.unwrap_or_else(unix_now_s);
     let _ = req.token_tx.send(TokenEvent::Scheduled {
@@ -161,282 +148,179 @@ fn reject_native_pd_error(
     );
 }
 
-/// Fast-reject invalid requests at intake (Scheduled → Rejected), otherwise
-/// bind the request to exactly one rank queue. The binding is permanent so
-/// frontend `engine_index`, metrics labels, and actual KV ownership agree.
-pub(super) fn intake(
-    req: GenerateRequest,
-    pending: &mut [VecDeque<GenerateRequest>],
-    running: &[usize],
-    max_model_len: usize,
-    prefill_only: bool,
-    native_mtp_prefill: bool,
-) {
-    if let Err(message) = validate_request(&req, max_model_len, prefill_only, native_mtp_prefill) {
-        reject(&req, message);
-        return;
-    }
-    let rank = match req.data_parallel_rank {
-        Some(rank) if rank < pending.len() => rank,
-        Some(rank) => {
-            reject(
-                &req,
-                format!(
-                    "GLM5.2 data_parallel_rank {rank} is outside 0..{}",
-                    pending.len()
-                ),
-            );
-            return;
-        }
-        None => least_loaded_rank(running, pending),
-    };
-    pending[rank].push_back(req);
-}
-
-/// Admission: fill each rank's free slots from its own FIFO queue while its
-/// full-lifetime KV budget permits. The frontend already selected the rank;
-/// admission must never move the request or its metrics/KV ownership diverge.
-/// New requests join the lock-step at the next step boundary. An `Err` is a
-/// kvbm invariant break — the caller fails the step (the affected request was
-/// already answered here).
+/// Admission: fill this rank's free slots from its own FIFO queue while its
+/// full-lifetime KV budget permits. New requests join the step cadence at
+/// the next step boundary. An `Err` is a kvbm invariant break — the caller
+/// treats it as engine-fatal (the affected request was already answered
+/// here).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn admit_from_queue(
-    pending: &mut [VecDeque<GenerateRequest>],
-    slots: &mut [RankSlots],
-    pools: &[BlockPool],
-    usable_blocks: &[usize],
-    offload: Option<&[offload::RankOffload]>,
+    rank: usize,
+    pending: &mut VecDeque<GenerateRequest>,
+    slots: &mut RankSlots,
+    pool: &BlockPool,
+    usable_blocks: usize,
+    offload: Option<&offload::RankOffload>,
     vllm_pd: &mut Option<VllmPdState>,
     native_pd: &mut Option<offload::NativePdState>,
-    workers: &[Glm52Worker],
+    // The rank's executor, only exercised by the vLLM-compat P/D admission
+    // (the rope fixup rides its stream); `None` in offline contract tests.
+    worker: Option<&Glm52Worker>,
     mirrored: bool,
     prefix_cache_enabled: bool,
     drafter_enabled: bool,
     native_mtp_prefill: bool,
-    pending_resets: &mut [Vec<usize>],
-    slots_changed: &mut bool,
+    pending_resets: &mut Vec<usize>,
 ) -> anyhow::Result<()> {
-    assert_eq!(pending.len(), slots.len());
-    let mut committed: Vec<usize> = slots
+    let mut committed: usize = slots
         .iter()
-        .map(|rank_slots| {
-            rank_slots
-                .iter()
-                .flatten()
-                .map(|active| active.kv.lifetime_blocks())
-                .sum()
-        })
-        .collect();
+        .flatten()
+        .map(|active| active.kv.lifetime_blocks())
+        .sum();
     // Pages pinned by in-flight release saves are physically unallocatable
-    // until their D2H lands. Hide them from each rank's full-lifetime budget
+    // until their D2H lands. Hide them from the rank's full-lifetime budget
     // so admission defers instead of promising pages a later schedule cannot
     // get (which would fail the whole engine).
-    let usable: Vec<usize> = match offload {
-        Some(offload) => usable_blocks
-            .iter()
-            .zip(offload)
-            .map(|(&usable, rank)| usable.saturating_sub(rank.pinned_blocks()))
-            .collect(),
-        None => usable_blocks.to_vec(),
-    };
+    let usable =
+        usable_blocks.saturating_sub(offload.map_or(0, offload::RankOffload::pinned_blocks));
 
-    for rank in 0..slots.len() {
-        while let Some(slot) = slots[rank].iter().position(Option::is_none) {
-            let Some(front) = pending[rank].front() else {
-                break;
-            };
-            // Drop a disconnected FIFO front before it can block valid work
-            // behind an admission budget it will never consume.
-            if front.token_tx.is_closed() {
-                pending[rank].pop_front();
-                if let Some(pd) = vllm_pd.as_mut() {
-                    pd.clear_parked(rank);
-                }
-                if let Some(pd) = native_pd.as_mut() {
-                    pd.clear(rank);
-                }
+    while let Some(slot) = slots.iter().position(Option::is_none) {
+        let Some(front) = pending.front() else {
+            break;
+        };
+        // Drop a disconnected FIFO front before it can block valid work
+        // behind an admission budget it will never consume.
+        if front.token_tx.is_closed() {
+            pending.pop_front();
+            if let Some(pd) = vllm_pd.as_mut() {
+                pd.clear_parked(rank);
+            }
+            if let Some(pd) = native_pd.as_mut() {
+                pd.clear(rank);
+            }
+            continue;
+        }
+        // Parse the native contract before budgeting: it changes the
+        // logical input/output capacity of the RequestKv created below.
+        // Invalid metadata must be rejected, not left at the FIFO head.
+        let native_handoff = match offload::native_mtp_handoff(front) {
+            Ok(handoff) => handoff,
+            Err(err) => {
+                let req = pending.pop_front().expect("checked non-empty");
+                reject(&req, format!("{err:#}"));
                 continue;
             }
-            // Parse the native contract before budgeting: it changes the
-            // logical input/output capacity of the RequestKv created below.
-            // Invalid metadata must be rejected, not left at the FIFO head.
-            let native_handoff = match offload::native_mtp_handoff(front) {
-                Ok(handoff) => handoff,
-                Err(err) => {
-                    let req = pending[rank].pop_front().expect("checked non-empty");
-                    reject(&req, format!("{err:#}"));
-                    continue;
-                }
-            };
-            let native_anchor = match native_handoff
-                .as_ref()
-                .map(|handoff| offload::native_anchor_plan(front, handoff))
-                .transpose()
-            {
-                Ok(plan) => plan,
-                Err(err) => {
-                    let req = pending[rank].pop_front().expect("checked non-empty");
-                    reject(&req, format!("{err:#}"));
-                    continue;
-                }
-            };
-            let need_blocks = match admission_lifetime_blocks(front, native_anchor) {
-                Ok(blocks) => blocks,
-                Err(err) => {
-                    let req = pending[rank].pop_front().expect("checked non-empty");
-                    reject(&req, format!("{err:#}"));
-                    continue;
-                }
-            };
-            // `usable` accounts for the block classes the scheduler knows
-            // about. The allocator is the final authority: duplicate
-            // primaries, restore probes, or another guard lifetime can make
-            // fewer pages physically allocatable than that bookkeeping
-            // predicts. Add back only pages held by active requests (already
-            // represented in `committed`) and defer the FIFO front if the
-            // resulting physical lifetime budget is smaller.
-            let active_resident: usize = slots[rank]
-                .iter()
-                .flatten()
-                .map(|active| active.kv.resident_blocks())
-                .sum();
-            let physical_usable = pools[rank]
-                .available_blocks()
-                .saturating_add(active_resident);
-            if committed[rank] + need_blocks > usable[rank].min(physical_usable) {
-                break;
+        };
+        let native_anchor = match native_handoff
+            .as_ref()
+            .map(|handoff| offload::native_anchor_plan(front, handoff))
+            .transpose()
+        {
+            Ok(plan) => plan,
+            Err(err) => {
+                let req = pending.pop_front().expect("checked non-empty");
+                reject(&req, format!("{err:#}"));
+                continue;
             }
+        };
+        let need_blocks = match admission_lifetime_blocks(front, native_anchor) {
+            Ok(blocks) => blocks,
+            Err(err) => {
+                let req = pending.pop_front().expect("checked non-empty");
+                reject(&req, format!("{err:#}"));
+                continue;
+            }
+        };
+        // `usable` accounts for the block classes the scheduler knows
+        // about. The allocator is the final authority: duplicate
+        // primaries, restore probes, or another guard lifetime can make
+        // fewer pages physically allocatable than that bookkeeping
+        // predicts. Add back only pages held by active requests (already
+        // represented in `committed`) and defer the FIFO front if the
+        // resulting physical lifetime budget is smaller.
+        let active_resident: usize = slots
+            .iter()
+            .flatten()
+            .map(|active| active.kv.resident_blocks())
+            .sum();
+        let physical_usable = pool.available_blocks().saturating_add(active_resident);
+        if committed + need_blocks > usable.min(physical_usable) {
+            break;
+        }
 
-            let mut req = pending[rank].pop_front().expect("checked non-empty");
-            let client_prompt_tokens = req.prompt_tokens.len();
-            let native_admitted = if let Some(handoff) = native_handoff.as_ref() {
-                let Some(state) = native_pd.as_mut() else {
-                    reject(
-                        &req,
-                        "native-MTP P/D metadata reached a decode engine without native P/D offload"
-                            .to_string(),
-                    );
-                    continue;
-                };
-                let offload = offload.expect("native P/D state requires offload");
-                let outcome = match offload::admit_native_mtp_pd(
-                    state,
-                    rank,
-                    &offload[rank],
-                    &pools[rank],
+        let mut req = pending.pop_front().expect("checked non-empty");
+        let client_prompt_tokens = req.prompt_tokens.len();
+        let native_admitted = if let Some(handoff) = native_handoff.as_ref() {
+            let Some(state) = native_pd.as_mut() else {
+                reject(
                     &req,
-                    handoff,
-                ) {
-                    Ok(outcome) => outcome,
-                    Err(err) => {
-                        reject_native_pd_error(state, rank, &req, &err);
-                        continue;
-                    }
-                };
-                match outcome {
-                    VllmAdmitOutcome::Admit { kv, cached_tokens } => Some((*kv, cached_tokens)),
-                    VllmAdmitOutcome::Park => {
-                        pending[rank].push_front(req);
-                        break;
-                    }
-                    VllmAdmitOutcome::Reject { message } => {
-                        reject(&req, message);
-                        continue;
-                    }
-                    VllmAdmitOutcome::LocalFallback => {
-                        unreachable!("native-MTP P/D never silently falls back to local prefill")
-                    }
-                }
-            } else {
-                None
+                    "native-MTP P/D metadata reached a decode engine without native P/D offload"
+                        .to_string(),
+                );
+                continue;
             };
-            // vLLM-compat P/D admission: the full peer-prefilled prefix must
-            // restore (this node never computes prompt positions), a racing
-            // registration parks the request at the queue front for the next
-            // step boundary, and an exhausted wait window rejects it for the
-            // router to retry through the prefill peer.
-            let pd_admitted = if native_admitted.is_some() {
-                native_admitted
-            } else {
-                match vllm_pd.as_mut() {
-                    Some(pd) => {
-                        let offload = offload.expect("vLLM-compat P/D requires --kv-offload");
-                        // Launch validation pins vllm-compat to the EP topology
-                        // (kv-offload ⇒ EP8): each rank's executor owns the only
-                        // replica of its arenas, so it alone runs the fixup. A
-                        // mirrored topology would need every worker here.
-                        assert!(
-                            !mirrored,
-                            "vLLM-compat P/D admission assumes the EP topology"
-                        );
-                        match offload::admit_vllm_pd(
-                            pd,
-                            rank,
-                            &offload[rank],
-                            &pools[rank],
-                            &req,
-                            &workers[rank],
-                        ) {
-                            Ok(VllmAdmitOutcome::Admit { kv, cached_tokens }) => {
-                                Some((*kv, cached_tokens))
-                            }
-                            Ok(VllmAdmitOutcome::Park) => {
-                                pending[rank].push_front(req);
-                                break; // head-of-line wait: retry next step boundary
-                            }
-                            Ok(VllmAdmitOutcome::Reject { message }) => {
-                                reject(&req, message);
-                                continue;
-                            }
-                            Ok(VllmAdmitOutcome::LocalFallback) => None,
-                            Err(err) => {
-                                let err = err.context("GLM5.2 P/D admission");
-                                let _ = req.token_tx.send(TokenEvent::Error {
-                                    message: format!("{err:#}"),
-                                    prompt_tokens: req.prompt_tokens.len(),
-                                    completion_tokens: 0,
-                                });
-                                return Err(err);
-                            }
+            let offload = offload.expect("native P/D state requires offload");
+            let outcome = match offload::admit_native_mtp_pd(
+                state, rank, offload, pool, &req, handoff,
+            ) {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    reject_native_pd_error(state, rank, &req, &err);
+                    continue;
+                }
+            };
+            match outcome {
+                VllmAdmitOutcome::Admit { kv, cached_tokens } => Some((*kv, cached_tokens)),
+                VllmAdmitOutcome::Park => {
+                    pending.push_front(req);
+                    break;
+                }
+                VllmAdmitOutcome::Reject { message } => {
+                    reject(&req, message);
+                    continue;
+                }
+                VllmAdmitOutcome::LocalFallback => {
+                    unreachable!("native-MTP P/D never silently falls back to local prefill")
+                }
+            }
+        } else {
+            None
+        };
+        // vLLM-compat P/D admission: the full peer-prefilled prefix must
+        // restore (this node never computes prompt positions), a racing
+        // registration parks the request at the queue front for the next
+        // step boundary, and an exhausted wait window rejects it for the
+        // router to retry through the prefill peer.
+        let pd_admitted = if native_admitted.is_some() {
+            native_admitted
+        } else {
+            match vllm_pd.as_mut() {
+                Some(pd) => {
+                    let offload = offload.expect("vLLM-compat P/D requires --kv-offload");
+                    let worker = worker.expect("vLLM-compat P/D requires the rank executor");
+                    // Launch validation pins vllm-compat to the EP topology
+                    // (kv-offload ⇒ EP): the rank's executor owns the only
+                    // replica of its arenas, so it alone runs the fixup. A
+                    // mirrored topology would need every worker here.
+                    assert!(
+                        !mirrored,
+                        "vLLM-compat P/D admission assumes the EP topology"
+                    );
+                    match offload::admit_vllm_pd(pd, rank, offload, pool, &req, worker) {
+                        Ok(VllmAdmitOutcome::Admit { kv, cached_tokens }) => {
+                            Some((*kv, cached_tokens))
                         }
-                    }
-                    None => None,
-                }
-            };
-            let (mut kv, cached_tokens) = if let Some(admitted) = pd_admitted {
-                admitted
-            } else {
-                let mut kv = if native_mtp_prefill {
-                    let cache_salt = super::native_mtp_cache_salt(&req.prompt_tokens);
-                    pools[rank].new_request_with_cache_salt(
-                        req.prompt_tokens.clone(),
-                        req.max_tokens,
-                        Some(&cache_salt),
-                        None,
-                    )
-                } else {
-                    pools[rank].new_request(req.prompt_tokens.clone(), req.max_tokens, None)
-                };
-                // Host-tier restore first, so the GPU prefix match sees the union
-                // of HBM-resident and freshly-restored blocks. The probe stays
-                // alive across the match to close the eviction window.
-                let _restored_hold = offload
-                    .filter(|_| prefix_cache_enabled && vllm_pd.is_none())
-                    .map(|offload| {
-                        offload::restore_host_prefix(
-                            &offload[rank].engine,
-                            &pools[rank],
-                            &req.prompt_tokens,
-                        )
-                    });
-                let cached_tokens = if prefix_cache_enabled {
-                    match kv.match_and_add_prefix(&pools[rank]) {
-                        Ok(cached) => cached,
+                        Ok(VllmAdmitOutcome::Park) => {
+                            pending.push_front(req);
+                            break; // head-of-line wait: retry next step boundary
+                        }
+                        Ok(VllmAdmitOutcome::Reject { message }) => {
+                            reject(&req, message);
+                            continue;
+                        }
+                        Ok(VllmAdmitOutcome::LocalFallback) => None,
                         Err(err) => {
-                            // The request is already out of `pending` and never
-                            // reaches a slot, so fail it explicitly before the
-                            // engine-fatal invariant error propagates.
-                            let err = err.context("GLM5.2 prefix match at admission");
+                            let err = err.context("GLM5.2 P/D admission");
                             let _ = req.token_tx.send(TokenEvent::Error {
                                 message: format!("{err:#}"),
                                 prompt_tokens: req.prompt_tokens.len(),
@@ -445,90 +329,128 @@ pub(super) fn admit_from_queue(
                             return Err(err);
                         }
                     }
-                } else {
-                    0
-                };
-                (kv, cached_tokens)
+                }
+                None => None,
+            }
+        };
+        let (mut kv, cached_tokens) = if let Some(admitted) = pd_admitted {
+            admitted
+        } else {
+            let mut kv = if native_mtp_prefill {
+                let cache_salt = super::native_mtp_cache_salt(&req.prompt_tokens);
+                pool.new_request_with_cache_salt(
+                    req.prompt_tokens.clone(),
+                    req.max_tokens,
+                    Some(&cache_salt),
+                    None,
+                )
+            } else {
+                pool.new_request(req.prompt_tokens.clone(), req.max_tokens, None)
             };
-            let queued_at_unix_s = req.queued_at_unix_s.unwrap_or_else(unix_now_s);
-            if let Some(plan) = native_anchor.filter(|plan| plan.replay_to_client) {
-                req.prompt_tokens.push(plan.token);
-            }
-            let _ = req.token_tx.send(TokenEvent::Scheduled {
-                queued_at_unix_s,
-                scheduled_at_unix_s: unix_now_s(),
-                prompt_tokens: client_prompt_tokens,
-                cached_tokens,
-            });
-            if let Some(plan) = native_anchor {
-                let replay_failed = plan.replay_to_client
-                    && plan.emitted_by_prefill
-                    && req
-                        .token_tx
-                        .send(TokenEvent::Token {
-                            id: plan.token,
-                            logprob: None,
-                        })
-                        .is_err();
-                let finish_reason = native_anchor_finish_reason(plan, req.max_tokens);
-                if replay_failed || finish_reason.is_some() {
-                    if let Some(finish_reason) = finish_reason
-                        && !req.token_tx.is_closed()
-                    {
-                        let _ = req.token_tx.send(TokenEvent::Finished {
-                            finish_reason,
-                            prompt_tokens: client_prompt_tokens,
-                            completion_tokens: 1,
+            // Host-tier restore first, so the GPU prefix match sees the union
+            // of HBM-resident and freshly-restored blocks. The probe stays
+            // alive across the match to close the eviction window.
+            let _restored_hold = offload
+                .filter(|_| prefix_cache_enabled && vllm_pd.is_none())
+                .map(|offload| offload::restore_host_prefix(&offload.engine, pool, &req.prompt_tokens));
+            let cached_tokens = if prefix_cache_enabled {
+                match kv.match_and_add_prefix(pool) {
+                    Ok(cached) => cached,
+                    Err(err) => {
+                        // The request is already out of `pending` and never
+                        // reaches a slot, so fail it explicitly before the
+                        // engine-fatal invariant error propagates.
+                        let err = err.context("GLM5.2 prefix match at admission");
+                        let _ = req.token_tx.send(TokenEvent::Error {
+                            message: format!("{err:#}"),
+                            prompt_tokens: req.prompt_tokens.len(),
+                            completion_tokens: 0,
                         });
+                        return Err(err);
                     }
-                    kv.release()?;
-                    continue;
                 }
-            }
-            let mut state = Glm52SlotState::new(
-                req.prompt_tokens.clone(),
-                req.max_tokens,
-                req.params.ignore_eos,
-                cached_tokens,
-            );
-            if let Some(handoff) = native_handoff {
-                anyhow::ensure!(
-                    cached_tokens == handoff.committed_len,
-                    "native-MTP P/D admitted {} cached tokens, expected {}",
-                    cached_tokens,
-                    handoff.committed_len
-                );
-                if native_anchor.is_some_and(|plan| plan.replay_to_client) {
-                    state.seed_native_pd_replayed_anchor();
-                } else {
-                    state.seed_native_pd_anchor();
-                }
-                state.set_drafts(handoff.draft_tokens.to_vec(), crate::mtp::GLM52_MTP_DRAFTS);
-                log::info!(
-                    "GLM5.2 native P/D admitted: rank={rank} slot={slot} \
-                     committed_len={} drafts={} first_step=verify",
-                    handoff.committed_len,
-                    handoff.draft_tokens.len()
-                );
-            }
-            if drafter_enabled {
-                pending_resets[rank].push(slot);
-            }
-            anyhow::ensure!(
-                kv.lifetime_blocks() == need_blocks,
-                "GLM5.2 admission budget drift: planned {need_blocks} blocks, RequestKv owns \
-                 lifetime capacity for {}",
-                kv.lifetime_blocks()
-            );
-            slots[rank][slot] = Some(ActiveRequest {
-                req,
-                state,
-                client_prompt_tokens,
-                kv,
-            });
-            committed[rank] += need_blocks;
-            *slots_changed = true;
+            } else {
+                0
+            };
+            (kv, cached_tokens)
+        };
+        let queued_at_unix_s = req.queued_at_unix_s.unwrap_or_else(unix_now_s);
+        if let Some(plan) = native_anchor.filter(|plan| plan.replay_to_client) {
+            req.prompt_tokens.push(plan.token);
         }
+        let _ = req.token_tx.send(TokenEvent::Scheduled {
+            queued_at_unix_s,
+            scheduled_at_unix_s: unix_now_s(),
+            prompt_tokens: client_prompt_tokens,
+            cached_tokens,
+        });
+        if let Some(plan) = native_anchor {
+            let replay_failed = plan.replay_to_client
+                && plan.emitted_by_prefill
+                && req
+                    .token_tx
+                    .send(TokenEvent::Token {
+                        id: plan.token,
+                        logprob: None,
+                    })
+                    .is_err();
+            let finish_reason = native_anchor_finish_reason(plan, req.max_tokens);
+            if replay_failed || finish_reason.is_some() {
+                if let Some(finish_reason) = finish_reason
+                    && !req.token_tx.is_closed()
+                {
+                    let _ = req.token_tx.send(TokenEvent::Finished {
+                        finish_reason,
+                        prompt_tokens: client_prompt_tokens,
+                        completion_tokens: 1,
+                    });
+                }
+                kv.release()?;
+                continue;
+            }
+        }
+        let mut state = Glm52SlotState::new(
+            req.prompt_tokens.clone(),
+            req.max_tokens,
+            req.params.ignore_eos,
+            cached_tokens,
+        );
+        if let Some(handoff) = native_handoff {
+            anyhow::ensure!(
+                cached_tokens == handoff.committed_len,
+                "native-MTP P/D admitted {} cached tokens, expected {}",
+                cached_tokens,
+                handoff.committed_len
+            );
+            if native_anchor.is_some_and(|plan| plan.replay_to_client) {
+                state.seed_native_pd_replayed_anchor();
+            } else {
+                state.seed_native_pd_anchor();
+            }
+            state.set_drafts(handoff.draft_tokens.to_vec(), crate::mtp::GLM52_MTP_DRAFTS);
+            log::info!(
+                "GLM5.2 native P/D admitted: rank={rank} slot={slot} \
+                 committed_len={} drafts={} first_step=verify",
+                handoff.committed_len,
+                handoff.draft_tokens.len()
+            );
+        }
+        if drafter_enabled {
+            pending_resets.push(slot);
+        }
+        anyhow::ensure!(
+            kv.lifetime_blocks() == need_blocks,
+            "GLM5.2 admission budget drift: planned {need_blocks} blocks, RequestKv owns \
+             lifetime capacity for {}",
+            kv.lifetime_blocks()
+        );
+        slots[slot] = Some(ActiveRequest {
+            req,
+            state,
+            client_prompt_tokens,
+            kv,
+        });
+        committed += need_blocks;
     }
     Ok(())
 }
@@ -561,7 +483,7 @@ mod tests {
     #[test]
     fn malformed_sampling_params_die_at_intake() {
         // Values the sampler kernel would reject with an `ensure!` — which
-        // past intake means a failed step and a whole-engine teardown.
+        // past intake means a failed step and a fatal engine exit.
         let cases = [
             openinfer_sample::SamplingParams {
                 top_p: 0.0,
@@ -604,47 +526,6 @@ mod tests {
             4,
         );
         assert!(validate_request(&req, 4096, false, false).is_ok());
-    }
-
-    #[test]
-    fn intake_keeps_frontend_binding_and_load_balances_direct_requests() {
-        let mut pending: Vec<VecDeque<GenerateRequest>> = (0..3).map(|_| VecDeque::new()).collect();
-
-        let mut bound = request(vec![10], SamplingParams::default(), 4);
-        bound.data_parallel_rank = Some(2);
-        intake(bound, &mut pending, &[0, 0, 0], 4096, false, false);
-        assert_eq!(
-            pending.iter().map(VecDeque::len).collect::<Vec<_>>(),
-            [0, 0, 1]
-        );
-
-        intake(
-            request(vec![11], SamplingParams::default(), 4),
-            &mut pending,
-            &[2, 1, 2],
-            4096,
-            false,
-            false,
-        );
-        assert_eq!(
-            pending.iter().map(VecDeque::len).collect::<Vec<_>>(),
-            [0, 1, 1]
-        );
-
-        // Rank 1's queued request adds a 4x waiting penalty, so the next
-        // direct request goes to the lower-rank member of the 2/2 tie.
-        intake(
-            request(vec![12], SamplingParams::default(), 4),
-            &mut pending,
-            &[2, 1, 2],
-            4096,
-            false,
-            false,
-        );
-        assert_eq!(
-            pending.iter().map(VecDeque::len).collect::<Vec<_>>(),
-            [1, 1, 1]
-        );
     }
 
     #[test]

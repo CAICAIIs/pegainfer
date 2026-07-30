@@ -29,10 +29,13 @@ pub(crate) struct StepRouteRecord {
     pub(crate) topk_weight_bits: Vec<u32>,
 }
 
-/// One fleet MTP round: which ranks entered with no work, and how long the
-/// whole submit-to-join took on the coordinator.
+/// One rank's MTP round: whether it entered with no work, and how long its
+/// own submit-to-join took. Each engine records its own round — the
+/// coordinator-era record held all ranks because only the coordinator saw
+/// them.
 pub(crate) struct MtpRoundRecord {
-    pub(crate) rank_empty: Vec<bool>,
+    pub(crate) rank: usize,
+    pub(crate) empty: bool,
     pub(crate) elapsed: Duration,
 }
 
@@ -51,7 +54,7 @@ pub(crate) fn record_step_route(record: StepRouteRecord) {
         .push(record);
 }
 
-pub(crate) fn record_mtp_round(rank_empty: Vec<bool>, elapsed: Duration) {
+pub(crate) fn record_mtp_round(rank: usize, empty: bool, elapsed: Duration) {
     if !enabled() {
         return;
     }
@@ -59,7 +62,8 @@ pub(crate) fn record_mtp_round(rank_empty: Vec<bool>, elapsed: Duration) {
         .lock()
         .expect("freerun MTP-round probe lock poisoned")
         .push(MtpRoundRecord {
-            rank_empty,
+            rank,
+            empty,
             elapsed,
         });
 }

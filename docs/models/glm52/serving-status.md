@@ -32,7 +32,7 @@ See `moe-tp8-low-latency.md`, `tp4-gb300-bringup.md`, `ep4-gb300.md`, and `cross
 | Offload | PegaFlow host-tier save/restore behind `--kv-offload` |
 | P/D | vLLM 0.24.0 TP8 prefill → OpenInfer EP8 decode, strict zero-prefill, merged in #657 |
 | Observability | Per-logical-partition running/waiting/KV gauges and decode graph export |
-| Remote ranks | Framed-TCP rank-host control plane; local and remote workers share one typed command contract |
+| Cross-node EP | One process per node hosting its own ranks (`--glm52-ranks` + `--glm52-rendezvous`); free-running per-rank engines, the DeepEP communicator is the only coupling (the framed-TCP rank-host is retired) |
 
 The P/D support matrix and acceptance data live in `pd-m2-execution.md`. It transfers target state only; DSpark draft state is not part of that protocol.
 
@@ -64,7 +64,7 @@ Issue #551 records one request that entered the frontend but never reached a ter
 
 DSpark is mutually exclusive with prefix caching, host offload, and P/D. A prefix hit skips the target forwards that normally produce DSpark's historical auxiliary state. Issue #590 must first measure a position-correct boundary cold start before the project considers transferring the additional draft K/V payload.
 
-Remote rank-host mode also remains incompatible with KV offload. Cross-node request execution and cross-node KV residency are separate protocols today.
+In the multi-process cross-node shape, KV offload registers each node's local arenas on its own pegaflow host under the shared deterministic namespace — the retired rank-host mode was incompatible with offload (its remote arenas could not cross the wire).
 
 ## Performance work
 
@@ -82,4 +82,4 @@ No optimization should be carried forward from these records without a matched A
 
 - #587: expose active slots, current bucket, and queue depth in addition to the scheduler gauges already shipped.
 - PegaFlow metaserver recovery: republish the existing block catalog after reconnect; new saves recover today, old remote prefixes do not.
-- General scale-out beyond a single NVLink/IMEX domain: preserve the rank-host contract, but use a data plane designed and measured for IB/RoCE rather than treating the one-rack result as universal.
+- General scale-out beyond a single NVLink/IMEX domain: preserve the per-node-process contract (free-running ranks + bootstrap rendezvous), but use a data plane designed and measured for IB/RoCE rather than treating the one-rack result as universal.

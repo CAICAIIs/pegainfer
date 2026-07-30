@@ -215,9 +215,9 @@ fn pack_qa_kva(
 /// build (0 where the mma table has no packed route). The context-cap budget
 /// subtracts this up front — the twins land after the free-VRAM probe, and an
 /// unledgered ~1.2 GiB eats the post-build headroom floor. The route query
-/// reads the COORDINATOR's device arch; a mixed-arch `--rank-hosts` fleet
-/// could drift from a remote rank's packing, where the post-build headroom
-/// re-probe is the backstop.
+/// reads the LAUNCHING process's device arch; a mixed-arch fleet (`--glm52-ranks`
+/// spans nodes) could drift from another node's packing, where the post-build
+/// headroom re-probe is the backstop.
 pub(crate) fn glm52_qa_kva_twin_bytes() -> Result<usize> {
     let n = Q_LORA + KV_A_OUT;
     if !glm52_gemv_mma_routes(crate::model::GLM52_MAX_BATCH_PER_RANK, n, HIDDEN)? {

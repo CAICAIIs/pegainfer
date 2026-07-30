@@ -1,19 +1,18 @@
 # GLM5.2 cross-node scaling: DP16 design, and the road to DP32/64
 
-> **TL;DR:** The control plane is SHIPPED and the NVL72 variant of the data plane is proven:
-> `feat/glm52-rank-host` implements the framed-TCP hub-and-spoke below verbatim
-> (`--rank-hosts host:port=N` on the coordinator, `--glm52-rank-host addr` for the dumb
-> rank-host), and on GB300 NVL72 the whole rack is ONE NVLink/IMEX domain, so the existing
-> single-LSA DeepEP shim works cross-tray with **no GIN un-baking at all** — live-verified
-> up to **EP32 across 8 trays**: bucket-1 solo p50 is flat at ~23.3-23.6 ms from EP4 loopback
-> through EP32 (intra-rack width tax ≈ nil), bucket-8 EP32 c256 9072 tok/s, greedy text
-> coherent through the serving path (EP8). EP widths
+> **TL;DR:** The NVL72 variant of the data plane is proven: on GB300 NVL72 the whole rack is
+> ONE NVLink/IMEX domain, so the existing single-LSA DeepEP shim works cross-tray with
+> **no GIN un-baking at all** — live-verified up to **EP32 across 8 trays**: bucket-1 solo p50
+> is flat at ~23.3-23.6 ms from EP4 loopback through EP32 (intra-rack width tax ≈ nil),
+> bucket-8 EP32 c256 9072 tok/s, greedy text coherent through the serving path (EP8). EP widths
 > {4,8,16,32,64} each get a constexpr shim instantiation + `Glm52MoeTopo` variant; the
 > weight-only expert chain is ABI-generic so a new width is a config header, not new code.
 > The GIN scale-out sections below remain the design for IB/RoCE clusters beyond one rack.
 > **架构方向更新(2026-07):** 本文的 Event plane(facts plane)与 SMR coordinator 方向被
 > `free-running-dp.md` 取代——长期架构是删除 coordinator 的 per-rank 独立 engine;本文的
-> NVL72 实测数据与 rank-host(短期已 shipped)仍有效。
+> NVL72 实测数据仍有效。**rank-host 已随 free-running 迁移第 2 步从树上删除
+> (2026-07-30):跨节点 = 同一 binary 每节点一进程(`--glm52-ranks` +
+> `--glm52-rendezvous`),framed-TCP 控制面不复存在;下文 rank-host 章节留作实测记录。**
 > Pitfalls that cost real time: the IMEX channel device must be passed into containers
 > (`--device /dev/nvidia-caps-imex-channels/channel0` — `--gpus` alone silently breaks
 > cross-tray LSA), and a remote-node teardown must `shutdown()` the socket, not just drop

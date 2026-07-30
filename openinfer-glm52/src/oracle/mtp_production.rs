@@ -45,7 +45,8 @@ fn native_mtp_uses_final_normalized_target_hidden() -> Result<()> {
             moe_topo: Glm52MoeTopo::Ep8,
             weight_staging: true,
             dump_graph_png: None,
-            rank_hosts: Vec::new(),
+            ranks: None,
+            rendezvous: None,
         },
     )?;
     let (token_tx, mut token_rx) = TokenSink::standalone();

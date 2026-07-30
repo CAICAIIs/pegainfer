@@ -1,4 +1,4 @@
-//! GLM5.2 native TP4 prefill executor, layer-outer over the coordinator
+//! GLM5.2 native TP4 prefill executor, layer-outer over the prefill
 //! chunk: every layer stage (norm, MLA front, KV pack, o_proj, MoE) runs at
 //! chunk M so the fp8 GEMMs stay large and each MoE layer reads its expert
 //! bank once per chunk (not once per tile). Only two stages sub-tile:
@@ -78,7 +78,7 @@ use crate::runner::Glm52PrefillBatch;
 /// FlashMLA sparse attention sub-tile (query rows per launch).
 ///
 /// The SM100 sparse-prefill kernel accepts arbitrary positive query rows.
-/// Keeping 4K rows in the temporary 64-head buffers cuts a 16K coordinator
+/// Keeping 4K rows in the temporary 64-head buffers cuts a 16K prefill
 /// chunk from 32 launches to 4 while staying inside the fixed
 /// prefill scratch reservation.
 const PREFILL_ATTN_TILE_ROWS: usize = 4096;
@@ -416,7 +416,7 @@ impl Glm52TpPrefillExecutor {
         &self.mtp_proposal_boundary
     }
 
-    /// Run the complete TP4 prefill forward for one coordinator batch,
+    /// Run the complete TP4 prefill forward for one prefill batch,
     /// layer-outer: each of the 78 layers processes the whole chunk before
     /// the next layer starts. Returns tokens only for request boundary rows.
     pub(crate) fn forward(

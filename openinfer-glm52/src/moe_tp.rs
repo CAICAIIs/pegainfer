@@ -518,7 +518,7 @@ impl Glm52MoeTpRank {
 pub(crate) const GLM52_PREFILL_MOE_BLOCK_ROWS: usize = 8192;
 
 /// Chunk-scale TP prefill MoE scratch: the router runs over the whole
-/// coordinator batch, routes are grouped on device, and both expert
+/// prefill batch, routes are grouped on device, and both expert
 /// projections run as ONE FlashInfer CUTLASS grouped GEMM over the rank's
 /// 256 routed-expert slices (fp8 weights + f32 block scales, checkpoint
 /// layout as-is — no cubins, no UE8M0 requant). The shared expert (bank

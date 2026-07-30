@@ -1,12 +1,11 @@
-//! Offline replica of the coordinator's engine-fatal KV contract: the exact
+//! Offline replica of the engine's engine-fatal KV contract: the exact
 //! schedule/apply sequence of the submit walk, driven end to end against a
-//! real [`BlockPool`] — a schedule failure in serving tears the whole EP8
-//! engine down, so the full-lifetime reservation must be proven tight here.
+//! real [`BlockPool`] — a schedule failure in serving is engine-fatal, so
+//! the full-lifetime reservation must be proven tight here.
 
 use std::collections::VecDeque;
 
 use openinfer_core::engine::FinishReason;
-use openinfer_core::engine::GenerateRequest;
 use openinfer_core::engine::LoadSnapshot;
 use openinfer_core::engine::TokenSink;
 use openinfer_kv_cache::BlockPool;
@@ -41,193 +40,172 @@ fn graph_dump_uses_a_serving_shape_for_each_topology() {
 }
 
 #[test]
-fn load_snapshots_keep_rank_ownership() {
-    let pools = vec![
-        BlockPool::new(PAGE, 8).expect("rank 0 pool"),
-        BlockPool::new(PAGE, 8).expect("rank 1 pool"),
-    ];
-    let mut slots: Vec<RankSlots> = (0..2).map(|_| std::array::from_fn(|_| None)).collect();
+fn load_snapshot_reports_the_ranks_own_state() {
+    let pool = BlockPool::new(PAGE, 8).expect("pool");
+    let mut slots: RankSlots = std::array::from_fn(|_| None);
 
     let req = request(vec![10, 11], SamplingParams::default(), 4);
     let state = Glm52SlotState::new(req.prompt_tokens.clone(), req.max_tokens, true, 0);
-    let mut kv = pools[0].new_request(req.prompt_tokens.clone(), req.max_tokens, None);
-    kv.schedule_prefill(1, &pools[0])
-        .expect("rank 0 owns one live KV block");
-    slots[0][0] = Some(ActiveRequest {
+    let mut kv = pool.new_request(req.prompt_tokens.clone(), req.max_tokens, None);
+    kv.schedule_prefill(1, &pool)
+        .expect("one live KV block");
+    slots[0] = Some(ActiveRequest {
         req,
         state,
         client_prompt_tokens: 2,
         kv,
     });
 
-    let mut pending: Vec<VecDeque<GenerateRequest>> = (0..2).map(|_| VecDeque::new()).collect();
-    pending[1].push_back(request(vec![20], SamplingParams::default(), 4));
-    pending[1].push_back(request(vec![21], SamplingParams::default(), 4));
+    let mut pending = VecDeque::new();
+    pending.push_back(request(vec![20], SamplingParams::default(), 4));
+    pending.push_back(request(vec![21], SamplingParams::default(), 4));
 
-    let channels: Vec<_> = (0..2)
-        .map(|_| tokio::sync::watch::channel(LoadSnapshot::default()))
-        .collect();
-    let load_txs: Vec<_> = channels.iter().map(|(tx, _)| tx.clone()).collect();
-    let load_rxs: Vec<_> = channels.into_iter().map(|(_, rx)| rx).collect();
-    publish_load(&load_txs, &pools, &slots, &pending);
+    let (load_tx, load_rx) = tokio::sync::watch::channel(LoadSnapshot::default());
+    publish_load(&load_tx, &pool, &slots, &pending);
 
-    let rank0 = *load_rxs[0].borrow();
-    assert_eq!(rank0.num_running_reqs, 1);
-    assert_eq!(rank0.num_waiting_reqs, 0);
-    assert_eq!(rank0.kv_total_blocks, 7);
-    assert_eq!(rank0.kv_used_blocks, 1);
-
-    let rank1 = *load_rxs[1].borrow();
-    assert_eq!(rank1.num_running_reqs, 0);
-    assert_eq!(rank1.num_waiting_reqs, 2);
-    assert_eq!(rank1.kv_total_blocks, 7);
-    assert_eq!(rank1.kv_used_blocks, 0);
+    let snapshot = *load_rx.borrow();
+    assert_eq!(snapshot.num_running_reqs, 1);
+    assert_eq!(snapshot.num_waiting_reqs, 2);
+    assert_eq!(snapshot.kv_total_blocks, 7);
+    assert_eq!(snapshot.kv_used_blocks, 1);
 }
 
 #[test]
-fn admission_never_moves_a_rank_bound_request() {
-    let pools = vec![
-        BlockPool::new(PAGE, 8).expect("rank 0 pool"),
-        BlockPool::new(PAGE, 8).expect("rank 1 pool"),
-    ];
-    let mut slots: Vec<RankSlots> = (0..2).map(|_| std::array::from_fn(|_| None)).collect();
-    let mut pending: Vec<VecDeque<GenerateRequest>> = (0..2).map(|_| VecDeque::new()).collect();
+fn admission_fills_free_slots_from_the_local_queue() {
+    let pool = BlockPool::new(PAGE, 8).expect("pool");
+    let mut slots: RankSlots = std::array::from_fn(|_| None);
+    let mut pending = VecDeque::new();
     let mut req = request(vec![10], SamplingParams::default(), 4);
-    req.data_parallel_rank = Some(1);
+    req.data_parallel_rank = Some(0);
     let (token_tx, _token_rx) = TokenSink::standalone();
     req.token_tx = token_tx;
-    pending[1].push_back(req);
-    let mut pending_resets = vec![Vec::new(), Vec::new()];
-    let mut slots_changed = false;
+    pending.push_back(req);
+    let mut pending_resets = Vec::new();
 
     admit_from_queue(
+        0,
         &mut pending,
         &mut slots,
-        &pools,
-        &[7, 7],
+        &pool,
+        7,
         None,
         &mut None,
         &mut None,
-        &[],
+        None,
         false,
         false,
         false,
         false,
         &mut pending_resets,
-        &mut slots_changed,
     )
     .expect("admission");
 
-    assert!(slots[0].iter().all(Option::is_none));
-    assert!(slots[1][0].is_some());
-    assert!(pending.iter().all(VecDeque::is_empty));
-    assert!(slots_changed);
+    assert!(slots[0].is_some());
+    assert!(pending.is_empty());
 }
 
 #[test]
 fn prefill_only_admits_multiple_requests_within_pool_capacity() {
-    let pools = vec![BlockPool::new(PAGE, 16).expect("pool")];
-    let mut slots: Vec<RankSlots> = vec![std::array::from_fn(|_| None)];
-    let mut pending: Vec<VecDeque<GenerateRequest>> = vec![VecDeque::new()];
+    let pool = BlockPool::new(PAGE, 16).expect("pool");
+    let mut slots: RankSlots = std::array::from_fn(|_| None);
+    let mut pending = VecDeque::new();
     let mut token_receivers = Vec::new();
     for token in [10, 20] {
         let mut req = request(vec![token], SamplingParams::default(), 1);
         let (token_tx, token_rx) = TokenSink::standalone();
         req.token_tx = token_tx;
         token_receivers.push(token_rx);
-        pending[0].push_back(req);
+        pending.push_back(req);
     }
-    let mut pending_resets = vec![Vec::new()];
-    let mut slots_changed = false;
+    let mut pending_resets = Vec::new();
 
     admit_from_queue(
+        0,
         &mut pending,
         &mut slots,
-        &pools,
-        &[15],
+        &pool,
+        15,
         None,
         &mut None,
         &mut None,
-        &[],
+        None,
         true,
         true,
         false,
         true,
         &mut pending_resets,
-        &mut slots_changed,
     )
     .expect("prefill-only admission");
 
-    assert_eq!(slots[0].iter().flatten().count(), 2);
-    assert!(pending[0].is_empty());
+    assert_eq!(slots.iter().flatten().count(), 2);
+    assert!(pending.is_empty());
 }
 
 #[test]
 fn admission_defers_while_physical_pages_are_temporarily_held() {
-    let pools = vec![BlockPool::new(PAGE, 6).expect("pool")];
-    let mut held = pools[0].new_request(vec![1; 2 * PAGE], 1, None);
-    held.schedule_prefill(2 * PAGE, &pools[0])
+    let pool = BlockPool::new(PAGE, 6).expect("pool");
+    let mut held = pool.new_request(vec![1; 2 * PAGE], 1, None);
+    held.schedule_prefill(2 * PAGE, &pool)
         .expect("temporarily hold two physical pages");
 
-    let mut slots: Vec<RankSlots> = vec![std::array::from_fn(|_| None)];
-    let mut pending: Vec<VecDeque<GenerateRequest>> = vec![VecDeque::new()];
+    let mut slots: RankSlots = std::array::from_fn(|_| None);
+    let mut pending = VecDeque::new();
     let mut req = request(vec![2; 3 * PAGE], SamplingParams::default(), 1);
     let (token_tx, _token_rx) = TokenSink::standalone();
     req.token_tx = token_tx;
-    pending[0].push_back(req);
-    let mut pending_resets = vec![Vec::new()];
-    let mut slots_changed = false;
+    pending.push_back(req);
+    let mut pending_resets = Vec::new();
 
     admit_from_queue(
+        0,
         &mut pending,
         &mut slots,
-        &pools,
-        &[5],
+        &pool,
+        5,
         None,
         &mut None,
         &mut None,
-        &[],
+        None,
         true,
         true,
         false,
         true,
         &mut pending_resets,
-        &mut slots_changed,
     )
     .expect("temporary pressure is not an admission error");
 
-    assert_eq!(pending[0].len(), 1, "request stays queued");
-    assert!(slots[0].iter().all(Option::is_none));
+    assert_eq!(pending.len(), 1, "request stays queued");
+    assert!(slots.iter().all(Option::is_none));
 
     held.revert_schedule().expect("release temporary pages");
     admit_from_queue(
+        0,
         &mut pending,
         &mut slots,
-        &pools,
-        &[5],
+        &pool,
+        5,
         None,
         &mut None,
         &mut None,
-        &[],
+        None,
         true,
         true,
         false,
         true,
         &mut pending_resets,
-        &mut slots_changed,
     )
     .expect("admit after pressure clears");
 
-    assert!(pending[0].is_empty());
-    assert_eq!(slots[0].iter().flatten().count(), 1);
+    assert!(pending.is_empty());
+    assert_eq!(slots.iter().flatten().count(), 1);
 }
 
-/// Drive one request end to end through the coordinator's exact
-/// schedule/apply sequence against `pool` — the offline replica of the
-/// two engine-fatal submit-walk assertions (span start == `kv_position`,
-/// schedule never fails under the admission reservation). Verify spans
-/// fully accept their drafts, maximizing the KV draw per round. Returns
-/// the first schedule failure (the tight-budget control asserts one).
+/// Drive one request end to end through the engine's exact schedule/apply
+/// sequence against `pool` — the offline replica of the two engine-fatal
+/// submit-walk assertions (span start == `kv_position`, schedule never fails
+/// under the admission reservation). Verify spans fully accept their drafts,
+/// maximizing the KV draw per round. Returns the first schedule failure (the
+/// tight-budget control asserts one).
 fn drive_request(
     pool: &BlockPool,
     prompt_len: usize,
@@ -305,7 +283,7 @@ fn drive_request(
 #[test]
 fn full_lifetime_reservation_covers_kvbm_peak_draw() {
     // The submit walk turns any schedule failure into an engine
-    // teardown; this is that contract's offline test. A pool sized
+    // exit; this is that contract's offline test. A pool sized
     // exactly `lifetime_blocks + 1` (padding) must carry every shape end
     // to end — and one block less must NOT, or the reservation is merely
     // sufficient by accident, not tight.

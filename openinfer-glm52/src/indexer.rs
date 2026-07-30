@@ -640,7 +640,7 @@ pub(crate) fn glm52_indexer_forward(
     Ok(s.global_slots)
 }
 
-/// Upper bound on requests sharing one prefill coordinator chunk (sizes the
+/// Upper bound on requests sharing one prefill chunk (sizes the
 /// per-request gather tables; exceeding it fails the chunk explicitly).
 pub(crate) const GLM52_INDEXER_PREFILL_MAX_REQUESTS: usize = 128;
 
@@ -757,7 +757,7 @@ impl Glm52IndexerPrefillScratch {
 
     /// Stage the per-chunk request plan: segment ranges, per-query kv ends,
     /// per-query LUT bases, and the per-request gather tables. Called once
-    /// per coordinator batch, before the layer loop.
+    /// per prefill batch, before the layer loop.
     pub(crate) fn stage_chunk(
         &mut self,
         ctx: &DeviceContext,

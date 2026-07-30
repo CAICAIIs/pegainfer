@@ -63,7 +63,7 @@ use crate::moe_ep_wo::glm52_moe_ep_wo_routed_forward;
 use crate::scratch::Glm52DecodeScratch;
 
 const EP_RANKS: usize = 4;
-/// Every global-token protocol value the production coordinator can agree on
+/// Every global-token protocol value a production engine can pass
 /// — one per decode bucket, largest first (the worst-case row bound leads).
 const GLOBAL_TOKEN_BUCKETS: [usize; GLM52_DECODE_BUCKETS.len()] = {
     let mut buckets = [0usize; GLM52_DECODE_BUCKETS.len()];

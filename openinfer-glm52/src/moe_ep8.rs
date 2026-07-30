@@ -1,9 +1,9 @@
 //! GLM5.2 EP8 routed-MoE decode: the DeepEP dispatch/combine collectives
 //! around the DeepGEMM masked grouped fp8 GEMMs.
 //!
-//! Every rank runs the same collective per MoE layer: a rank with an active
-//! request dispatches its token (under the DP8 coordinator that is every
-//! rank, padding tokens included) and computes its 32 local experts over
+//! Every rank runs the same collective per MoE layer (every rank steps
+//! unconditionally, padding tokens included): a rank dispatches its rows
+//! and computes its 32 local experts over
 //! whatever the all-to-all delivered:
 //!
 //! ```text
@@ -70,7 +70,7 @@ use crate::moe_decode::W13_K;
 use crate::moe_decode::W13_N;
 
 /// One rank's weights for one EP8 MoE layer: router and shared expert run
-/// where the token lives (every rank, under the DP8 coordinator); the bank
+/// where the token lives (every rank); the bank
 /// holds this rank's 32 local experts.
 pub(crate) struct Glm52MoeEp8LayerWeights {
     pub(crate) router: Glm52MoeRouterWeights,
@@ -199,8 +199,9 @@ impl Glm52MoeEp8State {
 /// single-dispatcher replay.
 ///
 /// `global_tokens` is the total token count dispatched across ALL ranks this
-/// step — every rank must pass the same value (a protocol constant of the
-/// coordinator, not derived from device data, so the chain stays host-quiet).
+/// step — every rank passes the same protocol constant
+/// (`ep_ranks × GLM52_MAX_BATCH_PER_RANK`, not derived from device data, so
+/// the chain stays host-quiet).
 /// It bounds how many recv rows the re-quant/SiLU kernels must cover instead
 /// of the fixed worst case: each source token expands to at most `TOPK` rows
 /// on this rank, and each non-empty local expert segment pads to the

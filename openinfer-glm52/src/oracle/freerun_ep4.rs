@@ -16,16 +16,16 @@
 //!    every replay must be bit-identical to that rank's eager reference. This
 //!    is the "different ranks replay different buckets" claim.
 //! 3. [`freerun_bound_tax_probe`] — measures the routed chain at the tight
-//!    coordinator-agreed `global_tokens` vs the free-running protocol max.
+//!    per-step-agreed `global_tokens` vs the free-running protocol max.
 //!    The delta × 75 MoE layers is the per-step tax of deleting the global
 //!    bucket agreement; the number feeds the design's go/no-go, so this
 //!    probe prints measurements and never asserts.
 //!
 //! Run each gate in its OWN `cargo test` process: the DeepEP context is
 //! once-per-process on this shim (a second `ctx_create` after a destroy
-//! hits an NVLink barrier timeout — the rank-host contract's "process exit
-//! is the release mechanism"). Results 2026-07-30 on GB300 tray03 (all GO)
-//! are recorded in `docs/models/glm52/free-running-dp.md` §8.
+//! hits an NVLink barrier timeout — process exit is the release mechanism).
+//! Results 2026-07-30 on GB300 tray03 (all GO) are recorded in
+//! `docs/models/glm52/free-running-dp.md` §8.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -66,7 +66,7 @@ use crate::moe_ep_wo::glm52_moe_ep_wo_routed_forward;
 
 const EP_RANKS: usize = 4;
 /// The free-running conservative bound: every rank always passes the
-/// protocol max instead of a coordinator-agreed per-step bucket value.
+/// protocol max instead of a per-step-agreed bucket value.
 const PROTOCOL_MAX: usize = EP_RANKS * GLM52_MAX_BATCH_PER_RANK;
 
 /// Synthetic dispatch traffic for a side rank: seeded hidden rows plus a
@@ -354,8 +354,8 @@ fn freerun_hetero_graph_gate() -> Result<()> {
 ///
 /// Every rank dispatches ONE decode token per collective (the steady-decode
 /// shape that dominates TPOT) and the chain runs back-to-back at two bounds:
-/// the tight coordinator-agreed value (`EP_RANKS`, today's bucket-1
-/// agreement) and the free-running `PROTOCOL_MAX`. The per-call delta × 75
+/// the tight per-step-agreed value (`EP_RANKS`, the retired coordinator's
+/// bucket-1 agreement) and the free-running `PROTOCOL_MAX`. The per-call delta × 75
 /// MoE layers is the step tax of deleting the bucket agreement. Prints
 /// measurements; the go/no-go judgement lives in the design doc, not here.
 #[test]

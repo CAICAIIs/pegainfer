@@ -8,8 +8,11 @@
 > 三条静态纪律(固定链、保守 bound、padding 即协议)。**§8 五个 gate 已全部 GO
 > (2026-07-30,GB300 tray03):跨 rank 流量不变性 bit-exact、异构 token 数 graph 回放
 > bit-exact、保守 bound 税 = 0、padding 字节逐步恒定、MTP 固定链轨迹相同且空 round
-> 开销 = 0。§10 迁移第 1 步已实装并验证(per-rank bucket、协议最大 global_tokens、
-> MTP 固定链;lease 暂保持全局,理由见 §10)。** 取代 `cross-node-scaling.md` 的
+> 开销 = 0。§10 两步迁移均已实装:第 1 步 per-rank bucket、协议最大 global_tokens、
+> MTP 固定链(gate 1–5 验证);第 2 步拆壳完成——coordinator 删除,每 DP rank 一个自治
+> engine 线程,lease 本地化(always-consume,stale-replay 路径消失),rank-host
+> (remote.rs,978 行)退役,跨节点 = 同一 binary 每节点一进程 + 一次性 bootstrap
+> rendezvous(rank0 进程分发 DeepEP unique id)。** 取代 `cross-node-scaling.md` 的
 > Event plane 与 SMR 方向(该文档的 NVL72 实测数据仍有效)。
 >
 > **Last touched:** 2026-07
@@ -247,45 +250,58 @@ return all hosted GPU state; process exit is the release mechanism")。gate 必�
 
 | 现在 | 之后 |
 |---|---|
-| `run_dp8_coordinator`(14 参数,持全 fleet 状态) | 降维成单 rank engine loop;`Vec<RankSlots>` → `RankSlots`,`for rank` 循环消失 |
-| `plan_step_shapes`(hungriest rank) | 纯本地 `plan_step_shape(&my_wants)`;函数仍纯,contract tests 保留 |
-| `launch_ahead_flags`(all-ranks-or-none) | 纯本地 bit |
-| `select_round_kind` + MTP 全局 bucket/ensure | 删除(固定 5-forward 链) |
-| `remote.rs`(978 行)+ rank-host + Event plane | 退役;跨节点 = 每节点进程加入同一 communicator |
-| `VllmPdState`/`NativePdState`(coordinator 持有) | engine 本地字段;parked 5ms sleep 节流消失 |
-| mirrored TP8/TP4 | 原样(本就是 N=1 特例) |
-| `fail_step` 全局收尸 | 本地 watchdog + router 健康检查 |
+| ~~`run_dp8_coordinator`(14 参数,持全 fleet 状态)~~ | **已拆**:`Glm52Engine` per-rank 自治 loop(`scheduler/mod.rs`),`Vec<RankSlots>` → `RankSlots`,`for rank` 循环消失;EP 无条件全速 step,mirrored TP 是 N=1 退化(保留空闲阻塞) |
+| ~~`plan_step_shapes`(hungriest rank)~~ | **已降维**:`plan_step_shape(&my_wants)`;函数仍纯,contract tests 原样迁移 |
+| ~~`launch_ahead_flags`(all-ranks-or-none)+ stale-replay 重跑~~ | **已本地化**:`lease_flags` always-consume——lease 冻结 slot 集合一步(finish/断连延迟物理释放、新请求延迟一步 admit),`consume` 从决策变结构保证;空 rank 显式禁 lease(修掉 vacuous-true 下 padding row `slot_mapping` 漂出 padding page 的漏洞) |
+| ~~`select_round_kind` + MTP 全局 bucket/ensure~~ | **已删**(固定 5-forward 链,迁移第 1 步) |
+| ~~`remote.rs`(978 行)+ rank-host + `--rank-hosts`~~ | **已退役**:跨节点 = 同一 binary 每节点一进程加入同一 DeepEP communicator;新增一次性 bootstrap rendezvous(`rendezvous.rs`,rank0 进程分发 unique id,`--glm52-ranks 4..8` + `--glm52-rendezvous`) |
+| ~~`VllmPdState`/`NativePdState`(coordinator 持有) | **已本地化**:engine 本地字段;parked 5ms sleep 节流消失(无条件 step 提供重试 cadence) |
+| 请求路由(coordinator intake 绑秩) | **已上移**:`EngineHandle` 多 submit channel,按 `data_parallel_rank` 路由,无标请求 least-load(4x waiting)读 load watches;HTTP 端点先复用每进程单 endpoint(客户端可显式 pin rank),每 rank 独立 endpoint 待 router 对接时再做 |
+| mirrored TP8/TP4 | 原样(本就是 N=1 特例,骑同一 engine loop) |
+| ~~`fail_step` 全局收尸~~ | **已去中心化**:rank 本地 fatal → error log + 本地请求发 Error + `process::exit(1)`;fleet 经 collective 超时传染 fail-stop(§6)。per-rank step watchdog 仍是后续项 |
 
 ## 10. 迁移路径
 
 不 big-bang。gates 绿后两步:
 
-1. **协议先变,结构后变(已实装,待 GPU 验证)**:保留 coordinator 的壳,协议全部
-   per-rank 化——
-   - `plan_step_shapes`:每 rank 的 bucket 只看自己的 demand(hungriest-rank max 删除;
-     TP8 的 `full_bucket` 钉死不变);
-   - `global_tokens`:`model/mod.rs` 与 `model/mtp.rs` 统一改为协议最大值
-     `ep_ranks × GLM52_MAX_BATCH_PER_RANK`(gate 3 的零税结果直接授权);
-   - MTP round:`select_round_kind` + `source_bucket` 跨 rank ensure + 全局 bucket max
-     删除;`Glm52MtpRound` 从三变体 enum 收敛为单结构体,每 rank 每 round 无条件跑
-     固定链,padding 行显式清零;
-   - launch-ahead lease/consume **保持全局**:未 consume 的 speculation 会把该步重跑
-     一遍(第二条完整 collective 链),只有全员一起投机才配对。lease 变 rank-local bit
-     的前提是"stale-replay 重跑路径消失",那是第 2 步拆壳后的事(自治 engine 永远
-     consume 自己的投机)。
-   每步有现有 golden/e2e gate 兜底;gate 4/5(§8)在 whole-step 路径上验收本步。
-2. **拆壳**:coordinator 循环拆成 N 个 engine 线程,各自挂 HTTP endpoint;bootstrap
-   rendezvous 收编启动逻辑。跨节点 = 同一 binary 每节点一进程。
+1. **协议先变,结构后变(已实装并验证)**:保留 coordinator 的壳,协议全部
+   per-rank 化——per-rank bucket、协议最大 `global_tokens`、MTP 固定链;launch-ahead
+   lease/consume 暂保持全局。gate 4/5(§8)在 whole-step 路径上验收本步。
+2. **拆壳(已实装,2026-07-30)**:coordinator 循环拆成 N 个 engine 线程,lease
+   本地化(always-consume),rank-host 退役,bootstrap rendezvous 收编启动期协调。
+   实现要点:
+   - **请求入口**:`EngineHandle` 扩展为 per-rank 多 submit channel(`new_with_join_handles`),
+     `submit()` 按 `data_parallel_rank` 路由;vLLM frontend 与 server 零改动
+     (`frontend_engine_count` = 本进程 rank 数)。
+   - **启动屏障**:各 engine 按固定 bucket 顺序各自 precapture——collective 天然
+     rendezvous;bootstrap 结果逐个上报 launcher,任一失败关闸全 join,fail-stop。
+   - **优雅退出**:channel 断开(bridge 已 abort 在途请求)→ 各 engine drain 后退出
+     loop → 各自 flush offload + shutdown 自己的 worker(DeepEP destroy barrier 自然
+     配对)→ handle join 全部线程。
+   - **跨节点**:`--glm52-ranks <start..end>` 指定本进程托管的全局 rank 段,
+     `--glm52-rendezvous <addr:port>` 是一次性 id 分发(rank0 进程绑定并幂等服务,
+     其余连接拉取;范围错 tile → DeepEP `ctx_create` 挂住 → 超时 → 各方 error log +
+     退出)。**注意 `max_model_len` 现为各节点本地 VRAM 推导,跨节点可能发散**——
+     不进 collective、不炸协议,但多机部署应显式 `--max-model-len` 保持 fleet 口径一致。
+   - **KV offload 跨节点自然解锁**:每节点只注册本地 arena 到自己的 pegaflow host
+     (老 blocker "remote arena 指针过不了 wire" 随 rank-host 一起消失),namespace
+     推导确定、各节点一致。native MTP 保持单机限制。
+   验收:全量单测 + clippy(本机,2026-07-30);EP4 五 gate 回归与 EP16 双 tray
+   rendezvous 验证挂 GPU 执行(见 Next step)。
 
 ## 与 cross-node-scaling.md 的关系
 
 该文档的 NVL72 实测数据(EP4→EP32 bucket-1 p50 平坦、IMEX/teardown 坑)仍然有效且
-load-bearing。被本设计取代的部分:framed-TCP rank-host 作为**长期架构**(短期已 shipped
-可用)、Event plane(facts plane)设计、SMR coordinator 方向。replay journal 片段被本
-设计吸收(第 7 节)。
+load-bearing。被本设计取代并已随第 2 步删除的部分:framed-TCP rank-host 作为
+**长期架构**(短期已 shipped 可用,2026-07-30 从树上删除)、Event plane(facts plane)
+设计、SMR coordinator 方向。replay journal 片段被本设计吸收(第 7 节)。
 
 ## Next step
 
-迁移第 1 步已实装并全绿(gate 1–3 回归 + gate 4/5 首跑,tray03,2026-07-30)。下一步是
-§10 第 2 步拆壳:coordinator 循环拆成 N 个 engine 线程 + 独立 HTTP endpoint + bootstrap
-rendezvous。EP16 的 bound-tax 复测挂在第一次跨 tray 部署时顺带跑。
+迁移两步均已实装。挂 GPU 的验收序列:
+1. **EP4 五 gate 回归**(tray03):拆壳后单机路径不变的证明——逐 gate 单进程跑 §8 命令。
+2. **e2e/golden 回归**:qwen 系 golden gate 与 glm52 既有 e2e。
+3. **EP16 双 tray 首验**:rendezvous + 服务 + fail-stop(杀一个 rank 的进程,全 fleet
+   数秒内经 collective 超时退出)+ bound-tax 复测(EP16 shim 常量不同,§8 gate 3 注记)。
+4. per-rank step watchdog(§6 的去中心化收尸的最后一块)与每 rank 独立 HTTP endpoint
+   (router 对接时)仍是后续项。

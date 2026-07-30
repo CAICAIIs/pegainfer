@@ -113,7 +113,7 @@
 ### EP4 / GB300 bring-up
 
 - Enabled `--glm52-native-mtp` for the single-node `--moe-topo ep4` topology at both the server
-  and model-engine validation boundaries. TP topologies and remote rank-hosts remain rejected.
+  and model-engine validation boundaries. TP topologies and multi-process rank ranges remain rejected.
 - Added an EP4 resident-weight-plan gate: rank 3 carries layer-78 experts `192..256`, alongside
   the MTP non-expert tensors.
 - The first real request exposed a second EP8 assumption after successful weight load and graph

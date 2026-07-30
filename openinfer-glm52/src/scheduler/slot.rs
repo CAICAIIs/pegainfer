@@ -136,7 +136,7 @@ pub(super) struct Glm52SlotState {
 /// on EVERY tested prompt class. The drafter still proposes 7; the tail is
 /// simply not fed. Under the TP8 topology that economics inverts — the span
 /// MoE mapping computes 8 rows at the same MoE cost as 1 — so the tp8
-/// coordinator feeds all 7 (`GLM52_DSPARK_DRAFTS`); the cap is a per-round
+/// engine feeds all 7 (`GLM52_DSPARK_DRAFTS`); the cap is a per-round
 /// argument, not this constant.
 pub(super) const GLM52_DSPARK_EP8_SPAN_DRAFTS: usize = 3;
 

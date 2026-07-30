@@ -59,16 +59,17 @@ pub(crate) struct Glm52RankWeightLoadReport {
     pub(crate) free_vram_bytes: usize,
 }
 
-/// The coordinator's launch-ahead directives for one step — both stay
-/// fleet-wide until the coordinator split: a NON-consumed speculation
-/// re-runs the step (a second full collective chain), which pairs only if
-/// every rank speculated together (see `plan::launch_ahead_flags`).
+/// The engine's launch-ahead directives for one step. Both directions are
+/// rank-local: an engine leases its OWN next step speculatively and always
+/// consumes its own speculation (the slot set is frozen while a lease is
+/// outstanding — see `plan::lease_flags`), so the consume/lease pairing
+/// needs no cross-rank agreement.
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Glm52StepFlags {
-    /// This step IS the speculative replay every rank enqueued last step.
+    /// This step IS the speculative replay this engine enqueued last step.
     pub(crate) consume: bool,
     /// The next step is guaranteed to repeat this shape with each row
-    /// advanced by its own argmax — every rank MUST enqueue that next
+    /// advanced by its own argmax — the engine MUST enqueue that next
     /// replay launch-ahead (see `Glm52RankModel::decode_step`).
     pub(crate) lease: bool,
     /// Bypass CUDA graph capture and replay.
@@ -229,14 +230,14 @@ enum Glm52RankCommand {
         tp_exchange: Option<Arc<Glm52TpExchange>>,
         resp: Sender<Result<()>>,
     },
-    /// One lock-step full-model step (75 MoE collectives inside): feed
+    /// One full-model step for one rank (75 MoE collectives inside): feed
     /// `inputs[row]` per forwarded row (a slot's span rows walk consecutive
     /// positions), reply with the next token per ROW (greedy argmax, or a
-    /// sampling pass for the rows in `sampling`). The coordinator sends this
-    /// to every rank each global step; `shape.bucket` is rank-local (the MoE
-    /// collectives take rank-local row counts under the conservative
-    /// protocol-max bound) — padding rows ride free slots and their outputs
-    /// are discarded.
+    /// sampling pass for the rows in `sampling`). The rank's engine sends
+    /// this unconditionally every step — idle ranks enter with padding rows
+    /// and their outputs are discarded; `shape.bucket` is rank-local (the
+    /// MoE collectives take rank-local row counts under the conservative
+    /// protocol-max bound).
     Step {
         inputs: Box<[(u32, usize); GLM52_MAX_BATCH_PER_RANK]>,
         shape: Glm52StepShape,
@@ -265,7 +266,8 @@ enum Glm52RankCommand {
     FreeVram {
         resp: Sender<Result<usize>>,
     },
-    /// Rank-local draft round (no collectives; runs between global steps).
+    /// Rank-local draft round (no collectives; runs between this rank's
+    /// steps).
     /// `resets` clear slot draft states (request left / new admission),
     /// `appends` feed step rows of the LAST Step's `bucket` capture buffer to
     /// slot pending contexts, `proposals` ask for a 7-token draft span per
@@ -278,9 +280,10 @@ enum Glm52RankCommand {
         proposals: Vec<(usize, u32, usize)>,
         resp: Sender<Result<Vec<[u32; GLM52_DSPARK_DRAFTS]>>>,
     },
-    /// Collective native-MTP round. Every EP rank receives one command,
-    /// including ranks with no live proposal, and uses the coordinator-agreed
-    /// context/draft buckets for the layer-78 MoE collectives.
+    /// Collective native-MTP round. Every EP rank's engine issues one command
+    /// per step, including ranks with no live proposal (padding rows enter the
+    /// fixed chain), with the rank's OWN context/draft buckets for the
+    /// layer-78 MoE collectives — no cross-rank round-kind negotiation.
     MtpDraft {
         round: Glm52MtpRound,
         resp: Sender<Result<Vec<[u32; crate::mtp::GLM52_MTP_DRAFTS]>>>,
@@ -508,7 +511,7 @@ impl Glm52RankWorker {
         Ok(resp_rx)
     }
 
-    fn dump_decode_graph_async(
+    pub(crate) fn dump_decode_graph_async(
         &self,
         bucket: usize,
         png_path: PathBuf,
@@ -555,155 +558,11 @@ impl Drop for Glm52RankWorker {
     }
 }
 
-/// One rank executor as the engine sees it: an in-process worker thread or a
-/// rank-host-side worker behind the wire. Same typed surface either way (the
-/// remote twin mirrors [`Glm52RankWorker`] method-for-method), so the
-/// coordinator and the load/build/probe paths never branch on locality.
-pub(crate) enum Glm52Worker {
-    Local(Glm52RankWorker),
-    Remote(crate::remote::Glm52RemoteRankWorker),
-}
-
-impl Glm52Worker {
-    pub(crate) fn load_weights_async(
-        &self,
-        model_path: &Path,
-        moe_topo: crate::Glm52MoeTopo,
-        weight_staging: bool,
-    ) -> Result<Receiver<Result<Glm52RankWeightLoadReport>>> {
-        match self {
-            Self::Local(worker) => worker.load_weights_async(model_path, moe_topo, weight_staging),
-            Self::Remote(worker) => worker.load_weights_async(model_path, moe_topo, weight_staging),
-        }
-    }
-
-    pub(crate) fn build_model_async(
-        &self,
-        max_model_len: usize,
-        moe_topo: crate::Glm52MoeTopo,
-        drafter: crate::Glm52Drafter,
-        prefill_chunk_size: Option<usize>,
-    ) -> Result<Receiver<Result<Vec<KvArena>>>> {
-        match self {
-            Self::Local(worker) => {
-                worker.build_model_async(max_model_len, moe_topo, drafter, prefill_chunk_size)
-            }
-            Self::Remote(worker) => {
-                ensure!(
-                    prefill_chunk_size.is_none(),
-                    "GLM5.2 TP4 prefill-only execution is single-host"
-                );
-                worker.build_model_async(max_model_len, moe_topo, drafter)
-            }
-        }
-    }
-
-    pub(crate) fn setup_comm_async(
-        &self,
-        unique_id: [u8; 128],
-        moe_topo: crate::Glm52MoeTopo,
-        tp_exchange: Option<Arc<Glm52TpExchange>>,
-    ) -> Result<Receiver<Result<()>>> {
-        match self {
-            Self::Local(worker) => worker.setup_comm_async(unique_id, moe_topo, tp_exchange),
-            Self::Remote(worker) => {
-                ensure!(
-                    tp_exchange.is_none(),
-                    "GLM5.2 tensor-replicated topologies are single-node"
-                );
-                worker.setup_comm_async(unique_id, moe_topo)
-            }
-        }
-    }
-
-    pub(crate) fn step_async(
-        &self,
-        inputs: [(u32, usize); GLM52_MAX_BATCH_PER_RANK],
-        shape: Glm52StepShape,
-        kv: Glm52StepKv,
-        flags: Glm52StepFlags,
-        sampling: Vec<Glm52RowSample>,
-        seed: u64,
-    ) -> Result<Receiver<Result<[u32; GLM52_MAX_BATCH_PER_RANK]>>> {
-        match self {
-            Self::Local(worker) => worker.step_async(inputs, shape, kv, flags, sampling, seed),
-            Self::Remote(worker) => worker.step_async(inputs, shape, kv, flags, sampling, seed),
-        }
-    }
-
-    pub(crate) fn prefill_chunk_async(
-        &self,
-        batch: Glm52PrefillBatch,
-    ) -> Result<Receiver<Result<Glm52PrefillOutput>>> {
-        match self {
-            Self::Local(worker) => worker.prefill_chunk_async(batch),
-            Self::Remote(_) => {
-                anyhow::bail!("GLM5.2 TP4 prefill-only execution is single-host")
-            }
-        }
-    }
-
-    pub(crate) fn load_dspark_async(&self, path: &Path) -> Result<Receiver<Result<()>>> {
-        match self {
-            Self::Local(worker) => worker.load_dspark_async(path),
-            Self::Remote(worker) => worker.load_dspark_async(path),
-        }
-    }
-
-    pub(crate) fn free_vram_async(&self) -> Result<Receiver<Result<usize>>> {
-        match self {
-            Self::Local(worker) => worker.free_vram_async(),
-            Self::Remote(worker) => worker.free_vram_async(),
-        }
-    }
-
-    pub(crate) fn draft_async(
-        &self,
-        bucket: usize,
-        resets: Vec<usize>,
-        appends: Vec<(usize, usize)>,
-        proposals: Vec<(usize, u32, usize)>,
-    ) -> Result<Receiver<Result<Vec<[u32; GLM52_DSPARK_DRAFTS]>>>> {
-        match self {
-            Self::Local(worker) => worker.draft_async(bucket, resets, appends, proposals),
-            Self::Remote(worker) => worker.draft_async(bucket, resets, appends, proposals),
-        }
-    }
-
-    pub(crate) fn mtp_draft_async(
-        &self,
-        round: Glm52MtpRound,
-    ) -> Result<Receiver<Result<Vec<[u32; crate::mtp::GLM52_MTP_DRAFTS]>>>> {
-        match self {
-            Self::Local(worker) => worker.mtp_draft_async(round),
-            Self::Remote(_) => {
-                anyhow::bail!("GLM5.2 native MTP currently requires all EP ranks in one process")
-            }
-        }
-    }
-
-    pub(crate) fn dump_decode_graph_async(
-        &self,
-        bucket: usize,
-        png_path: PathBuf,
-        title: String,
-    ) -> Result<Receiver<Result<CudaGraphDumpSummary>>> {
-        match self {
-            Self::Local(worker) => worker.dump_decode_graph_async(bucket, png_path, title),
-            Self::Remote(worker) => anyhow::bail!(
-                "GLM5.2 rank {} is remote; the decode-graph dump is a local dev tool",
-                worker.rank()
-            ),
-        }
-    }
-
-    pub(crate) fn request_shutdown(&self) -> Result<()> {
-        match self {
-            Self::Local(worker) => worker.request_shutdown(),
-            Self::Remote(worker) => worker.request_shutdown(),
-        }
-    }
-}
+/// One rank executor as an engine sees it. Engines drive only LOCAL workers:
+/// a cross-node fleet is one process per node joining the same DeepEP
+/// communicator — the TCP rank-host (`remote.rs`) is retired
+/// (`docs/models/glm52/free-running-dp.md` §9).
+pub(crate) type Glm52Worker = Glm52RankWorker;
 
 struct Glm52RankRuntime {
     model: Box<Glm52RankModel>,
@@ -1284,6 +1143,6 @@ fn rank_worker_loop(rx: &Receiver<Glm52RankCommand>, mut state: Glm52RankThreadS
     // `Glm52RankRuntime` field order.
     state.teardown_tp();
     // The DeepEP context drop is collective — it runs here as every rank's
-    // worker exits its loop after the coordinator broadcast Shutdown.
+    // worker exits its loop after its engine broadcast Shutdown.
     drop(state);
 }
