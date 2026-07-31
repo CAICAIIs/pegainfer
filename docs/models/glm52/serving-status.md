@@ -38,11 +38,11 @@ See `tp4-prefill-only.md`, `ep4-gb300.md`, `free-running-dp.md`, and `cross-node
 | Speculation | DSpark greedy and sampled verify on EP decode; span 4 default; verify spans reuse decode buckets |
 | KV | 64-token paged pool, full-lifetime admission, prefix cache on by default |
 | Offload | PegaFlow host-tier save/restore behind `--kv-offload` (EP; not TP4 prefill-only without native MTP) |
-| P/D | vLLM prefill → OpenInfer EP decode remains the documented cross-engine path; DSpark draft state is out of contract |
+| P/D | Native-MTP handoff: OpenInfer TP4 prefill-only → EP decode (`first_step=verify`); the vLLM-prefill compat path is removed |
 | Observability | Per-logical-partition running/waiting/KV gauges and decode graph export (EP) |
 | Cross-node EP | One process per node hosting its own ranks (`--glm52-ranks` + `--glm52-rendezvous`); free-running per-rank engines; DeepEP is the only runtime coupling |
 
-The P/D support matrix and acceptance data live in `pd-m2-execution.md`. It transfers target state only; DSpark draft state is not part of that protocol.
+The supported P/D path is the native-MTP handoff (`pd-native-mtp-handoff.md`). The retired vLLM-prefill target-only path (#657) was removed along with its doc; DSpark draft state was never part of any transfer protocol.
 
 ## Sampling and API limits
 
