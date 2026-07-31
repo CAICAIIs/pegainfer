@@ -18,6 +18,8 @@
 
 mod attn_tp;
 mod bookend;
+mod freerun_ep4;
+mod freerun_step;
 mod indexer;
 mod layer;
 mod layer_ep4;

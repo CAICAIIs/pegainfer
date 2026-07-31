@@ -34,22 +34,6 @@ async fn main() -> anyhow::Result<()> {
         Args::from_arg_matches(&matches).map_err(|e| anyhow::anyhow!("invalid CLI args: {e}"))?;
     let provided = config::provided_args(&matches);
 
-    // rank-host mode: a dumb worker shell for a remote GLM5.2 coordinator —
-    // no engine, no HTTP. Serves connections until killed.
-    if let Some(listen) = &args.glm52_rank_host {
-        #[cfg(feature = "glm52")]
-        {
-            return tokio::task::spawn_blocking({
-                let listen = listen.clone();
-                move || openinfer_glm52::serve_rank_host(&listen)
-            })
-            .await
-            .context("rank-host thread panicked")?;
-        }
-        #[cfg(not(feature = "glm52"))]
-        anyhow::bail!("--glm52-rank-host requires the glm52 feature (got {listen})");
-    }
-
     let model_type = detect_model_type(&args.model_path).with_context(|| {
         format!(
             "failed to detect model type from {}",
@@ -81,10 +65,20 @@ async fn main() -> anyhow::Result<()> {
     let glm52_prefill_only = false;
     #[cfg(feature = "glm52")]
     let frontend_engine_count = if model_type == ModelType::Glm52 {
-        args.moe_topo
+        let moe_topo = args
+            .moe_topo
             .parse::<openinfer_glm52::Glm52MoeTopo>()
-            .context("--moe-topo")?
-            .logical_rank_count()
+            .context("--moe-topo")?;
+        match &args.glm52_ranks {
+            // A partial fleet hosts only its own ranks; a mirrored topology
+            // always collapses to one logical rank.
+            Some(spec) if !moe_topo.uses_tensor_replicated_moe() => {
+                openinfer_glm52::parse_rank_range(spec)
+                    .context("--glm52-ranks")?
+                    .len()
+            }
+            _ => moe_topo.logical_rank_count(),
+        }
     } else {
         frontend_engine_count
     };
@@ -237,12 +231,13 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
                     moe_topo,
                     weight_staging: args.glm52_weight_staging,
                     dump_graph_png: args.dump_graph_png.clone(),
-                    rank_hosts: args
-                        .rank_hosts
-                        .iter()
-                        .map(|spec| spec.parse())
-                        .collect::<anyhow::Result<Vec<_>>>()
-                        .context("--rank-hosts")?,
+                    ranks: args
+                        .glm52_ranks
+                        .as_deref()
+                        .map(openinfer_glm52::parse_rank_range)
+                        .transpose()
+                        .context("--glm52-ranks")?,
+                    rendezvous: args.glm52_rendezvous.clone(),
                 },
             )
             .context("failed to start GLM5.2 engine")?

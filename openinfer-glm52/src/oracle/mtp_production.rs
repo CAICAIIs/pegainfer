@@ -12,7 +12,7 @@ use openinfer_sample::SamplingParams;
 use crate::Glm52LaunchOptions;
 use crate::Glm52MoeTopo;
 
-const PATHOLOGICAL_PROMPT: &[u32] = &[
+pub(super) const PATHOLOGICAL_PROMPT: &[u32] = &[
     98770, 98771, 98772, 98773, 98774, 98775, 98776, 98777, 98778, 98779, 98780, 98781, 98782,
     98783, 98784, 98785, 98786, 98787, 98788, 98789, 98790, 98791, 98792, 98793, 98794, 98795,
     98796, 98797, 98798, 98799, 98800, 98801, 98802, 98803, 98804, 98805, 98806, 98807, 98808,
@@ -45,7 +45,8 @@ fn native_mtp_uses_final_normalized_target_hidden() -> Result<()> {
             moe_topo: Glm52MoeTopo::Ep8,
             weight_staging: true,
             dump_graph_png: None,
-            rank_hosts: Vec::new(),
+            ranks: None,
+            rendezvous: None,
         },
     )?;
     let (token_tx, mut token_rx) = TokenSink::standalone();

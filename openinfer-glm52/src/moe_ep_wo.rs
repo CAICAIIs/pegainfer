@@ -4,8 +4,8 @@
 //! every shape below comes from the shim's `DeepEpInfo`, so a new EP width
 //! is a new instantiation, not new code).
 //!
-//! Same DP-coordinator protocol as the masked EP8 chain (every rank enters
-//! the collective per MoE layer with the agreed `global_tokens`), but the
+//! Same per-rank protocol as the masked EP8 chain (every rank enters
+//! the collective per MoE layer with the protocol-max `global_tokens`), but the
 //! expert GEMMs run the arch-portable weight-only chain
 //! (`glm52_moe_ep_wo.cu`) instead of the sm_90a-only DeepGEMM masked chain:
 //!

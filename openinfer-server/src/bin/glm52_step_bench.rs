@@ -72,11 +72,15 @@ struct Cli {
     /// bucket-8-with-pads.
     #[arg(long, default_value = "ep8")]
     moe_topo: String,
-    /// Remote rank-host nodes, comma-separated `host:port=ranks` — same
-    /// contract as the server flag (EP topologies only; remote ranks come
-    /// after the local ones).
-    #[arg(long, value_delimiter = ',')]
-    rank_hosts: Vec<String>,
+    /// GLM5.2 global DP ranks this process hosts, `start..end` — same
+    /// contract as the server flag (EP topologies only; a partial range
+    /// needs `--glm52-rendezvous`).
+    #[arg(long)]
+    glm52_ranks: Option<String>,
+    /// GLM5.2 bootstrap rendezvous address — same contract as the server
+    /// flag.
+    #[arg(long)]
+    glm52_rendezvous: Option<String>,
     /// Override the VRAM-derived per-request context cap — same contract as
     /// the server flag. Wide-EP topologies need this until the context-cap
     /// ledger accounts for width-scaled DeepEP buffers.
@@ -120,12 +124,13 @@ fn main() -> Result<()> {
             moe_topo,
             weight_staging: false,
             dump_graph_png: None,
-            rank_hosts: cli
-                .rank_hosts
-                .iter()
-                .map(|spec| spec.parse())
-                .collect::<Result<Vec<_>>>()
-                .context("--rank-hosts")?,
+            ranks: cli
+                .glm52_ranks
+                .as_deref()
+                .map(openinfer_glm52::parse_rank_range)
+                .transpose()
+                .context("--glm52-ranks")?,
+            rendezvous: cli.glm52_rendezvous.clone(),
         },
     )
     .context("failed to start GLM5.2 engine")?;

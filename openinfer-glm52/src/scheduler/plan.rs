@@ -1,8 +1,12 @@
-//! Per-step planning: the global batch bucket and every rank's row list
-//! ([`plan_step_shapes`]), the all-ranks-or-none launch-ahead decision
-//! ([`launch_ahead_flags`]), and the rows the sampler owns instead of the
-//! fused argmax ([`collect_sampling_rows`]) — pure functions over the same
-//! fleet snapshot, so the collective-visible shapes can never disagree.
+//! Per-step planning for one rank: its own bucket and row list
+//! ([`plan_step_shape`]), the rank-local launch-ahead decision
+//! ([`lease_flags`]), and the rows the sampler owns instead of the fused
+//! argmax ([`collect_sampling_rows`]) — pure functions over the rank's
+//! occupancy and feed wants. Buckets are rank-local (the collectives take
+//! rank-local row counts and the conservative protocol-max bound; see
+//! `docs/models/glm52/free-running-dp.md` §2), and the launch-ahead lease is
+//! rank-local too: a free-running engine always consumes its own
+//! speculation, so no cross-rank agreement exists (see [`lease_flags`]).
 
 use openinfer_sample::SamplingParams;
 
@@ -35,115 +39,113 @@ pub(super) fn padding_step_kv(
     }
 }
 
-/// Every rank's forward shape for one step, decided together from the same
-/// feed-want snapshot (`wants[rank][slot]` = rows that slot can usefully
-/// fill: 0 free, 1 decode, remaining-prompt while mid-prefill).
+/// One rank's forward shape for one step, decided from its feed-want
+/// snapshot (`wants[slot]` = rows that slot can usefully fill: 0 free, 1
+/// decode, remaining-prompt while mid-prefill).
 ///
 /// The bucket is the smallest [`GLM52_DECODE_BUCKETS`] member covering the
-/// hungriest rank's row demand (each rank's demand = Σ wants, capped at the
-/// max bucket; never smaller than its active count — a smaller bucket would
-/// silently drop rows). Per rank, every active slot first gets one row
-/// (liveness), then the leftover bucket capacity extends mid-prefill slots
-/// into *spans* (consecutive prompt positions batched through one step),
-/// round-robin across the hungry slots so co-resident prefills drain in
-/// parallel; padding rows ride the free slots. Span rows are emitted as one
-/// contiguous run per slot — the [`Glm52StepShape`] contract.
-/// Deriving the bucket and every rank's row list from the same data in one
-/// place is what keeps them consistent.
+/// rank's OWN row demand (Σ wants, capped at the max bucket; never smaller
+/// than its active count — a smaller bucket would silently drop rows).
+/// Buckets are rank-local: the MoE collectives take each rank's real row
+/// count and the conservative protocol-max GEMM bound
+/// (`ep_ranks × GLM52_MAX_BATCH_PER_RANK`), so no rank pays compute for
+/// another rank's demand (the free-running gates measured the conservative
+/// bound at zero cost — `docs/models/glm52/free-running-dp.md` §8).
+/// Every active slot first gets one row (liveness), then the leftover bucket
+/// capacity extends mid-prefill slots into *spans* (consecutive prompt
+/// positions batched through one step), round-robin across the hungry slots
+/// so co-resident prefills drain in parallel; padding rows ride the free
+/// slots. Span rows are emitted as one contiguous run per slot — the
+/// [`Glm52StepShape`] contract.
 /// `full_bucket` pins the bucket to `GLM52_MAX_BATCH_PER_RANK` regardless of
 /// demand: the TP8 replicated topology serves exactly one graph shape (the
 /// MoE phase kernels are fixed 8-row), so solo decode rides 7 padding rows
 /// instead of a smaller bucket.
-pub(super) fn plan_step_shapes(
-    wants: &[[usize; GLM52_MAX_BATCH_PER_RANK]],
+pub(super) fn plan_step_shape(
+    wants: &[usize; GLM52_MAX_BATCH_PER_RANK],
     full_bucket: bool,
-) -> Vec<Glm52StepShape> {
-    let hungriest = wants
-        .iter()
-        .map(|row| row.iter().sum::<usize>().min(GLM52_MAX_BATCH_PER_RANK))
-        .max()
-        .unwrap_or(0);
+) -> Glm52StepShape {
+    let demand = wants.iter().sum::<usize>().min(GLM52_MAX_BATCH_PER_RANK);
     let bucket = if full_bucket {
         GLM52_MAX_BATCH_PER_RANK
     } else {
         *GLM52_DECODE_BUCKETS
             .iter()
-            .find(|&&rows| rows >= hungriest.max(1))
+            .find(|&&rows| rows >= demand.max(1))
             .expect("the largest bucket covers every demand by construction")
     };
-    wants
-        .iter()
-        .map(|row| {
-            let spans = plan_prefill_spans(row, bucket);
-            let mut slots: [u8; GLM52_MAX_BATCH_PER_RANK] = std::array::from_fn(|slot| slot as u8);
-            let mut dst = 0usize;
-            for (slot, &span) in spans.iter().enumerate() {
-                for _ in 0..span {
-                    slots[dst] = slot as u8;
-                    dst += 1;
-                }
-            }
-            // Padding rows on free slots: there are always enough, because
-            // used >= actives and bucket <= MAX, so bucket - used <= frees.
-            let active_rows = dst;
-            let mut frees = (0..GLM52_MAX_BATCH_PER_RANK).filter(|&slot| row[slot] == 0);
-            while dst < bucket {
-                slots[dst] = frees.next().expect("bucket - used <= free slots") as u8;
-                dst += 1;
-            }
-            Glm52StepShape {
-                bucket,
-                slots,
-                active_rows,
-            }
-        })
-        .collect()
+    let spans = plan_prefill_spans(wants, bucket);
+    let mut slots: [u8; GLM52_MAX_BATCH_PER_RANK] = std::array::from_fn(|slot| slot as u8);
+    let mut dst = 0usize;
+    for (slot, &span) in spans.iter().enumerate() {
+        for _ in 0..span {
+            slots[dst] = slot as u8;
+            dst += 1;
+        }
+    }
+    // Padding rows on free slots: there are always enough, because
+    // used >= actives and bucket <= MAX, so bucket - used <= frees.
+    let active_rows = dst;
+    let mut frees = (0..GLM52_MAX_BATCH_PER_RANK).filter(|&slot| wants[slot] == 0);
+    while dst < bucket {
+        slots[dst] = frees.next().expect("bucket - used <= free slots") as u8;
+        dst += 1;
+    }
+    Glm52StepShape {
+        bucket,
+        slots,
+        active_rows,
+    }
 }
 
-/// The launch-ahead flag decision — pure so the desync rules are testable.
-/// `consume`: this step IS the speculation every rank enqueued (same shapes
-/// AND no slot changed hands — a finish + admission can reuse a slot id
-/// under an identical-looking shape). `lease`: every rank must enqueue the
-/// next step speculatively — pure single-token GREEDY decode everywhere (the
-/// speculation feeds each row's argmax token, so a sampled row would replay
-/// the wrong input) with model-length headroom, off every 64-token page
-/// boundary (the feed kernel's `slot_mapping += 1` only stays valid inside
-/// the current page, and the advanced step's page must already be in the
-/// uploaded block table; breaking the streak at every active row's boundary
-/// also bounds padding rows — reset to position 0 by each full prologue —
-/// inside the padding page), nothing queued, no draft round. Both are global
-/// claims: a speculative replay is a full set of collectives, so per-rank
-/// discretion would desync the pairing.
+/// The rank-local launch-ahead flag decision — pure so the rules are
+/// testable. A free-running engine ALWAYS consumes its own speculation:
+/// leasing freezes the slot set for exactly one step (newcomers wait in the
+/// pending queue, finishes defer their physical release to the consume
+/// step), so `consume` is a structural guarantee the caller passes through,
+/// not a decision made here. The coordinator-era stale-replay re-run — a
+/// second collective chain that only paired if every rank speculated
+/// together — does not exist anymore.
+///
+/// `lease`: enqueue the next step speculatively — pure single-token GREEDY
+/// decode everywhere (the speculation feeds each row's argmax token, so a
+/// sampled row would replay the wrong input) with model-length headroom, off
+/// every 64-token page boundary (the feed kernel's `slot_mapping += 1` only
+/// stays valid inside the current page, and the advanced step's page must
+/// already be in the uploaded block table; breaking the streak at every
+/// active row's boundary also bounds padding rows — reset to position 0 by
+/// each full prologue — inside the padding page), nothing queued, no draft
+/// round, and no deferred releases pending (a dead slot's rows leave the
+/// shape after the consume step, so it must not be leased into the next
+/// one). An idle rank must NOT lease: with zero active rows the per-row
+/// boundary break never fires, and chained replays would walk the padding
+/// row's slot_mapping out of the padding page.
 ///
 /// `offload_enabled` kills the lease outright: a leased replay keeps writing
-/// KV on the rank stream for ~a step after the coordinator joined its
-/// argmax D2H, and the offload restore leg H2Ds into freshly-reallocated
-/// pool pages on pegaflow's OWN stream at the very next admission — the two
-/// are unordered, so a replay row landing after the restore would silently
-/// poison a content-addressed block for every later match. Without leases,
-/// the joined D2H is the last thing on the rank stream and admission truly
-/// is a quiet boundary. Costs ~0.7 ms/step, offload deployments only.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn launch_ahead_flags(
-    shapes: &[Glm52StepShape],
-    leased_shapes: Option<&[Glm52StepShape]>,
-    slots_changed: bool,
+/// KV on the rank stream for ~a step after the engine joined its argmax D2H,
+/// and the offload restore leg H2Ds into freshly-reallocated pool pages on
+/// pegaflow's OWN stream at the very next admission — the two are unordered,
+/// so a replay row landing after the restore would silently poison a
+/// content-addressed block for every later match. Without leases, the joined
+/// D2H is the last thing on the rank stream and admission truly is a quiet
+/// boundary. Costs ~0.7 ms/step, offload deployments only.
+pub(super) fn lease_flags(
+    consume: bool,
     pending_empty: bool,
     drafter_enabled: bool,
     offload_enabled: bool,
-    slots: &[RankSlots],
+    deferred_pending: bool,
+    slots: &RankSlots,
     max_model_len: usize,
 ) -> Glm52StepFlags {
-    let consume = !slots_changed && leased_shapes == Some(shapes);
     let lease = pending_empty
         && !drafter_enabled
         && !offload_enabled
-        && slots
-            .iter()
-            .flat_map(|rank_slots| rank_slots.iter().flatten())
-            .all(|active| {
-                takes_argmax(&active.req.params) && lease_ok(&active.state, max_model_len)
-            });
+        && !deferred_pending
+        && slots.iter().any(Option::is_some)
+        && slots.iter().flatten().all(|active| {
+            takes_argmax(&active.req.params) && lease_ok(&active.state, max_model_len)
+        });
     Glm52StepFlags {
         consume,
         lease,
@@ -163,8 +165,8 @@ pub(super) fn takes_argmax(params: &SamplingParams) -> bool {
 
 /// Whether one active request's KV position permits leasing the next step: a
 /// pure single-token decode row with model-length headroom whose advanced
-/// position stays inside its current 64-token page (see
-/// [`launch_ahead_flags`] for why the page boundary breaks the streak).
+/// position stays inside its current 64-token page (see [`lease_flags`] for
+/// why the page boundary breaks the streak).
 fn lease_ok(state: &Glm52SlotState, max_model_len: usize) -> bool {
     let position = state.next_input_at(0).position;
     state.feed_want() == 1 && position + 1 < max_model_len && !(position + 1).is_multiple_of(PAGE)
@@ -204,17 +206,12 @@ pub(super) fn collect_sampling_rows(
     sampling
 }
 
-pub(super) fn feed_wants(slots: &[RankSlots]) -> Vec<[usize; GLM52_MAX_BATCH_PER_RANK]> {
-    slots
-        .iter()
-        .map(|rank_slots| {
-            std::array::from_fn(|slot| {
-                rank_slots[slot]
-                    .as_ref()
-                    .map_or(0, |active| active.state.feed_want())
-            })
-        })
-        .collect()
+pub(super) fn feed_wants(slots: &RankSlots) -> [usize; GLM52_MAX_BATCH_PER_RANK] {
+    std::array::from_fn(|slot| {
+        slots[slot]
+            .as_ref()
+            .map_or(0, |active| active.state.feed_want())
+    })
 }
 
 /// Split one prefill launch across active requests without exceeding the
@@ -264,56 +261,47 @@ mod tests {
     use crate::scheduler::testkit::state;
     use crate::scheduler::testkit::test_kv;
 
-    fn shape(bucket: usize, active_rows: usize) -> Glm52StepShape {
-        let mut slots = [0u8; GLM52_MAX_BATCH_PER_RANK];
-        for (slot, dst) in slots.iter_mut().enumerate().take(bucket) {
-            *dst = slot as u8;
-        }
-        Glm52StepShape {
-            bucket,
-            slots,
-            active_rows,
-        }
-    }
-
     #[test]
-    fn consume_requires_unchanged_shapes_and_untouched_slots() {
-        let shapes = vec![shape(1, 1)];
-        let flags =
-            launch_ahead_flags(&shapes, Some(&shapes), false, true, false, false, &[], 4096);
+    fn consume_is_a_structural_passthrough() {
+        // The engine freezes the slot set while leased, so consume is never
+        // a decision: the flag returned equals the flag handed in.
+        let greedy = decoding_rank(openinfer_sample::SamplingParams::default());
+        let flags = lease_flags(true, true, false, false, false, &greedy, 4096);
         assert!(flags.consume);
-    }
-
-    #[test]
-    fn slot_handoff_blocks_consume_even_under_identical_shapes() {
-        // A finish + admission can reuse a slot id without changing the
-        // shape — the desync class the first gate run hit.
-        let shapes = vec![shape(1, 1)];
-        let flags = launch_ahead_flags(&shapes, Some(&shapes), true, true, false, false, &[], 4096);
+        let flags = lease_flags(false, true, false, false, false, &greedy, 4096);
         assert!(!flags.consume);
     }
 
     #[test]
-    fn active_row_count_is_part_of_shape_equality() {
-        // Same bucket/slots but a row flipped active <-> pad must not consume:
-        // a padding input is not value-distinguishable from an active one.
-        let leased = vec![shape(1, 1)];
-        let shapes = vec![shape(1, 0)];
-        let flags =
-            launch_ahead_flags(&shapes, Some(&leased), false, true, false, false, &[], 4096);
-        assert!(!flags.consume);
+    fn idle_rank_never_leases() {
+        // Zero actives vacuously satisfy the per-row lease rules; without
+        // the explicit guard a chained lease would walk the padding row's
+        // slot_mapping out of the padding page.
+        let slots: RankSlots = std::array::from_fn(|_| None);
+        let flags = lease_flags(false, true, false, false, false, &slots, 4096);
+        assert!(!flags.lease && !flags.consume);
+    }
+
+    #[test]
+    fn deferred_releases_break_the_lease_chain() {
+        // A finish under a lease defers its physical release to the consume
+        // step; that step must not re-lease — the dead slot's rows leave the
+        // shape right after it.
+        let greedy = decoding_rank(openinfer_sample::SamplingParams::default());
+        let flags = lease_flags(true, true, false, false, true, &greedy, 4096);
+        assert!(flags.consume && !flags.lease);
     }
 
     #[test]
     fn no_lease_without_an_empty_queue() {
-        let shapes = vec![shape(1, 1)];
-        let flags = launch_ahead_flags(&shapes, None, false, false, false, false, &[], 4096);
+        let greedy = decoding_rank(openinfer_sample::SamplingParams::default());
+        let flags = lease_flags(false, false, false, false, false, &greedy, 4096);
         assert!(!flags.lease && !flags.consume);
     }
 
     /// One rank holding a single decoding request with the given params (its
     /// prompt token is already fed, so `feed_want() == 1`).
-    fn decoding_fleet(params: openinfer_sample::SamplingParams) -> Vec<RankSlots> {
+    fn decoding_rank(params: openinfer_sample::SamplingParams) -> RankSlots {
         let req = request(vec![10], params, 8);
         let mut state = Glm52SlotState::new(req.prompt_tokens.clone(), req.max_tokens, false, 0);
         assert!(matches!(
@@ -328,7 +316,7 @@ mod tests {
             client_prompt_tokens: 1,
             kv,
         });
-        vec![slots]
+        slots
     }
 
     #[test]
@@ -336,37 +324,37 @@ mod tests {
         // A leased replay keeps writing KV on the rank stream after the
         // join; the offload restore H2Ds on pegaflow's stream, unordered
         // against it. Offload on ⇒ never lease.
-        let shapes = vec![shape(1, 1)];
-        let greedy = decoding_fleet(openinfer_sample::SamplingParams::default());
-        assert!(!launch_ahead_flags(&shapes, None, false, true, false, true, &greedy, 4096).lease);
+        let greedy = decoding_rank(openinfer_sample::SamplingParams::default());
+        assert!(!lease_flags(false, true, false, true, false, &greedy, 4096).lease);
+    }
+
+    #[test]
+    fn drafter_blocks_the_lease() {
+        let greedy = decoding_rank(openinfer_sample::SamplingParams::default());
+        assert!(!lease_flags(false, true, true, false, false, &greedy, 4096).lease);
     }
 
     #[test]
     fn non_greedy_request_blocks_the_lease() {
         // The speculation feeds each row's argmax token; a sampled row would
         // replay the wrong input, so any non-greedy active blocks the lease.
-        let shapes = vec![shape(1, 1)];
-        let greedy = decoding_fleet(openinfer_sample::SamplingParams::default());
-        assert!(launch_ahead_flags(&shapes, None, false, true, false, false, &greedy, 4096).lease);
+        let greedy = decoding_rank(openinfer_sample::SamplingParams::default());
+        assert!(lease_flags(false, true, false, false, false, &greedy, 4096).lease);
 
-        let sampled = decoding_fleet(openinfer_sample::SamplingParams {
+        let sampled = decoding_rank(openinfer_sample::SamplingParams {
             temperature: 0.7,
             ..Default::default()
         });
-        assert!(
-            !launch_ahead_flags(&shapes, None, false, true, false, false, &sampled, 4096).lease
-        );
+        assert!(!lease_flags(false, true, false, false, false, &sampled, 4096).lease);
 
         // An effectively-greedy request (top_p nucleus <= 1/vocab holds only
         // the argmax token) takes the argmax path, so it may ride the lease.
-        let tiny_top_p = decoding_fleet(openinfer_sample::SamplingParams {
+        let tiny_top_p = decoding_rank(openinfer_sample::SamplingParams {
             temperature: 0.7,
             top_p: 0.5 / GLM52_VOCAB as f32,
             ..Default::default()
         });
-        assert!(
-            launch_ahead_flags(&shapes, None, false, true, false, false, &tiny_top_p, 4096).lease
-        );
+        assert!(lease_flags(false, true, false, false, false, &tiny_top_p, 4096).lease);
     }
 
     #[test]
@@ -488,97 +476,81 @@ mod tests {
     }
 
     /// `counts` decode-phase requests per rank (each wants one row).
-    fn decode_wants(counts: &[usize]) -> Vec<[usize; GLM52_MAX_BATCH_PER_RANK]> {
-        counts
-            .iter()
-            .map(|&c| std::array::from_fn(|slot| usize::from(slot < c)))
-            .collect()
+    fn decode_wants(count: usize) -> [usize; GLM52_MAX_BATCH_PER_RANK] {
+        std::array::from_fn(|slot| usize::from(slot < count))
     }
 
     /// The observable part of a shape: the bucket and the forwarded rows'
     /// slots (trailing entries beyond the bucket are never read).
-    fn forwarded(shapes: &[Glm52StepShape]) -> Vec<(usize, Vec<u8>)> {
-        shapes
-            .iter()
-            .map(|shape| (shape.bucket, shape.slots[..shape.bucket].to_vec()))
-            .collect()
+    fn forwarded(shape: &Glm52StepShape) -> (usize, Vec<u8>) {
+        (shape.bucket, shape.slots[..shape.bucket].to_vec())
     }
 
     #[test]
-    fn full_bucket_pins_every_shape_to_the_max() {
-        // TP8 replicated: one logical rank, one graph shape. A mid-prefill
-        // request wanting 5 rows takes 5 rows + 3 pads.
-        let mut wants = decode_wants(&[0]);
-        wants[0][0] = 5;
-        let shapes = plan_step_shapes(&wants, true);
-        assert_eq!(forwarded(&shapes), vec![(8, vec![0, 0, 0, 0, 0, 1, 2, 3])]);
-        assert_eq!(shapes[0].active_rows, 5);
+    fn full_bucket_pins_the_shape_to_the_max() {
+        // TP8 replicated: one graph shape. A mid-prefill request wanting 5
+        // rows takes 5 rows + 3 pads.
+        let mut wants = decode_wants(0);
+        wants[0] = 5;
+        let shape = plan_step_shape(&wants, true);
+        assert_eq!(forwarded(&shape), (8, vec![0, 0, 0, 0, 0, 1, 2, 3]));
+        assert_eq!(shape.active_rows, 5);
 
         // Solo single-token decode still rides the full bucket (7 pads) —
         // the MoE phase kernels are fixed 8-row.
         assert_eq!(
-            forwarded(&plan_step_shapes(&decode_wants(&[1]), true)),
-            vec![(8, vec![0, 1, 2, 3, 4, 5, 6, 7])]
+            forwarded(&plan_step_shape(&decode_wants(1), true)),
+            (8, vec![0, 1, 2, 3, 4, 5, 6, 7])
         );
 
         // Concurrency packs actives first, then pads.
         assert_eq!(
-            forwarded(&plan_step_shapes(&decode_wants(&[3]), true)),
-            vec![(8, vec![0, 1, 2, 3, 4, 5, 6, 7])]
+            forwarded(&plan_step_shape(&decode_wants(3), true)),
+            (8, vec![0, 1, 2, 3, 4, 5, 6, 7])
         );
 
         // A verify span (slot wants 8) owns the whole bucket.
-        let mut wants = decode_wants(&[0]);
-        wants[0][0] = 8;
-        assert_eq!(
-            forwarded(&plan_step_shapes(&wants, true)),
-            vec![(8, vec![0; 8])]
-        );
+        let mut wants = decode_wants(0);
+        wants[0] = 8;
+        assert_eq!(forwarded(&plan_step_shape(&wants, true)), (8, vec![0; 8]));
     }
 
     #[test]
-    fn bucket_is_the_smallest_covering_the_hungriest_rank() {
+    fn bucket_is_the_smallest_covering_the_ranks_own_demand() {
         assert_eq!(
-            forwarded(&plan_step_shapes(&decode_wants(&[0, 0]), false)),
-            vec![(1, vec![0]), (1, vec![0])]
+            forwarded(&plan_step_shape(&decode_wants(0), false)),
+            (1, vec![0])
         );
         assert_eq!(
-            forwarded(&plan_step_shapes(&decode_wants(&[1; 8]), false)),
-            vec![(1, vec![0]); 8]
-        );
-        // One rank at two requests lifts EVERY rank to the 2-row bucket —
-        // idle ranks pad with free slots.
-        assert_eq!(
-            forwarded(&plan_step_shapes(&decode_wants(&[2, 1]), false)),
-            vec![(2, vec![0, 1]), (2, vec![0, 1])]
+            forwarded(&plan_step_shape(&decode_wants(1), false)),
+            (1, vec![0])
         );
         assert_eq!(
-            forwarded(&plan_step_shapes(&decode_wants(&[3, 1]), false))[0],
+            forwarded(&plan_step_shape(&decode_wants(2), false)),
+            (2, vec![0, 1])
+        );
+        assert_eq!(
+            forwarded(&plan_step_shape(&decode_wants(3), false)),
             (4, vec![0, 1, 2, 3])
         );
         // Past the 4-row bucket the full batch takes over.
-        assert_eq!(
-            forwarded(&plan_step_shapes(&decode_wants(&[5, 1]), false))[0].0,
-            8
-        );
+        assert_eq!(plan_step_shape(&decode_wants(5), false).bucket, 8);
     }
 
     #[test]
     fn partial_buckets_pack_actives_first() {
-        // A rank holding slots {1, 5} forwards them in rows 0..2; the padding
-        // rows (bucket 4) ride on the lowest free slots.
-        let mut holey = decode_wants(&[0, 3]);
-        holey[0][1] = 1;
-        holey[0][5] = 1;
+        // A rank holding slots {1, 5} forwards them in rows 0..2 in its own
+        // bucket-2 shape; a rank with 3 actives rides a bucket-4 shape whose
+        // padding row lands on the lowest free slot.
+        let mut holey = decode_wants(0);
+        holey[1] = 1;
+        holey[5] = 1;
+        assert_eq!(forwarded(&plan_step_shape(&holey, false)), (2, vec![1, 5]));
+        let mut deep = decode_wants(5);
+        deep[0] = 0;
+        deep[7] = 1;
         assert_eq!(
-            forwarded(&plan_step_shapes(&holey, false)),
-            vec![(4, vec![1, 5, 0, 2]), (4, vec![0, 1, 2, 3])]
-        );
-        let mut deep = decode_wants(&[5, 0]);
-        deep[0][0] = 0;
-        deep[0][7] = 1;
-        assert_eq!(
-            forwarded(&plan_step_shapes(&deep, false))[0],
+            forwarded(&plan_step_shape(&deep, false)),
             (8, vec![1, 2, 3, 4, 7, 0, 5, 6])
         );
     }
@@ -586,25 +558,20 @@ mod tests {
     #[test]
     fn prefill_want_extends_one_slot_into_a_span() {
         // A lone mid-prefill request with plenty of prompt left fills the
-        // whole max bucket with its span; idle ranks pad.
-        let mut wants = decode_wants(&[0, 0]);
-        wants[0][2] = 3000;
-        let shapes = plan_step_shapes(&wants, false);
+        // whole max bucket with its span.
+        let mut wants = decode_wants(0);
+        wants[2] = 3000;
         assert_eq!(
-            forwarded(&shapes)[0],
+            forwarded(&plan_step_shape(&wants, false)),
             (8, vec![2, 2, 2, 2, 2, 2, 2, 2]),
             "one hungry slot owns every row of the max bucket"
         );
-        assert_eq!(
-            forwarded(&shapes)[1],
-            (8, (0..8).map(|s| s as u8).collect())
-        );
 
         // A short prompt remainder only lifts the bucket as far as needed.
-        let mut wants = decode_wants(&[0, 0]);
-        wants[0][0] = 3;
+        let mut wants = decode_wants(0);
+        wants[0] = 3;
         assert_eq!(
-            forwarded(&plan_step_shapes(&wants, false))[0],
+            forwarded(&plan_step_shape(&wants, false)),
             (4, vec![0, 0, 0, 1])
         );
     }
@@ -614,21 +581,21 @@ mod tests {
         // Slot 0 decodes (1 row), slot 1 is mid-prefill: liveness rows first,
         // then the leftover capacity extends the prefill span — one
         // contiguous run per slot.
-        let mut wants = decode_wants(&[0]);
-        wants[0][0] = 1;
-        wants[0][1] = 100;
+        let mut wants = decode_wants(0);
+        wants[0] = 1;
+        wants[1] = 100;
         assert_eq!(
-            forwarded(&plan_step_shapes(&wants, false))[0],
+            forwarded(&plan_step_shape(&wants, false)),
             (8, vec![0, 1, 1, 1, 1, 1, 1, 1])
         );
 
         // Two mid-prefill slots with small wants: both met, remaining rows
         // pad on free slots.
-        let mut wants = decode_wants(&[0]);
-        wants[0][0] = 3;
-        wants[0][1] = 2;
+        let mut wants = decode_wants(0);
+        wants[0] = 3;
+        wants[1] = 2;
         assert_eq!(
-            forwarded(&plan_step_shapes(&wants, false))[0],
+            forwarded(&plan_step_shape(&wants, false)),
             (8, vec![0, 0, 0, 1, 1, 2, 3, 4]),
             "wants met, remaining rows pad on free slots"
         );
@@ -638,22 +605,22 @@ mod tests {
     fn two_long_prefills_split_the_leftover_round_robin() {
         // Two co-resident long prefills split the bucket evenly — neither
         // starves at a single liveness row while the other eats the leftover.
-        let mut wants = decode_wants(&[0]);
-        wants[0][2] = 3000;
-        wants[0][5] = 3000;
+        let mut wants = decode_wants(0);
+        wants[2] = 3000;
+        wants[5] = 3000;
         assert_eq!(
-            forwarded(&plan_step_shapes(&wants, false))[0],
+            forwarded(&plan_step_shape(&wants, false)),
             (8, vec![2, 2, 2, 2, 5, 5, 5, 5])
         );
 
         // A decode slot in the mix keeps its single row; the prefills split
         // what remains (7 rows -> 4 + 3 by round-robin order).
-        let mut wants = decode_wants(&[0]);
-        wants[0][0] = 1;
-        wants[0][3] = 3000;
-        wants[0][6] = 3000;
+        let mut wants = decode_wants(0);
+        wants[0] = 1;
+        wants[3] = 3000;
+        wants[6] = 3000;
         assert_eq!(
-            forwarded(&plan_step_shapes(&wants, false))[0],
+            forwarded(&plan_step_shape(&wants, false)),
             (8, vec![0, 3, 3, 3, 3, 6, 6, 6])
         );
     }

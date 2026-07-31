@@ -76,8 +76,9 @@ pub struct GenerateRequest {
     /// scheduler's `Clone` request state without holding a live (non-`Clone`)
     /// `Span`.
     pub trace_parent: Option<fastrace::collector::SpanContext>,
-    /// Logical data-parallel rank selected by the frontend. `None` leaves
-    /// placement to the model scheduler (the direct `EngineHandle` path).
+    /// Logical data-parallel rank selected by the frontend. `None` lets the
+    /// handle place the request on its least-loaded partition (waiting
+    /// requests weigh 4x).
     pub data_parallel_rank: Option<usize>,
     pub prompt_tokens: Vec<u32>,
     pub params: SamplingParams,
@@ -419,25 +420,27 @@ pub struct EngineHandle {
 }
 
 struct EngineInner {
-    submit_tx: Option<mpsc::UnboundedSender<GenerateRequest>>,
+    /// One submit channel per scheduler partition (logical DP rank). A
+    /// single-partition engine holds exactly one sender.
+    submit_txs: Vec<mpsc::UnboundedSender<GenerateRequest>>,
     command_tx: Option<mpsc::UnboundedSender<EngineCommand>>,
-    join_handle: Option<JoinHandle<()>>,
+    join_handles: Vec<JoinHandle<()>>,
 }
 
 impl EngineHandle {
     pub fn new(submit_tx: mpsc::UnboundedSender<GenerateRequest>) -> Self {
-        Self::from_parts(Some(submit_tx), None, None)
+        Self::from_parts(vec![submit_tx], None, Vec::new())
     }
 
     pub fn new_with_command_channel(command_tx: mpsc::UnboundedSender<EngineCommand>) -> Self {
-        Self::from_parts(None, Some(command_tx), None)
+        Self::from_parts(Vec::new(), Some(command_tx), Vec::new())
     }
 
     pub fn new_with_command_channel_and_join_handle(
         command_tx: mpsc::UnboundedSender<EngineCommand>,
         join_handle: JoinHandle<()>,
     ) -> Self {
-        Self::from_parts(None, Some(command_tx), Some(join_handle))
+        Self::from_parts(Vec::new(), Some(command_tx), vec![join_handle])
     }
 
     /// Construct a handle that owns the engine thread shutdown.
@@ -449,19 +452,38 @@ impl EngineHandle {
         submit_tx: mpsc::UnboundedSender<GenerateRequest>,
         join_handle: JoinHandle<()>,
     ) -> Self {
-        Self::from_parts(Some(submit_tx), None, Some(join_handle))
+        Self::from_parts(vec![submit_tx], None, vec![join_handle])
+    }
+
+    /// Construct a multi-partition handle: one submit channel and one owned
+    /// engine thread per logical scheduler partition (e.g. one autonomous
+    /// engine per DP rank). [`Self::submit`] routes by the request's
+    /// `data_parallel_rank`; unbound requests go to the least-loaded
+    /// partition (waiting requests weigh 4x, the vLLM DP policy).
+    ///
+    /// Dropping the last handle clone closes every channel and joins every
+    /// thread in partition order.
+    pub fn new_with_join_handles(
+        submit_txs: Vec<mpsc::UnboundedSender<GenerateRequest>>,
+        join_handles: Vec<JoinHandle<()>>,
+    ) -> Self {
+        assert!(
+            !submit_txs.is_empty(),
+            "an engine must expose at least one scheduler partition"
+        );
+        Self::from_parts(submit_txs, None, join_handles)
     }
 
     fn from_parts(
-        submit_tx: Option<mpsc::UnboundedSender<GenerateRequest>>,
+        submit_txs: Vec<mpsc::UnboundedSender<GenerateRequest>>,
         command_tx: Option<mpsc::UnboundedSender<EngineCommand>>,
-        join_handle: Option<JoinHandle<()>>,
+        join_handles: Vec<JoinHandle<()>>,
     ) -> Self {
         Self {
             inner: Arc::new(EngineInner {
-                submit_tx,
+                submit_txs,
                 command_tx,
-                join_handle,
+                join_handles,
             }),
             servable_len: None,
             kv_capacity: None,
@@ -555,18 +577,52 @@ impl EngineHandle {
         &self,
         req: GenerateRequest,
     ) -> std::result::Result<(), mpsc::error::SendError<GenerateRequest>> {
-        match self.inner.submit_tx.as_ref() {
-            Some(submit_tx) => submit_tx.send(req),
-            None => match self.inner.command_tx.as_ref() {
-                Some(command_tx) => command_tx
-                    .send(EngineCommand::Generate(Box::new(req)))
-                    .map_err(|err| match err.0 {
-                        EngineCommand::Generate(req) => mpsc::error::SendError(*req),
-                        EngineCommand::Control(_) => unreachable!("submitted generate command"),
-                    }),
-                None => Err(mpsc::error::SendError(req)),
-            },
+        if !self.inner.submit_txs.is_empty() {
+            let partition = req
+                .data_parallel_rank
+                .unwrap_or_else(|| self.least_loaded_partition());
+            if let Some(submit_tx) = self.inner.submit_txs.get(partition) {
+                return submit_tx.send(req);
+            }
+            // An out-of-range rank is a caller error, not an engine
+            // failure: answer the request with the standard
+            // Scheduled → Rejected pair instead of failing the submit.
+            reject_unroutable(&req, partition, self.inner.submit_txs.len());
+            return Ok(());
         }
+        match self.inner.command_tx.as_ref() {
+            Some(command_tx) => command_tx
+                .send(EngineCommand::Generate(Box::new(req)))
+                .map_err(|err| match err.0 {
+                    EngineCommand::Generate(req) => mpsc::error::SendError(*req),
+                    EngineCommand::Control(_) => unreachable!("submitted generate command"),
+                }),
+            None => Err(mpsc::error::SendError(req)),
+        }
+    }
+
+    /// Placement for an unbound request: the partition with the lowest
+    /// waiting-weighted load (`running + 4 × waiting`, the same weight the
+    /// vLLM DP load balancer uses), ties to the lowest index. Scores come
+    /// from the partitions' load watches; a partition without a feed scores
+    /// zero, so the single-partition degenerate always returns 0.
+    fn least_loaded_partition(&self) -> usize {
+        self.inner
+            .submit_txs
+            .iter()
+            .enumerate()
+            .min_by_key(|(partition, _)| {
+                let score = self
+                    .load_watches
+                    .get(*partition)
+                    .and_then(Option::as_ref)
+                    .map_or(0, |watch| {
+                        let snapshot = watch.borrow();
+                        snapshot.num_running_reqs + 4 * snapshot.num_waiting_reqs
+                    });
+                (score, *partition)
+            })
+            .map_or(0, |(partition, _)| partition)
     }
 
     pub fn supports_lora_control(&self) -> bool {
@@ -657,11 +713,29 @@ pub fn panic_message(payload: &dyn Any) -> &str {
         .unwrap_or("<non-string panic payload>")
 }
 
+/// Answer a request the handle cannot place (a `data_parallel_rank` outside
+/// the engine's partition topology) with the standard Scheduled → Rejected
+/// pair — the same surface a model scheduler's intake rejection produces.
+fn reject_unroutable(req: &GenerateRequest, partition: usize, partitions: usize) {
+    let queued_at_unix_s = req.queued_at_unix_s.unwrap_or_else(unix_now_s);
+    let _ = req.token_tx.send(TokenEvent::Scheduled {
+        queued_at_unix_s,
+        scheduled_at_unix_s: unix_now_s(),
+        prompt_tokens: req.prompt_tokens.len(),
+        cached_tokens: 0,
+    });
+    let _ = req.token_tx.send(TokenEvent::Rejected {
+        message: format!("data_parallel_rank {partition} is outside 0..{partitions}"),
+        prompt_tokens: req.prompt_tokens.len(),
+        completion_tokens: 0,
+    });
+}
+
 impl Drop for EngineInner {
     fn drop(&mut self) {
-        let _ = self.submit_tx.take();
+        self.submit_txs.clear();
         let _ = self.command_tx.take();
-        if let Some(join_handle) = self.join_handle.take() {
+        for join_handle in self.join_handles.drain(..) {
             if join_handle.thread().id() != thread::current().id() {
                 if let Err(panic) = join_handle.join() {
                     log::warn!(
@@ -699,6 +773,112 @@ mod tests {
 
         drop(clone);
         assert!(exited.load(Ordering::SeqCst));
+    }
+
+    fn routed_request(rank: Option<usize>) -> (GenerateRequest, TokenStreamReceiver) {
+        let (token_tx, token_rx) = TokenSink::standalone();
+        (
+            GenerateRequest {
+                request_id: None,
+                queued_at_unix_s: None,
+                trace_parent: None,
+                data_parallel_rank: rank,
+                prompt_tokens: vec![1],
+                params: crate::sampler::SamplingParams::default(),
+                max_tokens: 1,
+                lora_adapter: None,
+                kv_transfer_params: None,
+                token_tx,
+                logprobs: 0,
+                echo: false,
+            },
+            token_rx,
+        )
+    }
+
+    #[test]
+    fn multi_partition_submit_routes_by_bound_rank() {
+        let (tx0, mut rx0) = mpsc::unbounded_channel::<GenerateRequest>();
+        let (tx1, mut rx1) = mpsc::unbounded_channel::<GenerateRequest>();
+        let handle = EngineHandle::new_with_join_handles(vec![tx0, tx1], Vec::new());
+
+        let (req, _events) = routed_request(Some(1));
+        handle.submit(req).expect("submit");
+        assert!(rx0.try_recv().is_err());
+        assert_eq!(rx1.try_recv().expect("routed to rank 1").prompt_tokens, [1]);
+    }
+
+    #[test]
+    fn multi_partition_submit_places_unbound_on_the_least_loaded() {
+        let (tx0, mut rx0) = mpsc::unbounded_channel::<GenerateRequest>();
+        let (tx1, mut rx1) = mpsc::unbounded_channel::<GenerateRequest>();
+        let (load_tx0, load_rx0) = watch::channel(LoadSnapshot {
+            num_running_reqs: 2,
+            ..LoadSnapshot::default()
+        });
+        let (_load_tx1, load_rx1) = watch::channel(LoadSnapshot {
+            num_waiting_reqs: 1,
+            ..LoadSnapshot::default()
+        });
+        let handle = EngineHandle::new_with_join_handles(vec![tx0, tx1], Vec::new())
+            .with_load_watches(vec![load_rx0, load_rx1]);
+
+        // Scores are running + 4 × waiting: rank 0 scores 2, rank 1 scores 4.
+        let (req, _events) = routed_request(None);
+        handle.submit(req).expect("submit");
+        assert!(rx0.try_recv().is_ok());
+        assert!(rx1.try_recv().is_err());
+
+        // Rank 0 rises to 6 running while rank 1 still waits 1: 4 < 6, so the
+        // next unbound request tips to rank 1.
+        load_tx0.send_replace(LoadSnapshot {
+            num_running_reqs: 6,
+            ..LoadSnapshot::default()
+        });
+        let (req, _events) = routed_request(None);
+        handle.submit(req).expect("submit");
+        assert!(rx1.try_recv().is_ok());
+    }
+
+    #[test]
+    fn multi_partition_out_of_range_rank_is_rejected_not_dropped() {
+        let (tx0, _rx0) = mpsc::unbounded_channel::<GenerateRequest>();
+        let handle = EngineHandle::new_with_join_handles(vec![tx0], Vec::new());
+
+        let (req, mut events) = routed_request(Some(7));
+        handle
+            .submit(req)
+            .expect("out-of-range is answered, not an error");
+        assert!(matches!(
+            events.try_recv().map(|(_, event)| event),
+            Ok(TokenEvent::Scheduled { .. })
+        ));
+        assert!(matches!(
+            events.try_recv().map(|(_, event)| event),
+            Ok(TokenEvent::Rejected { ref message, .. }) if message.contains("outside 0..1")
+        ));
+    }
+
+    #[test]
+    fn multi_partition_drop_joins_every_thread() {
+        let exited: Vec<_> = (0..3).map(|_| Arc::new(AtomicBool::new(false))).collect();
+        let (txs, joins): (Vec<_>, Vec<_>) = exited
+            .iter()
+            .map(|flag| {
+                let (tx, mut rx) = mpsc::unbounded_channel::<GenerateRequest>();
+                let flag = Arc::clone(flag);
+                let join = thread::spawn(move || {
+                    while rx.blocking_recv().is_some() {}
+                    flag.store(true, Ordering::SeqCst);
+                });
+                (tx, join)
+            })
+            .unzip();
+        let handle = EngineHandle::new_with_join_handles(txs, joins);
+        drop(handle);
+        for flag in &exited {
+            assert!(flag.load(Ordering::SeqCst));
+        }
     }
 
     #[test]

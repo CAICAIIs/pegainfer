@@ -19,7 +19,7 @@ use super::Glm52StepShape;
 /// the bucket graph was launched ahead, hiding the ~0.7 ms host-side
 /// `cuGraphLaunch` under the current step's execution (measured on jz-38:
 /// 5.4 µs intra-step replay gap vs 810 µs at an unhidden step boundary).
-/// Consumed only when the coordinator's next step matches `expect` exactly;
+/// Consumed only when the engine's next step matches `expect` exactly;
 /// on any mismatch the full host prologue overwrites the advanced inputs and
 /// the stale replay degrades to a recompute whose rows never influence the
 /// following real replay (per-row math is row-independent).
@@ -27,7 +27,7 @@ pub(super) struct Glm52SpeculatedStep {
     pub(super) bucket: usize,
     pub(super) active_rows: usize,
     pub(super) slots: [u8; GLM52_MAX_BATCH_PER_RANK],
-    /// The coordinator inputs this speculation assumed: active rows carry
+    /// The engine inputs this speculation assumed: active rows carry
     /// (this step's argmax, position + 1); padding rows echo this step's
     /// padding input verbatim (their device rows keep self-feeding, which
     /// is harmless — pad outputs are never read and rows are isolated).
@@ -65,7 +65,7 @@ impl Glm52RankModel {
 
         // Speculation must be all-ranks-or-none: the speculative replay is a
         // full set of collectives, so every precondition here is a GLOBAL
-        // invariant the coordinator's lease already guarantees (single-token
+        // invariant the engine's lease already guarantees (single-token
         // rows from the shape, position headroom from its slot bookkeeping —
         // pad rows never outrun active rows — and captured graphs from the
         // startup pre-capture). A rank that silently skipped would desync
@@ -90,7 +90,7 @@ impl Glm52RankModel {
                 // The feed kernel advances slot_mapping by +1, which only
                 // stays inside the row's current 64-token page off a page
                 // boundary; the next page is not even in the uploaded block
-                // table. The coordinator's lease gate breaks the streak at
+                // table. The engine's lease gate breaks the streak at
                 // every ACTIVE row's boundary, which also bounds every
                 // padding row (reset to position 0 by each full prologue)
                 // inside the padding page — a violation here is a gate bug.

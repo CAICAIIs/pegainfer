@@ -4,17 +4,19 @@
 //! [`GLM52_DECODE_BUCKETS`] batch buckets per step (real request tokens in
 //! occupied slots, padding rows elsewhere; prefill rides decode as *spans* —
 //! several consecutive positions of one slot in a single step). KV lives in
-//! a rank-wide pool of 64-token pages: the coordinator's `BlockPool` assigns
+//! a rank-wide pool of 64-token pages: the rank engine's `BlockPool` assigns
 //! pages per request, and every step's [`Glm52StepKv`] carries each row's
 //! page table row plus its flat cache write slot — padding rows ride the
 //! pool's reserved padding page, whose garbage writes nobody reads.
 //!
-//! Every step, all 8 ranks run the forward in lock-step with the SAME bucket
-//! (the coordinator's global decision), each dispatching exactly that many
-//! rows into every MoE layer's DeepEP collective — the collectives require
-//! all ranks to enter in the same layer order 3..=77 with the agreed global
-//! row count, and the per-bucket fixed row count keeps every step's kernel
-//! shapes identical within a bucket (the whole-step CUDA graphs' contract).
+//! Every step, every rank runs the forward unconditionally with its OWN
+//! bucket (one free-running engine per rank — idle ranks forward padding
+//! rows), dispatching those rows into every MoE layer's DeepEP collective.
+//! The collectives pair by entry count in the fixed layer order 3..=77 with
+//! rank-local row counts under the conservative protocol-max bound
+//! (`docs/models/glm52/free-running-dp.md` §2), and the per-bucket fixed
+//! row count keeps every step's kernel shapes identical within a bucket
+//! (the whole-step CUDA graphs' contract).
 
 use anyhow::Context as _;
 use anyhow::Result;
@@ -100,7 +102,7 @@ pub(crate) const GLM52_MODEL_LEN_ALIGN: usize = GLM52_FLASHMLA_SPARSE_PAGE_SIZE;
 /// with `prompt + max_tokens <= cap + 1` (`validate_request`) — one page
 /// more than its KV ever writes, because kvbm appends the final generated
 /// token and eagerly provisions its page (the dangling-token contract). The
-/// coordinator's `BlockPool` and the rank arenas
+/// engine's `BlockPool` and the rank arenas
 /// ([`Glm52RankModel::build`]) MUST agree on this count: pool block ids index
 /// the arenas directly.
 pub(crate) fn glm52_pool_blocks(max_model_len: usize, pool_slots: usize) -> usize {
@@ -193,8 +195,8 @@ fn glm52_persistent_mla_bytes_per_token(
 /// CUDA graphs, scratch arena, and FlashMLA plans, and the batched GEMV
 /// kernel is instantiated for exactly these row counts (`kBatchedGemvBatch*`
 /// in `glm52_moe_gemv.cu` — a drift crashes at the launch boundary). The
-/// coordinator picks the smallest bucket covering the fullest rank, so a
-/// lightly-loaded fleet keeps the small-step cost; discrete buckets (not a
+/// engine picks the smallest bucket covering its own demand, so a
+/// lightly-loaded rank keeps the small-step cost; discrete buckets (not a
 /// continuum) keep the whole-step graphs' fixed-shape contract.
 pub(crate) const GLM52_DECODE_BUCKETS: [usize; 4] = [1, 2, 4, GLM52_MAX_BATCH_PER_RANK];
 
@@ -217,9 +219,9 @@ const _: () =
 // a batch-cap bump past it must widen the kernel, not silently truncate.
 const _: () = assert!(GLM52_MAX_BATCH_PER_RANK <= 32);
 
-/// The step's forward shape, agreed globally by the coordinator: `bucket`
-/// rows per rank (a member of [`GLM52_DECODE_BUCKETS`] — the MoE collectives
-/// require every rank to enter with the same global row count), with
+/// The step's forward shape for one rank: `bucket` rows (a member of
+/// [`GLM52_DECODE_BUCKETS`]; the MoE collectives pair by entry count with
+/// rank-local row counts under the conservative protocol-max bound), with
 /// `slots[row]` naming the cache slot each forwarded row addresses for
 /// `row < bucket` (active slots first, padding rows parked on free slots
 /// whose cache regions are dead).
@@ -241,7 +243,7 @@ pub(crate) struct Glm52StepShape {
     pub(crate) active_rows: usize,
 }
 
-/// The step's KV paging, decided by the coordinator's per-rank `BlockPool`:
+/// The step's KV paging, decided by the rank engine's `BlockPool`:
 /// where each forwarded row's cache writes land and which pages its
 /// attention/indexer walk. Uploaded by the step prologue into the bucket's
 /// device block table / slot mapping (the captured graphs read only those
@@ -325,12 +327,12 @@ pub(crate) struct Glm52RankModel {
     /// bytes; TP4 FlashInfer uses the standard 576-byte E4M3 layout.
     mla_cache_bytes_per_token: usize,
     /// EP rank count of the launch topology (8 for EP8, 4 for EP4, 1 for the
-    /// tensor-replicated topologies): the factor between a step's per-rank
-    /// bucket and the MoE collectives' agreed `global_tokens`.
+    /// tensor-replicated topologies): the factor between the per-rank batch
+    /// cap and the MoE collectives' protocol-max `global_tokens` bound.
     ep_ranks: usize,
     /// Built with `--moe-topo tp`: every MoE arm is `MoeTp`, bucket-8
     /// steps are span steps (all 8 rows one owner rank), and the
-    /// coordinator must stage the span owner on every such step.
+    /// engine must stage the span owner on every such step.
     slot_mapping: CudaSlice<i64>,
     seq_lens: CudaSlice<i32>,
     /// Device-resident rope tables for every position (`[max_model_len,
@@ -705,7 +707,7 @@ impl Glm52RankModel {
         // One Glm52BucketState per decode bucket: batch-`rows` contracts
         // (num_blocks is cache geometry, not batch, so it carries over),
         // plans, scratch, and a zeroed block table (never read before the
-        // first step prologue uploads the coordinator's page rows).
+        // first step prologue uploads the engine's page rows).
         // Attention-TP scratch follows the head shard and selected MLA cache
         // layout; both were fixed before the per-layer arenas were allocated.
         let mut buckets = Vec::with_capacity(if prefill_chunk_size.is_some() {
@@ -965,7 +967,7 @@ impl Glm52RankModel {
             .context("GLM5.2 TP4 prefill proposal exceeds decode bucket capacity")?;
         mtp.reset_slots(&proposal_slots)?;
         mtp.resume_reset_slots(&proposal_slots, &appends)?;
-        let round = crate::runner::Glm52MtpRound::Propose {
+        let round = crate::runner::Glm52MtpRound {
             source_bucket: bucket,
             context_bucket: bucket,
             draft_bucket: bucket,
@@ -1009,21 +1011,14 @@ impl Glm52RankModel {
         tp: Option<&mut Glm52MoeTpRank>,
         round: &crate::runner::Glm52MtpRound,
     ) -> Result<Vec<[u32; crate::mtp::GLM52_MTP_DRAFTS]>> {
-        let Some(source_bucket) = round.source_bucket() else {
-            self.mtp
-                .as_mut()
-                .context("GLM5.2 native MTP command reached a model without MTP weights")?
-                .reset_slots(round.resets())?;
-            return Ok(Vec::new());
-        };
         let source_index = self
             .buckets
             .iter()
-            .position(|bucket| bucket.rows == source_bucket)
+            .position(|bucket| bucket.rows == round.source_bucket)
             .with_context(|| {
                 format!(
-                    "GLM5.2 MTP source bucket {source_bucket} is not in \
-                     {GLM52_DECODE_BUCKETS:?}"
+                    "GLM5.2 MTP source bucket {} is not in {GLM52_DECODE_BUCKETS:?}",
+                    round.source_bucket
                 )
             })?;
         // Official vLLM feeds MTP the target model return, which is after
@@ -1034,8 +1029,8 @@ impl Glm52RankModel {
             .mtp
             .as_mut()
             .context("GLM5.2 native MTP command reached a model without MTP weights")?;
-        mtp.reset_slots(round.resets())?;
-        mtp.resume_reset_slots(round.resets(), round.appends())?;
+        mtp.reset_slots(&round.resets)?;
+        mtp.resume_reset_slots(&round.resets, &round.appends)?;
         mtp.propose(
             ctx,
             aux,
@@ -1051,17 +1046,19 @@ impl Glm52RankModel {
         )
     }
 
-    /// One lock-step step: feed `inputs[row]` = the `(token, position)` each
+    /// One rank's step: feed `inputs[row]` = the `(token, position)` each
     /// forwarded row carries, return the next-token id per ROW (the fused
-    /// greedy argmax, overwritten for the coordinator's `sampling` rows by a
+    /// greedy argmax, overwritten for the engine's `sampling` rows by a
     /// post-graph FlashInfer sampling pass — see [`Self::sample_rows_into`]).
-    /// Enters
-    /// 75 MoE collectives — every other rank must be stepping concurrently
-    /// WITH THE SAME BUCKET (`shape.bucket`): the coordinator agrees the
-    /// bucket globally per step. Row `r` writes and reads KV through `kv`'s
-    /// page row / slot mapping; a slot's span rows walk consecutive positions
-    /// (see [`Glm52StepShape`]); padding rows' cache writes land in the
-    /// pool's padding page, which nobody reads meaningfully.
+    /// Enters 75 MoE collectives unconditionally — every other rank's engine
+    /// is stepping concurrently with its OWN bucket (`shape.bucket` is
+    /// rank-local): the collectives pair by entry count with rank-local row
+    /// counts under the conservative protocol-max bound
+    /// (`docs/models/glm52/free-running-dp.md` §2). Row `r` writes and reads
+    /// KV through `kv`'s page row / slot mapping; a slot's span rows walk
+    /// consecutive positions (see [`Glm52StepShape`]); padding rows' cache
+    /// writes land in the pool's padding page, which nobody reads
+    /// meaningfully.
     ///
     /// The step body (embed → 78 layers → lm_head → argmax) is captured into
     /// a CUDA graph on the first call in each (attention tier × bucket) shape
@@ -1071,12 +1068,12 @@ impl Glm52RankModel {
     /// tokens, and — for partial buckets — each forwarded row's block-table
     /// row), and the epilogue reads back the per-row argmax results — both
     /// outside the graph. Capture-time safety: stream capture records without
-    /// executing, and in lock-step all ranks enter a new shape on the same
-    /// global step, so the DeepEP collectives first execute together on every
-    /// rank's first launch of that shape (the same argument as the kimi
-    /// decode graph; the ceiling is the ~100 s DeepEP device timeout against
-    /// a capture window of tens of ms — already proven by the mid-serving
-    /// tier-crossing capture).
+    /// executing, so a capturing rank does NOT enter the collectives — its
+    /// peers' pairing entries simply wait until this rank's first replay of
+    /// the shape executes them (pairing is by entry order, not step index;
+    /// the ceiling is the ~100 s DeepEP device timeout against a capture
+    /// window of tens of ms — already proven by the mid-serving tier-crossing
+    /// capture).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn decode_step(
         &mut self,
@@ -1097,7 +1094,7 @@ impl Glm52RankModel {
         );
         // A launch-ahead speculation feeds this step's ARGMAX token to the
         // next step, so it can never coexist with a sampled row — the
-        // coordinator withholds the lease while any non-greedy request is
+        // engine withholds the lease while any non-greedy request is
         // active, and a violation here is a protocol bug.
         ensure!(
             sampling.is_empty() || (!flags.consume && !flags.lease),
@@ -1106,7 +1103,7 @@ impl Glm52RankModel {
         );
         let batch = shape.bucket;
         if flags.consume {
-            // Launch-ahead fast path: the coordinator says this step IS the
+            // Launch-ahead fast path: the engine says this step IS the
             // replay every rank speculatively enqueued last step. That claim
             // is global — a speculative replay is a full set of collectives,
             // so ranks must consume together or not at all. Any mismatch is
@@ -1114,7 +1111,7 @@ impl Glm52RankModel {
             // would desync the collective pairing (measured as the ~100 s
             // DeepEP device-timeout trap).
             let speculated = self.speculated.take().context(
-                "GLM5.2 launch-ahead desync: the coordinator consumed a speculation this rank \
+                "GLM5.2 launch-ahead desync: the engine consumed a speculation this rank \
                  never enqueued",
             )?;
             ensure!(
@@ -1187,7 +1184,7 @@ impl Glm52RankModel {
             );
             ensure!(
                 !effectively_greedy(&s.params, GLM52_VOCAB),
-                "GLM5.2 effectively-greedy row {} routed to the sampler (coordinator bug)",
+                "GLM5.2 effectively-greedy row {} routed to the sampler (engine bug)",
                 s.row
             );
         }
@@ -1246,8 +1243,40 @@ impl Glm52RankModel {
         Ok(())
     }
 
+    /// Test probe (free-running gate 4): D2H the last routed MoE layer's
+    /// top-k output for one bucket's rows. The decode scratch is shared by
+    /// every layer, so this is the layer-77 routing — a byte-constancy
+    /// witness that transitively covers the whole step upstream of it
+    /// (indexer seq_len=1, fp8 quant, attention, all 74 earlier routers).
+    #[cfg(test)]
+    pub(crate) fn probe_step_route(
+        &self,
+        ctx: &DeviceContext,
+        bucket_rows: usize,
+    ) -> Result<(Vec<i32>, Vec<u32>)> {
+        let bucket = self
+            .buckets
+            .iter()
+            .find(|bucket| bucket.rows == bucket_rows)
+            .with_context(|| format!("GLM5.2 route probe: unknown bucket {bucket_rows}"))?;
+        let rows = bucket_rows * crate::config::GLM52_TOPK;
+        let idx = ctx
+            .stream
+            .clone_dtoh(&bucket.scratch.router.route.topk_idx)?;
+        let weight = ctx
+            .stream
+            .clone_dtoh(&bucket.scratch.router.route.topk_weight)?;
+        Ok((
+            idx[..rows.min(idx.len())].to_vec(),
+            weight[..rows.min(weight.len())]
+                .iter()
+                .map(|w| w.to_bits())
+                .collect(),
+        ))
+    }
+
     /// The non-leased step path: validate the shape, rewrite every per-step
-    /// device input buffer from the coordinator's `inputs`, and run (or lazily
+    /// device input buffer from the engine's `inputs`, and run (or lazily
     /// capture) the whole-step graph for the step's bucket × tier.
     #[allow(clippy::too_many_arguments)]
     fn decode_step_prologue_and_replay(
@@ -1262,7 +1291,7 @@ impl Glm52RankModel {
         eager: bool,
     ) -> Result<()> {
         // The bucket state's `rows` is the lookup key — an unknown bucket is
-        // a coordinator bug and fails the step before touching the GPU.
+        // an engine bug and fails the step before touching the GPU.
         let bucket = self
             .buckets
             .iter_mut()
@@ -1318,7 +1347,7 @@ impl Glm52RankModel {
                 "GLM5.2 slot {slot} position {position} exceeds the model-length cap {}",
                 self.max_model_len
             );
-            // The coordinator's page row must place this row's write slot
+            // The engine's page row must place this row's write slot
             // inside the page covering its position — a drifted slot mapping
             // would write one row's KV into another request's page.
             let page =
@@ -1355,7 +1384,7 @@ impl Glm52RankModel {
             .memcpy_htod(&kv.pages[..], &mut bucket.block_table)?;
         // Want-mask for the TP8 kernels: pad rows (>= active_rows, a prefix
         // by plan construction) skip the LL wire and shrink the expert union.
-        // Every rank stages the same value — the coordinator mirrors the
+        // Every rank stages the same value — the engine mirrors the
         // step, and LL push/wait symmetry depends on it. A leased replay
         // (consume path) skips this prologue, which is safe: the lease
         // guarantees the identical shape, so the staged value still holds.
@@ -1377,11 +1406,15 @@ impl Glm52RankModel {
             block_table: &bucket.block_table,
             seq_lens: &self.seq_lens,
         };
-        // Every rank must pass the same global token count into the MoE
-        // collectives — guaranteed by the coordinator agreeing the bucket.
-        // (`ep_ranks` is 1 on tensor-replicated topologies, where the value
-        // is never consumed.)
-        let global_tokens = self.ep_ranks * batch;
+        // The MoE collectives take this rank's real row count plus a GEMM
+        // tile bound that only has to be conservative — every rank passes the
+        // protocol max (`ep_ranks × GLM52_MAX_BATCH_PER_RANK`) so the bound
+        // never depends on other ranks' buckets. Measured at zero cost vs the
+        // tight bound (free-running gate 3, `docs/models/glm52/
+        // free-running-dp.md` §8); the recv-side truth comes from the device
+        // expert counts, not this value. (`ep_ranks` is 1 on
+        // tensor-replicated topologies, where the value is never consumed.)
+        let global_tokens = self.ep_ranks * GLM52_MAX_BATCH_PER_RANK;
 
         let s = &mut bucket.scratch;
         let decode_lm_head = self.decode_lm_head.as_ref().unwrap_or(&self.lm_head);

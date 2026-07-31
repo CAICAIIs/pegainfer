@@ -230,20 +230,18 @@ pub(crate) struct Args {
     #[arg(long)]
     pub glm52_weight_staging: bool,
 
-    /// GLM5.2 remote rank-host nodes for cross-node EP, comma-separated
-    /// `host:port=ranks` (e.g. `10.13.84.7:19000=4`). Each node contributes
-    /// its ranks AFTER this process's local ranks, in list order; the total
-    /// must equal the topology's rank count. Start the remote side with
-    /// `--glm52-rank-host`.
-    #[arg(long, value_delimiter = ',')]
-    pub rank_hosts: Vec<String>,
-
-    /// Serve as a GLM5.2 rank-host on this listen address (e.g.
-    /// `0.0.0.0:19000`) instead of running an engine: a coordinator started
-    /// with `--rank-hosts` connects and drives this node's GPUs. No HTTP
-    /// frontend, no scheduler — a dumb worker shell.
+    /// GLM5.2 global DP ranks this process hosts, `start..end` (e.g. `4..8`).
+    /// Default: the whole topology (single-node). A partial range is the
+    /// multi-process cross-node shape: every node runs the same binary over
+    /// its own ranks, and requires `--glm52-rendezvous`.
     #[arg(long)]
-    pub glm52_rank_host: Option<String>,
+    pub glm52_ranks: Option<String>,
+
+    /// GLM5.2 bootstrap rendezvous address (`host:port`): the process hosting
+    /// rank 0 binds it and serves the DeepEP unique id; every other process
+    /// connects to fetch it. A one-time handshake — no runtime control plane.
+    #[arg(long)]
+    pub glm52_rendezvous: Option<String>,
 
     /// Fraction of total GPU memory the Qwen3 instance may use. The KV cache is
     /// sized from this budget after startup profiling accounts for weights,
@@ -380,7 +378,8 @@ fn consumed_args(model_type: ModelType) -> &'static [&'static str] {
             "moe_topo",
             "glm52_weight_staging",
             "dump_graph_png",
-            "rank_hosts",
+            "glm52_ranks",
+            "glm52_rendezvous",
         ],
         #[cfg(feature = "kimi-k2")]
         ModelType::KimiK2 => &["tp_size", "dp_size", "ep_backend", "cuda_graph"],

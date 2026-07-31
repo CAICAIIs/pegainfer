@@ -63,7 +63,7 @@ use crate::moe_ep_wo::glm52_moe_ep_wo_routed_forward;
 use crate::scratch::Glm52DecodeScratch;
 
 const EP_RANKS: usize = 4;
-/// Every global-token protocol value the production coordinator can agree on
+/// Every global-token protocol value a production engine can pass
 /// — one per decode bucket, largest first (the worst-case row bound leads).
 const GLOBAL_TOKEN_BUCKETS: [usize; GLM52_DECODE_BUCKETS.len()] = {
     let mut buckets = [0usize; GLM52_DECODE_BUCKETS.len()];
@@ -168,8 +168,10 @@ fn layer_moe_ep4_oracle_gate() -> Result<()> {
 
 /// The EP4 variant of the gate's prefill-via-decode walk: same decode
 /// environment as `oracle::layer::run_layer_prefill`, with the MLP half
-/// driven through the weight-only collective chain.
-fn run_layer_prefill_ep4(
+/// driven through the weight-only collective chain. Shared with the
+/// free-running DP gates (`freerun_ep4`), which re-run it under
+/// heterogeneous cross-rank traffic.
+pub(super) fn run_layer_prefill_ep4(
     ctx: &DeviceContext,
     w: &crate::layer::Glm52DecoderLayerWeights,
     ep4: &mut Glm52MoeEpWoState<openinfer_kernels::ops::Glm52Ep4DeepEpAbi>,

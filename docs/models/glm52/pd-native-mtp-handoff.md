@@ -1,12 +1,23 @@
 # GLM5.2 P/D native-MTP handoff
 
 > **TL;DR:** TP4 prefill transfers 99 target plus two committed native-MTP
-> arenas and a five-token proposal to EP decode. Real 89-token, 4K, and 16K
-> TP4 P → EP4 D gates restore over RDMA; post-review state-machine coverage
-> now guarantees that the forwarded anchor starts directly in verify. In a
-> five-run cold-prefix A/B, P-to-D-first p50 was 82/386/1,465 ms versus EP4
-> local-prefill TTFT of 317/13,853/55,932 ms; hardware first-verify telemetry
-> must be rerun after the state fix.
+> arenas and a five-token proposal to EP decode; gates from 89 tokens to 16K
+> restore byte-identically over RDMA with `first_step=verify`. End-to-end
+> through a dual-endpoint router (P TP4 + D EP8 across two trays): parity
+> gate byte-exact, GSM8K full 1,276/1,315 strict (0.970) at c32 — parity
+> with the single-instance reference — and random-IO sweeps show the
+> throughput knee at c32 (~1.6k tok/s out, ~14.1k tok/s in ceiling). Under
+> sustained long-generation load the hard-coded 15 s handoff deadline is the
+> first limit: with one prefill, c64 rejects ~24% on decode1, c128 ~83%; a
+> GSM8K boundary case also exposed and fixed a fatal admission-capacity
+> drift at `(input+output) ≡ 1 (mod 64)` (`d791dffc`). Scaling out: a second
+> TP4 prefill (2P, round_robin router) holds GSM8K full at c64 with strict
+> 1,273/1,319 (0.9718) and only a warm-up transient — the sustainable
+> envelope doubles from c32 to c64. A standalone EP16 decode fleet
+> (4 trays × 4 ranks, local prefill) serves GSM8K n200 c32 at 0.985 strict
+> and ~944 tok/s out per endpoint decode-heavy (TPOT p50 29 ms), but
+> co-located prefill costs ~55% of mid-workload throughput versus a
+> dedicated P.
 >
 > **Last touched:** 2026-07
 
@@ -81,6 +92,182 @@
     gate.
 
 ## Execution Log
+
+### EP16 decode-only fleet and second-prefill (2P) scaling (2026-07-31)
+
+Two scale-out experiments in the idle evening window (tray01/02/04/06/08
+free; tray09–12 still held by the k3 job).
+
+**EP16 standalone decode fleet** (tray01/02/04/08, 4 trays × 4 ranks,
+rendezvous on tray01:19211, no P/metaserver/router — requests are served by
+local prefill on the decode ranks):
+`GLM52_PD_CONFIG=~/.config/openinfer/glm52-ep16-decode.env
+scripts/glm52_pd_stack.sh decode-only`.
+
+- Bring-up incidents worth knowing about: jump-host disconnects killed
+  script attempts 1–3 (every attempt restarts decode0, discarding peer
+  progress), and tray02's 8-hour-old container lost GPU visibility
+  (`Failed to initialize NVML: Unknown Error` → `CUDA_ERROR_NO_DEVICE`,
+  host `nvidia-smi` fine) after a host-side driver event. `docker restart`
+  on the container restored NVML; relaunching decode1 (ranks 4..8) by hand
+  with the script's exact command let the in-flight fleet finish DeepEP
+  init — all 4 endpoints healthy on the final attempt. Per-token decode
+  speed was unaffected afterwards.
+- 4-endpoint smoke: identical deterministic answers from all endpoints.
+- **GSM8K (8-shot, temp 0, max_tokens 4,096, against the decode0 endpoint
+  only): n200 c32 = 197/200 strict (0.985), 0 errors, wall 399 s** — parity
+  with the EP8 P/D baseline (0.980). The throwaway harness in susun-dev
+  needed a `cached_tokens` empty-list guard: standalone decode reports no
+  prefix-cache hits.
+- **vllm-bench against decode0 alone** (random IO, 512 prompts, c64, temp
+  0, `ignore_eos`, 0 failed; artifacts
+  `/mnt/shared/home/susun/bench-results/glm52-ep16-{decode,mid}-infqps-concurrency64-GLM-5.2-FP8-20260731-*.json`):
+  - decode-heavy in=256/out=2,048: **943.7 tok/s out, TPOT p50 29.3 ms**,
+    TTFT p50 75 s (local-prefill queueing at c64), 1,111 s wall.
+  - mid in=1,024/out=512: **369.4 tok/s out, TPOT p50 29.1 ms**, TTFT p50
+    73.6 s.
+  - Read against the EP8 P/D stack: per decode endpoint the EP8 fleet did
+    ~818 tok/s out at TPOT p50 38 ms on decode-heavy, so an EP16 endpoint
+    is faster per token (native MTP, 29 ms) and per endpoint. On mid the
+    EP16 endpoint collapses to 369 tok/s versus ~815/endpoint with a
+    dedicated P — co-locating 1,024-token prefills with decode on the same
+    4 ranks costs ~55% of output throughput. That is the cleanest
+    quantification so far of what P/D separation buys.
+- Not measured: fleet-aggregate throughput over all 4 endpoints (decode-only
+  has no router; the bench targeted decode0 by design).
+
+**Second prefill instance (2P)** behind the same router: P2 on tray06 (TP4
+prefill-only, advertise 10.13.84.12:50103, same metaserver on tray03:50056),
+router restarted with two `--prefill` endpoints round_robin over both P and
+both D endpoints. Launched manually — `glm52_pd_stack.sh` still models a
+single P.
+
+- **GSM8K full 1,319 c64: strict 1,273 (0.9718), flex identical, 9 errors,
+  finish stop 1,297 / length 13, wall 523 s** (artifact
+  `bench-results/gsm8k-full-c64-2p-router.json`). The 9 errors were a P2
+  warm-up transient in the first ~2 minutes. The same c64 load with 1P
+  rejected ~24% of requests steady-state on decode1; 2P eliminates the
+  saturation rejects and doubles the sustainable GSM8K-class envelope from
+  c32 to c64 while holding accuracy.
+- P2 bring-up gotchas (apply to any reused EP32-provisioned container):
+  those containers were created without `--ulimit memlock=-1:-1`, so
+  kv-offload RDMA MR registration fails — the tray06 container was rebuilt
+  with the ulimit. Any container rebuild reverts libnccl to the image
+  default; reinstall `libnccl2/libnccl-dev=2.30.7-1+cuda13.3` and verify
+  `ncclCommQueryProperties` before starting (the stack script's
+  `ensure_nccl` does this check).
+
+### Full P/D-stack validation: router parity, GSM8K, load sweeps (2026-07-30)
+
+Same deployment as the multi-process section above (P TP4 tray03, D EP8
+tray13+tray14, vLLM router on tray03:10001, round_robin over both decode
+endpoints), exercised end to end through the router.
+
+- **Router parity gate**: for a prompt of N ids with anchor a,
+  `router(ids, mt=6).text == D(ids, mt=1).text + D(ids+[a], mt=5).text` —
+  byte-exact at N=148 and N=4,096 on BOTH decode endpoints (round_robin
+  confirmed to hit decode0 rank=0 and decode1 rank=4, each admitting with
+  `first_step=verify`). 4K router handoff ~352 ms versus ~29 s decode-local
+  recompute. The gate script treats the anchor as the client's first
+  generated token (`completion_tokens=6` includes it).
+- **Fatal admission-capacity drift found by GSM8K and fixed** (`d791dffc`):
+  `adopt_external_prefill_anchor` reclassifies the anchor from input to
+  generated (`num_input_tokens -= 1`), so `RequestKv::lifetime_blocks()` lost
+  one block of capacity exactly when `(input + output) ≡ 1 (mod 64)` —
+  e.g. 1,601+4,096=5,697 → 90 blocks dropped to 89, tripping the
+  admission `ensure` and fail-stopping the whole EP fleet (the second
+  decode's `CUDA_ERROR_LAUNCH_FAILED` was collateral of the first decode's
+  death). `RequestKv` now freezes its lifetime capacity at construction;
+  regression test `external_prefill_anchor_promotion_keeps_lifetime_capacity`.
+- **GSM8K (8-shot, temp 0, max_tokens 4,096, through the router)**:
+  n200 c32 = 196/200 strict (0.980), 0 errors; full 1,319 c32 = 1,276/1,315
+  strict (0.970), 4 errors. At parity with the single-instance
+  admission-fix reference 1,280/1,315 (0.973). The 4 full-run errors were a
+  startup transient: they were rejected while decode1 was still draining
+  timed-out handoffs from the preceding c64 experiment; steady state at c32
+  is clean.
+- **Load ceiling: the 15 s handoff deadline is the first thing to bind.**
+  `REMOTE_FETCH_DEADLINE` (scheduler/offload.rs) caps one request's
+  remote-KV wait; a parked request that outlives it is rejected
+  ("GLM5.2 native-MTP P/D handoff incomplete after 15.0s (full-page
+  transfer)") and the client sees a 500 (the router runs
+  `--disable-retries`). GSM8K-class load (sustained queue, long
+  generations): c64 drove decode1 to a steady ~16 rejects/min (~24% of
+  traffic, decode0 clean); c128 rejected ~83% of requests. One TP4 prefill
+  cannot feed the handoff pipeline at those rates; decode1 (ranks 4..8)
+  saturates before decode0. Sustainable envelope for that workload is
+  ~c32. Raising the deadline only converts rejects into TTFT; the real
+  lever is more prefill capacity (second P) or a faster save/publish
+  pipeline.
+- **vllm-bench random-IO sweeps through the router** (temperature 0,
+  `ignore_eos`, 0 failed requests at every point; artifacts in
+  `/mnt/shared/home/susun/bench-results/glm52-pd-*-20260730-165646.json`):
+  - mid in=1,024/out=512: output throughput saturates past the knee —
+    1,590 tok/s at c32 (TPOT p50 18.5 ms, TTFT p50 267 ms) versus 1,629
+    tok/s at c64 (TPOT 37.5 ms, TTFT p99 7.4 s). c1: 164 tok/s, TPOT 5.1 ms.
+  - prefill-heavy in=4,096/out=128: total (in+out) throughput plateaus at
+    ~14.1k tok/s by c16–c64; TTFT p50 degrades 466 ms (c4) → 3.6 s (c16) →
+    17.8 s (c64, queue-bound).
+  - decode-heavy in=256/out=2,048: single stream 187 tok/s out (TPOT
+    4.7 ms, native MTP on); fleet output ~1,640 tok/s at c64 with TPOT p50
+    38 ms and TTFT p99 72 s. All 512 prompts completed.
+  - The same c64 concurrencies that flooded GSM8K produced only ~2 rejects
+    per bench run: the deadline binds under *sustained* long-generation
+    load, not short random-IO bursts.
+- **EP16/EP32 decode-scale attempt: blocked by cluster contention.** A
+  4-node k3 job took tray09–12 and other tenants took tray04/08 within
+  minutes of the free-machine scan (decode2/3 died on
+  `CUDA_ERROR_OUT_OF_MEMORY` at `W13Weight` alloc). EP16 fleet was torn
+  down; tray01/02/06 remain provisioned (`openinfer-ep32-decode`, NCCL
+  2.30.7 checked) for the next idle window. `scripts/glm52_pd_stack.sh`
+  supports `D_TOPO=ep16/ep32` + `decode-only` for that rerun.
+
+### Multi-process decode fleet: TP4 P → EP8 D across two trays (2026-07-30)
+
+- First hardware run of native P/D against a **multi-process** decode fleet:
+  P TP4 on tray03; D EP8 split tray13 (ranks 0..4) + tray14 (ranks 4..8)
+  under `--glm52-rendezvous`; metaserver on tray03:50056; transfers over
+  `mlx5_bond_0`; vLLM router v0.1.15 on tray03:10001. The bring-up used
+  `scripts/glm52_pd_stack.sh`, extended for multi-process decode
+  (`D_TOPO`/`D_HOSTS`, rendezvous gating, ssh-proxied health probes).
+- **148-token gate byte-identical on both decode endpoints** (tray13
+  handoff 194 ms vs 660 ms local baseline; tray14 220 ms vs 683 ms). The
+  4,096-token/64-page gate is byte-identical on tray13 (104.5 ms vs
+  14,607 ms local baseline, ~140×). Anchor, drafts, and tail key match the
+  single-process EP4 run bit-for-bit.
+- Both decode nodes restore independently: admissions logged
+  `first_step=verify` with `committed_len=148/4096` on rank=1 (tray13) and
+  rank=5 (tray14) — each D node registers only its local arenas and pulls
+  rank-locally, hardware-verifying the free-running claim that cross-node
+  KV offload needs no central arena registry.
+- The 4K first verify round on EP8 D accepted **5 of 5 drafts plus the
+  bonus token** (the single-process EP4 run took 4 of 5) — first observed
+  full-proposal acceptance.
+- Router-driven smoke through the P/D loop passes (`ok: true`, TTFT
+  117 ms).
+
+### Post-shell-split replay: free-running DP architecture (2026-07-30)
+
+- Context: the DP coordinator was split into per-rank autonomous engines
+  (`free-running-dp.md` migration step 2, branch
+  `feat/glm52-free-running-dp-gates`, head `22d7d047`). The full P/D chain was
+  replayed on that code to confirm the handoff contract survived the
+  restructure: TP4 P on tray03 + EP4 D on tray04 + metaserver over
+  `mlx5_bond_0` (RoCE), native MTP on both sides.
+- **148-token gate: byte-identical.** P → D first 161 ms versus EP4
+  local-prefill TTFT 680 ms.
+- **4,096-token gate (64 pages): byte-identical.** The first verify round
+  accepted 4 of the 5 forwarded drafts plus the bonus token (5 tokens total,
+  `mean_accepted_drafts=4.000`); D log confirmed `first_step=verify`. P → D
+  first 104 ms versus EP4 local-prefill TTFT 15,339 ms (~147×).
+- One 75-token ambiguous prompt produced a deterministic fork (` point` vs
+  ` paragraph`) between the P/D and local-prefill paths. This is the top-1
+  near-tie class already declared in `native-mtp-accuracy.md` (logit-margin
+  level, movable by bucket/topology numerics), not a handoff defect; all
+  non-near-tie prompts matched byte-for-byte.
+- This replay settles the earlier outstanding item ("hardware first-verify
+  telemetry must be rerun after the state fix"): post-split, first-verify
+  admission and initial-proposal acceptance are confirmed on hardware.
 
 ### Post-review first-verify and context-cap fixes
 
@@ -297,5 +484,11 @@ The post-review state bug also showed that a log describing the intended next
 step is not evidence of the slot's actual span kind. First-verify gates must
 assert the state transition or observed speculative span.
 
-Next action: rerun the 89-token token-ID handoff gate against EP4, then EP16,
-and record observed first-verify telemetry here.
+Next action: the 2026-07-31 window closed both earlier follow-ups — the
+second prefill removed the c64 saturation rejects, and an EP16 fleet now
+serves standalone. What remains: (1) rerun the token-ID handoff contract
+against a P → EP16/EP32 D fleet (the EP16 run above was decode-only, no
+handoff); tray09–12 are still k3-held, so EP32 waits; (2) fold multi-P
+into `glm52_pd_stack.sh` (P2 launch and the dual-`--prefill` router were
+manual); (3) measure EP16 fleet-aggregate throughput across all 4
+endpoints, which needs a router or parallel clients in decode-only mode.

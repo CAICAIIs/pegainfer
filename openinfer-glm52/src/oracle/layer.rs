@@ -314,7 +314,7 @@ const EXPERTS: usize = 256;
 
 /// Mirror of the Python splitmix64 generator (see `mla_oracle_gate`), with the
 /// layer stage's input scale applied in f64 exactly like the harness.
-fn seeded_hidden(seed: u64, count: usize, scale: f64) -> Vec<bf16> {
+pub(crate) fn seeded_hidden(seed: u64, count: usize, scale: f64) -> Vec<bf16> {
     (0..count)
         .map(|i| {
             let mut z = seed.wrapping_add((i as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
@@ -327,7 +327,7 @@ fn seeded_hidden(seed: u64, count: usize, scale: f64) -> Vec<bf16> {
         .collect()
 }
 
-fn bf16_digest(data: &[bf16]) -> String {
+pub(crate) fn bf16_digest(data: &[bf16]) -> String {
     let mut hasher = Sha256::new();
     for v in data {
         hasher.update(v.to_bits().to_le_bytes());
@@ -371,7 +371,7 @@ impl LayerTensors {
         Ok(Self { by_name })
     }
 
-    fn bytes(&self, name: &str) -> Result<&[u8]> {
+    pub(crate) fn bytes(&self, name: &str) -> Result<&[u8]> {
         self.by_name
             .get(name)
             .map(Vec::as_slice)
@@ -420,7 +420,7 @@ pub(crate) fn load_rank_expert_bank(
     crate::moe_decode::Glm52MoeExpertBank::pack_from_host(ctx, &experts)
 }
 
-fn upload_u8(ctx: &DeviceContext, host: &[u8]) -> Result<cudarc::driver::CudaSlice<u8>> {
+pub(crate) fn upload_u8(ctx: &DeviceContext, host: &[u8]) -> Result<cudarc::driver::CudaSlice<u8>> {
     let mut dev = ctx.stream.alloc_zeros::<u8>(host.len())?;
     ctx.stream.memcpy_htod(host, &mut dev)?;
     Ok(dev)

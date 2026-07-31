@@ -1,4 +1,4 @@
-//! Host-tier KV offload glue: the coordinator's two touch points with the
+//! Host-tier KV offload glue: the engine's two touch points with the
 //! shared pegaflow pool. Restore runs at admission (a step boundary — every
 //! rank is joined, so blocking on the load is safe and the loaded pages race
 //! nothing); save runs on request release, fire-and-forget, with block
@@ -39,8 +39,8 @@ static QUERY_SEQ: AtomicU64 = AtomicU64::new(0);
 /// still pin. The save guards hold released blocks in the active pool
 /// (unallocatable, un-evictable) until the D2H copy lands — pages the
 /// admission full-lifetime math would otherwise promise to a new request,
-/// turning a slow copy into a mid-request allocation failure and a
-/// `fail_step` engine teardown. Admission subtracts [`Self::pinned_blocks`]
+/// turning a slow copy into a mid-request allocation failure and a fatal
+/// engine exit. Admission subtracts [`Self::pinned_blocks`]
 /// from the rank's usable count instead, degrading to "admit a few steps
 /// later" — the same honor-or-reject posture as the rest of the scheduler.
 pub(super) struct RankOffload {
@@ -154,7 +154,7 @@ const BREAKER_PROBE_WINDOW: Duration = Duration::from_millis(500);
 /// fetch (`QueryOutcome::Loading`). Well above pegaflow's own fetch timeout.
 pub(crate) const REMOTE_FETCH_DEADLINE: Duration = Duration::from_secs(15);
 
-/// Decode-node admission state for a vLLM prefill peer (one per coordinator;
+/// Decode-node admission state for a vLLM prefill peer (one per engine;
 /// see `crate::Glm52VllmCompatOptions` for the deployment contract). Tracks
 /// each rank's parked front request — only the FIFO front can be waiting on
 /// remote KV — and the cross-rank miss breaker.
@@ -339,10 +339,6 @@ impl NativePdState {
     pub(super) fn clear(&mut self, rank: usize) {
         self.parked[rank] = None;
     }
-
-    pub(super) fn any_parked(&self) -> bool {
-        self.parked.iter().any(Option::is_some)
-    }
 }
 
 /// The rank's front request currently waiting out the P/D handoff race.
@@ -449,27 +445,15 @@ impl VllmPdState {
     pub(super) fn clear_parked(&mut self, rank: usize) {
         self.parked[rank] = None;
     }
-
-    /// True while any rank's front request is parked on the handoff race —
-    /// the idle coordinator loop throttles instead of spinning.
-    pub(super) fn any_parked(&self) -> bool {
-        self.parked.iter().any(Option::is_some)
-    }
 }
 
 /// Deinterleave the RoPE dims of freshly-restored pages on their owning rank.
 /// Blocking, but called only at step boundaries where its command queue is
-/// idle. P/D is restricted to EP8, so each arena has exactly one executor.
+/// idle. P/D is restricted to EP, so each arena has exactly one executor.
 fn vllm_rope_fixup(worker: &crate::runner::Glm52Worker, pages: &[i32]) -> anyhow::Result<()> {
-    match worker {
-        crate::runner::Glm52Worker::Local(worker) => worker
-            .vllm_rope_fixup(pages.to_vec())
-            .context("restored page rope fixup"),
-        crate::runner::Glm52Worker::Remote(worker) => anyhow::bail!(
-            "GLM5.2 vLLM RoPE fixup cannot run on remote rank {}",
-            worker.rank()
-        ),
-    }
+    worker
+        .vllm_rope_fixup(pages.to_vec())
+        .context("restored page rope fixup")
 }
 
 /// vLLM-compat P/D admission for one rank's front request. The router

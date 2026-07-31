@@ -434,31 +434,12 @@ impl Glm52NativeMtp {
         round: &Glm52MtpRound,
         seed: Option<Glm52MtpProposalSeed<'_>>,
     ) -> Result<Vec<[u32; GLM52_MTP_DRAFTS]>> {
-        let (context_bucket, appends, proposal) = match round {
-            Glm52MtpRound::Context {
-                context_bucket,
-                appends,
-                ..
-            } => (*context_bucket, appends.as_slice(), None),
-            Glm52MtpRound::Propose {
-                context_bucket,
-                draft_bucket,
-                appends,
-                proposal_slots,
-                ..
-            } => (
-                *context_bucket,
-                appends.as_slice(),
-                Some((*draft_bucket, proposal_slots.as_slice())),
-            ),
-            Glm52MtpRound::Reset { .. } => {
-                unreachable!("reset-only MTP rounds return before target hidden is selected")
-            }
-        };
-        let proposal_slots = proposal.map_or(&[][..], |(_, slots)| slots);
+        let context_bucket = round.context_bucket;
+        let appends = round.appends.as_slice();
+        let proposal_slots = round.proposal_slots.as_slice();
         ensure!(
             appends.len() <= context_bucket,
-            "GLM5.2 MTP context rows {} exceed collective bucket {context_bucket}",
+            "GLM5.2 MTP context rows {} exceed bucket {context_bucket}",
             appends.len(),
         );
         ensure!(
@@ -497,6 +478,13 @@ impl Glm52NativeMtp {
             self.committed_lens[append.slot] += 1;
         }
         if seed.is_none() {
+            // The context forward runs UNCONDITIONALLY, appends or not — it
+            // is an EP collective, and the fixed-chain discipline forbids
+            // host state deciding whether a collective happens. Rows without
+            // an append are padding: token 0, position 0, page 0, and a
+            // zeroed `previous` hidden — constructively deterministic bytes
+            // on the wire, never capture-buffer residue.
+            self.zero_padding_previous(ctx, context_index, appends.len())?;
             let context_inputs: Vec<(usize, u32, usize, Option<&[i32]>)> = appends
                 .iter()
                 .map(|append| {
@@ -522,12 +510,10 @@ impl Glm52NativeMtp {
             )
             .context("GLM5.2 MTP context forward")?;
         }
-        let Some((draft_bucket, proposal_slots)) = proposal else {
-            return Ok(Vec::new());
-        };
+        let draft_bucket = round.draft_bucket;
         ensure!(
             proposal_slots.len() <= draft_bucket,
-            "GLM5.2 MTP proposal rows {} exceed collective bucket {draft_bucket}",
+            "GLM5.2 MTP proposal rows {} exceed bucket {draft_bucket}",
             proposal_slots.len(),
         );
         let mut last_rows = Vec::with_capacity(proposal_slots.len());
@@ -551,6 +537,7 @@ impl Glm52NativeMtp {
                 .context("GLM5.2 MTP context argmax")?,
         };
         let draft_index = self.bucket_index(draft_bucket)?;
+        self.zero_padding_previous(ctx, draft_index, proposal_slots.len())?;
         let mut proposal_pages = Vec::with_capacity(proposal_slots.len());
         let mut partial_backups = Vec::with_capacity(proposal_slots.len());
         for (packed, (&slot, &context_row)) in proposal_slots.iter().zip(&last_rows).enumerate() {
@@ -646,6 +633,29 @@ impl Glm52NativeMtp {
             .iter()
             .position(|bucket| bucket.rows == rows)
             .with_context(|| format!("GLM5.2 MTP bucket {rows} is not in {GLM52_DECODE_BUCKETS:?}"))
+    }
+
+    /// Zero the padding rows of a bucket's `previous` hidden buffer before a
+    /// forward. `previous` persists across rounds, so without this a padding
+    /// row would feed whatever hidden state the buffer held last — bytes that
+    /// go over the DeepEP wire. The padding-as-protocol discipline requires
+    /// every dummy row's input to be constructively deterministic.
+    fn zero_padding_previous(
+        &mut self,
+        ctx: &DeviceContext,
+        bucket_index: usize,
+        real_rows: usize,
+    ) -> Result<()> {
+        let bucket = &mut self.buckets[bucket_index];
+        if real_rows < bucket.rows {
+            ctx.stream.memset_zeros(
+                &mut bucket
+                    .previous
+                    .data_mut()
+                    .slice_mut(real_rows * GLM52_HIDDEN..bucket.rows * GLM52_HIDDEN),
+            )?;
+        }
+        Ok(())
     }
 
     fn scratch_page(&self, slot: usize, offset: usize) -> usize {
@@ -849,7 +859,17 @@ impl Glm52NativeMtp {
                     let ep = ep
                         .as_deref_mut()
                         .context("GLM5.2 EP MTP layer has no DeepEP runtime")?;
-                    glm52_moe_ep_layer(ctx, aux, ep, moe, scratch, rows, self.ep_ranks * rows)?;
+                    // Conservative protocol-max GEMM bound, same as the
+                    // target step: MTP buckets are rank-local too.
+                    glm52_moe_ep_layer(
+                        ctx,
+                        aux,
+                        ep,
+                        moe,
+                        scratch,
+                        rows,
+                        self.ep_ranks * GLM52_MAX_BATCH_PER_RANK,
+                    )?;
                 }
                 Glm52LayerMlp::MoeTp(router) => {
                     let (state, slot, bank) = tp

@@ -158,6 +158,7 @@ impl BlockPool {
     ) -> RequestKv {
         let salt_hash = compute_salt_hash(cache_salt, lora_name)
             .expect("compute_salt_hash is infallible for string cache/lora identities");
+        let lifetime_blocks = (prompt_tokens.len() + max_output_tokens).div_ceil(self.block_size);
         let seq = SchedulableSequence::new(
             prompt_tokens,
             max_output_tokens,
@@ -168,6 +169,7 @@ impl BlockPool {
         RequestKv {
             seq,
             emitted_blocks: 0,
+            lifetime_blocks,
         }
     }
 
@@ -336,6 +338,12 @@ pub struct RequestKv {
     /// which holds wherever the event feed is enabled). Untouched on the plain
     /// path where the feed is off.
     emitted_blocks: usize,
+    /// Input-plus-output page capacity, frozen at construction. The sequence
+    /// may later reclassify an input token as generated (external-prefill
+    /// anchor adoption), which must not shrink the reservation: the promoted
+    /// token still occupies its sequence position and the dangling token at
+    /// the end of the sequence still provisions a page beyond it.
+    lifetime_blocks: usize,
 }
 
 impl RequestKv {
@@ -517,7 +525,7 @@ impl RequestKv {
     /// created. Admission uses this value for already-active requests so any
     /// internal tokens added by a protocol remain accounted for.
     pub fn lifetime_blocks(&self) -> usize {
-        (self.seq.num_input_tokens() + self.seq.max_output_tokens()).div_ceil(self.seq.block_size())
+        self.lifetime_blocks
     }
 
     /// Physical blocks currently held by this request, including registered,
@@ -758,6 +766,27 @@ mod tests {
         let req = pool.new_request(vec![1; 16], 17, None);
 
         assert_eq!(req.lifetime_blocks(), 3);
+    }
+
+    #[test]
+    fn external_prefill_anchor_promotion_keeps_lifetime_capacity() {
+        let pool = BlockPool::new(16, 8).unwrap();
+        // 16 restored tokens + 1 anchor tail + 16 output positions. The
+        // anchor promotion reclassifies one input token as generated; the
+        // reservation must not shrink — the promoted token still occupies a
+        // sequence position and the dangling token at the end of the
+        // sequence still provisions a page beyond it.
+        let mut req = pool.new_request(vec![1; 17], 16, None);
+        assert_eq!(req.lifetime_blocks(), 3);
+        req.schedule_prefill(16, &pool).expect("restored chunk");
+        req.apply_prefill_chunk(&pool).expect("restored apply");
+        req.adopt_external_prefill_anchor()
+            .expect("anchor adoption");
+        assert_eq!(
+            req.lifetime_blocks(),
+            3,
+            "promoting the external anchor to generated must not shrink the reservation"
+        );
     }
 
     fn complete_non_retained_speculative_request(
