@@ -256,9 +256,9 @@ impl Glm52Engine {
                 match Glm52Engine::new(spec) {
                     Ok(engine) => engine.run(),
                     Err(err) => {
-                        let _ = startup_tx.send(Err(err.context(format!(
-                            "GLM5.2 rank {rank} KV pool construction"
-                        ))));
+                        let _ = startup_tx.send(Err(
+                            err.context(format!("GLM5.2 rank {rank} KV pool construction"))
+                        ));
                     }
                 }
             })
@@ -269,7 +269,11 @@ impl Glm52Engine {
         let mirrored = spec.moe_topo.uses_tensor_replicated_moe();
         debug_assert_eq!(
             spec.workers.len(),
-            if mirrored { spec.moe_topo.device_count() } else { 1 },
+            if mirrored {
+                spec.moe_topo.device_count()
+            } else {
+                1
+            },
             "one executor per EP rank; every mirrored worker under TP"
         );
         // vLLM-compat P/D disables self-saves: the content domain carries the
@@ -593,7 +597,10 @@ impl Glm52Engine {
         let pool = &self.pool;
         let padding_page = pool.padding_block_id();
         let sampling = collect_sampling_rows(shape, &self.slots);
-        let seed = mix_seed(mix_seed(GLM52_SAMPLE_SEED, self.sample_step), self.rank as u64);
+        let seed = mix_seed(
+            mix_seed(GLM52_SAMPLE_SEED, self.sample_step),
+            self.rank as u64,
+        );
         let mut span_kinds = [None; GLM52_MAX_BATCH_PER_RANK];
         let mut inputs =
             [(GLM52_PADDING_STEP.token, GLM52_PADDING_STEP.position); GLM52_MAX_BATCH_PER_RANK];
@@ -970,10 +977,7 @@ impl Glm52Engine {
         // Same logical-to-executor mapping as the step submit: under the
         // mirrored topology every worker drafts from its own (identical)
         // capture buffer and must propose the identical spans.
-        let (last_worker, fanned) = self
-            .workers
-            .split_last()
-            .expect("one executor per rank");
+        let (last_worker, fanned) = self.workers.split_last().expect("one executor per rank");
         let mut rxs = Vec::with_capacity(self.workers.len());
         for worker in fanned {
             rxs.push(worker.draft_async(
@@ -1003,9 +1007,10 @@ impl Glm52Engine {
                 // invariants broke — crash early rather than silently degrade
                 // to plain decode.
                 Err(err) => {
-                    return Err(
-                        err.context(format!("GLM5.2 rank {} executor {executor} draft", self.rank))
-                    );
+                    return Err(err.context(format!(
+                        "GLM5.2 rank {} executor {executor} draft",
+                        self.rank
+                    )));
                 }
             }
         }
@@ -1174,7 +1179,9 @@ impl Glm52Engine {
                 span_outputs[span - 1] = *boundary_output.next().expect("validated output count");
             }
             let prompt_tokens = active.client_prompt_tokens;
-            let outcome = active.state.advance_span(&span_outputs, &self.eos_token_ids);
+            let outcome = active
+                .state
+                .advance_span(&span_outputs, &self.eos_token_ids);
             let freed = match outcome {
                 Glm52StepOutcome::Prefilling => {
                     active.kv.apply_prefill_chunk(pool)?;

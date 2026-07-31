@@ -121,10 +121,7 @@ pub fn parse_rank_range(spec: &str) -> Result<Range<usize>> {
     let end: usize = end
         .parse()
         .with_context(|| format!("rank range `{spec}` has a non-numeric end"))?;
-    ensure!(
-        start < end,
-        "rank range `{spec}` must satisfy start < end"
-    );
+    ensure!(start < end, "rank range `{spec}` must satisfy start < end");
     Ok(start..end)
 }
 
@@ -973,18 +970,22 @@ fn start_engine(
             })
         })
         .unzip();
-    let (mut graph_dump_request, graph_dump_response) = match (&dump_graph_png, startup.ranks.start == 0)
-    {
-        (Some(path), true) => {
-            let (response_tx, response_rx) = crossbeam_channel::bounded(1);
-            (Some((path.clone(), response_tx)), Some(response_rx))
-        }
-        _ => (None, None),
-    };
+    let (mut graph_dump_request, graph_dump_response) =
+        match (&dump_graph_png, startup.ranks.start == 0) {
+            (Some(path), true) => {
+                let (response_tx, response_rx) = crossbeam_channel::bounded(1);
+                (Some((path.clone(), response_tx)), Some(response_rx))
+            }
+            _ => (None, None),
+        };
     let worker_groups: Vec<Vec<Glm52Worker>> = if mirrored {
         vec![loaded.workers]
     } else {
-        loaded.workers.into_iter().map(|worker| vec![worker]).collect()
+        loaded
+            .workers
+            .into_iter()
+            .map(|worker| vec![worker])
+            .collect()
     };
     let offload_groups: Vec<Option<Vec<OffloadEngine>>> = if mirrored {
         vec![offload]
@@ -1000,10 +1001,8 @@ fn start_engine(
     let mut submit_txs = Vec::with_capacity(local_ranks);
     let mut startup_rxs = Vec::with_capacity(local_ranks);
     let mut join_handles = Vec::with_capacity(local_ranks);
-    for (engine_index, (engine_workers, engine_offload)) in worker_groups
-        .into_iter()
-        .zip(offload_groups)
-        .enumerate()
+    for (engine_index, (engine_workers, engine_offload)) in
+        worker_groups.into_iter().zip(offload_groups).enumerate()
     {
         let rank = if mirrored {
             0
@@ -1055,13 +1054,14 @@ fn start_engine(
     // rendezvous) and reports once. On any failure close every queue so the
     // healthy engines exit their loops and shut their workers down
     // concurrently, then join them.
-    let abort_engines = |submit_txs: Vec<mpsc::UnboundedSender<openinfer_core::engine::GenerateRequest>>,
-                         join_handles: Vec<std::thread::JoinHandle<()>>| {
-        drop(submit_txs);
-        for handle in join_handles {
-            let _ = handle.join();
-        }
-    };
+    let abort_engines =
+        |submit_txs: Vec<mpsc::UnboundedSender<openinfer_core::engine::GenerateRequest>>,
+         join_handles: Vec<std::thread::JoinHandle<()>>| {
+            drop(submit_txs);
+            for handle in join_handles {
+                let _ = handle.join();
+            }
+        };
     for (engine_index, startup_rx) in startup_rxs.iter().enumerate() {
         let report = startup_rx.recv();
         let failed = match report {
@@ -1102,13 +1102,15 @@ fn start_engine(
     // requests the scheduler would reject (same contract as qwen3/dsv2-lite).
     let servable_len = u32::try_from(max_model_len)
         .expect("max_model_len is bounded by GLM52_MAX_CONTEXT and fits u32");
-    Ok(EngineHandle::new_with_join_handles(submit_txs, join_handles)
-        .with_servable_len(servable_len)
-        .with_kv_capacity(KvCapacity {
-            total_blocks: kv_total_blocks,
-            block_size: GLM52_MODEL_LEN_ALIGN,
-        })
-        .with_load_watches(load_rxs))
+    Ok(
+        EngineHandle::new_with_join_handles(submit_txs, join_handles)
+            .with_servable_len(servable_len)
+            .with_kv_capacity(KvCapacity {
+                total_blocks: kv_total_blocks,
+                block_size: GLM52_MODEL_LEN_ALIGN,
+            })
+            .with_load_watches(load_rxs),
+    )
 }
 
 fn preflight_prefill_kernels(workers: &[Glm52Worker]) -> Result<()> {

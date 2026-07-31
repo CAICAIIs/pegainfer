@@ -846,7 +846,9 @@ mod tests {
         let handle = EngineHandle::new_with_join_handles(vec![tx0], Vec::new());
 
         let (req, mut events) = routed_request(Some(7));
-        handle.submit(req).expect("out-of-range is answered, not an error");
+        handle
+            .submit(req)
+            .expect("out-of-range is answered, not an error");
         assert!(matches!(
             events.try_recv().map(|(_, event)| event),
             Ok(TokenEvent::Scheduled { .. })

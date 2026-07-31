@@ -47,8 +47,7 @@ fn load_snapshot_reports_the_ranks_own_state() {
     let req = request(vec![10, 11], SamplingParams::default(), 4);
     let state = Glm52SlotState::new(req.prompt_tokens.clone(), req.max_tokens, true, 0);
     let mut kv = pool.new_request(req.prompt_tokens.clone(), req.max_tokens, None);
-    kv.schedule_prefill(1, &pool)
-        .expect("one live KV block");
+    kv.schedule_prefill(1, &pool).expect("one live KV block");
     slots[0] = Some(ActiveRequest {
         req,
         state,

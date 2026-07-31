@@ -158,8 +158,8 @@ impl BlockPool {
     ) -> RequestKv {
         let salt_hash = compute_salt_hash(cache_salt, lora_name)
             .expect("compute_salt_hash is infallible for string cache/lora identities");
-        let lifetime_blocks = (prompt_tokens.len() + max_output_tokens)
-            .div_ceil(self.block_size as usize);
+        let lifetime_blocks =
+            (prompt_tokens.len() + max_output_tokens).div_ceil(self.block_size as usize);
         let seq = SchedulableSequence::new(
             prompt_tokens,
             max_output_tokens,

@@ -260,15 +260,14 @@ pub(super) fn admit_from_queue(
                 continue;
             };
             let offload = offload.expect("native P/D state requires offload");
-            let outcome = match offload::admit_native_mtp_pd(
-                state, rank, offload, pool, &req, handoff,
-            ) {
-                Ok(outcome) => outcome,
-                Err(err) => {
-                    reject_native_pd_error(state, rank, &req, &err);
-                    continue;
-                }
-            };
+            let outcome =
+                match offload::admit_native_mtp_pd(state, rank, offload, pool, &req, handoff) {
+                    Ok(outcome) => outcome,
+                    Err(err) => {
+                        reject_native_pd_error(state, rank, &req, &err);
+                        continue;
+                    }
+                };
             match outcome {
                 VllmAdmitOutcome::Admit { kv, cached_tokens } => Some((*kv, cached_tokens)),
                 VllmAdmitOutcome::Park => {
@@ -352,7 +351,9 @@ pub(super) fn admit_from_queue(
             // alive across the match to close the eviction window.
             let _restored_hold = offload
                 .filter(|_| prefix_cache_enabled && vllm_pd.is_none())
-                .map(|offload| offload::restore_host_prefix(&offload.engine, pool, &req.prompt_tokens));
+                .map(|offload| {
+                    offload::restore_host_prefix(&offload.engine, pool, &req.prompt_tokens)
+                });
             let cached_tokens = if prefix_cache_enabled {
                 match kv.match_and_add_prefix(pool) {
                     Ok(cached) => cached,

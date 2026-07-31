@@ -185,12 +185,11 @@ fn freerun_hetero_traffic_gate() -> Result<()> {
                         ensure!(!dispatched, "token-less rank produced a combined output");
                     }
                     // Pass B: heterogeneous traffic.
-                    let traffic =
-                        SyntheticTraffic::new(&ctx, rank, GLM52_MAX_BATCH_PER_RANK)?;
+                    let traffic = SyntheticTraffic::new(&ctx, rank, GLM52_MAX_BATCH_PER_RANK)?;
                     for position in 0..MOE_ORACLE_CTX {
                         let tokens = side_tokens(position, rank);
-                        let token = (tokens > 0)
-                            .then_some((&traffic.hidden, &traffic.route, tokens));
+                        let token =
+                            (tokens > 0).then_some((&traffic.hidden, &traffic.route, tokens));
                         let dispatched = glm52_moe_ep_wo_routed_forward(
                             &ctx,
                             &mut ep,
@@ -213,8 +212,7 @@ fn freerun_hetero_traffic_gate() -> Result<()> {
         MOE_ORACLE_LAYER,
         GateLayerMlp::MoeEp4Rank0,
     )?;
-    let mut ep =
-        Glm52MoeEpWoState::<Glm52Ep4DeepEpAbi>::new(&ctx, &unique_id, EP_RANKS, 0)?;
+    let mut ep = Glm52MoeEpWoState::<Glm52Ep4DeepEpAbi>::new(&ctx, &unique_id, EP_RANKS, 0)?;
     let quiet = run_layer_prefill_ep4(
         &ctx,
         &w,
@@ -324,8 +322,7 @@ fn freerun_hetero_graph_gate() -> Result<()> {
                         })?;
                         ctx.stream.synchronize()?;
                         let out = ctx.stream.clone_dtoh(ep.combined())?;
-                        for (i, (a, b)) in eager.iter().zip(&out[..tokens * HIDDEN]).enumerate()
-                        {
+                        for (i, (a, b)) in eager.iter().zip(&out[..tokens * HIDDEN]).enumerate() {
                             ensure!(
                                 a.to_bits() == b.to_bits(),
                                 "rank {rank} replay {replay}: combined[{i}] {} != eager {} — \

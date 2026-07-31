@@ -143,10 +143,9 @@ pub(super) fn lease_flags(
         && !offload_enabled
         && !deferred_pending
         && slots.iter().any(Option::is_some)
-        && slots
-            .iter()
-            .flatten()
-            .all(|active| takes_argmax(&active.req.params) && lease_ok(&active.state, max_model_len));
+        && slots.iter().flatten().all(|active| {
+            takes_argmax(&active.req.params) && lease_ok(&active.state, max_model_len)
+        });
     Glm52StepFlags {
         consume,
         lease,
@@ -518,8 +517,14 @@ mod tests {
 
     #[test]
     fn bucket_is_the_smallest_covering_the_ranks_own_demand() {
-        assert_eq!(forwarded(&plan_step_shape(&decode_wants(0), false)), (1, vec![0]));
-        assert_eq!(forwarded(&plan_step_shape(&decode_wants(1), false)), (1, vec![0]));
+        assert_eq!(
+            forwarded(&plan_step_shape(&decode_wants(0), false)),
+            (1, vec![0])
+        );
+        assert_eq!(
+            forwarded(&plan_step_shape(&decode_wants(1), false)),
+            (1, vec![0])
+        );
         assert_eq!(
             forwarded(&plan_step_shape(&decode_wants(2), false)),
             (2, vec![0, 1])
@@ -565,7 +570,10 @@ mod tests {
         // A short prompt remainder only lifts the bucket as far as needed.
         let mut wants = decode_wants(0);
         wants[0] = 3;
-        assert_eq!(forwarded(&plan_step_shape(&wants, false)), (4, vec![0, 0, 0, 1]));
+        assert_eq!(
+            forwarded(&plan_step_shape(&wants, false)),
+            (4, vec![0, 0, 0, 1])
+        );
     }
 
     #[test]
