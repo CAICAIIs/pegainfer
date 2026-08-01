@@ -127,8 +127,8 @@ mod tests {
     #[test]
     fn tp4_mtp_arena_ledger_charges_the_second_cache() {
         let cap = 16_384;
-        let blocks =
-            glm52_pool_blocks(cap, GLM52_MAX_BATCH_PER_RANK) + 2 * GLM52_MAX_BATCH_PER_RANK;
+        let slots = crate::model::glm52_decode_slots();
+        let blocks = glm52_pool_blocks(cap, slots) + 2 * slots;
         let extra_execution_mla = blocks
             * GLM52_FLASHMLA_SPARSE_PAGE_SIZE
             * openinfer_kernels::ops::GLM52_FLASHINFER_SPARSE_BYTES_PER_TOKEN;
@@ -273,8 +273,14 @@ impl Glm52NativeMtp {
         let layer =
             build::build_decoder_layer(ctx, weights, GLM52_MTP_LAYER, moe_topo, attn_shard)?;
 
-        let committed_blocks = glm52_pool_blocks(max_model_len, GLM52_MAX_BATCH_PER_RANK);
-        let num_blocks = committed_blocks + GLM52_MAX_BATCH_PER_RANK * MTP_SCRATCH_PAGES_PER_SLOT;
+        // The committed region mirrors the main pool's page ids 1:1 (radix
+        // hits reuse L78 KV by page id), so it must be sized from the SAME
+        // runtime slot count as the pool — the scratch pair pages sit
+        // directly after it. Ceiling-sizing here would both waste VRAM and
+        // desync the ledger in `glm52_mtp_arena_bytes`.
+        let slots = crate::model::glm52_decode_slots();
+        let committed_blocks = glm52_pool_blocks(max_model_len, slots);
+        let num_blocks = committed_blocks + slots * MTP_SCRATCH_PAGES_PER_SLOT;
         let table_width = glm52_table_width(max_model_len);
         let index_layout = Glm52IndexerCacheLayout {
             cache_blocks: num_blocks,
@@ -594,7 +600,7 @@ impl Glm52NativeMtp {
         for (span, &row) in spans.iter_mut().zip(&last_rows) {
             span[0] = context_tokens[row];
         }
-        for iteration in 1..GLM52_MTP_DRAFTS {
+        for iteration in 1..crate::mtp::glm52_mtp_draft_len() {
             let inputs: Vec<(usize, u32, usize, Option<&[i32]>)> = proposal_slots
                 .iter()
                 .enumerate()
