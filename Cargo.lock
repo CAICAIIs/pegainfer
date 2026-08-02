@@ -3306,6 +3306,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "openinfer-kv-store"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cudarc",
+ "dynamo-kv-hashing",
+ "kvbm-logical",
+ "libc",
+ "log",
+ "openinfer-engine",
+ "pegaflow-core",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+]
+
+[[package]]
 name = "openinfer-qwen3"
 version = "0.1.0"
 dependencies = [
