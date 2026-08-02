@@ -453,11 +453,21 @@ def bucket_record(
     resource_after: ResourceSample,
 ) -> dict[str, Any]:
     digest = sha256_file(report_path)
+    report_loaded = isinstance(report, dict)
     record: dict[str, Any] = {
         "bucket_index": bucket_index,
         "concurrency": concurrency,
         "artifact": str(report_path),
         "sha256": digest,
+        "leaf_artifacts": [
+            {
+                "artifact": str(report_path),
+                "sha256": digest,
+                "benchmark_returncode": returncode,
+                "report_loaded": report_loaded,
+            }
+        ],
+        "leaf_count": 1,
         "benchmark_returncode": returncode,
         "resource_before": asdict(resource_before),
         "resource_after": asdict(resource_after),
@@ -556,7 +566,15 @@ def aggregate_bucket_record(
         for request in successes
         if request.get("output_hash")
     ]
-    returncodes = [int(run.get("returncode") or 0) for run in leaf_runs]
+    returncodes = [run.get("returncode") for run in leaf_runs]
+    leaf_reports_loaded = bool(leaf_runs) and all(
+        isinstance(run.get("report"), dict)
+        and sha256_file(run["report_path"]) is not None
+        for run in leaf_runs
+    )
+    leaf_commands_passed = bool(leaf_runs) and all(
+        isinstance(code, int) and code == 0 for code in returncodes
+    )
     leaf_artifacts = [
         {
             "artifact": str(run["report_path"]),
@@ -573,8 +591,8 @@ def aggregate_bucket_record(
         "sha256": sha256_file(leaf_runs[0]["report_path"]) if leaf_runs else None,
         "leaf_artifacts": leaf_artifacts,
         "leaf_count": len(leaf_runs),
-        "report_loaded": bool(reports),
-        "benchmark_returncode": 0 if all(code == 0 for code in returncodes) else 1,
+        "report_loaded": leaf_reports_loaded,
+        "benchmark_returncode": 0 if leaf_commands_passed else 1,
         "resource_before": asdict(resource_before),
         "resource_after": asdict(resource_after),
         "wall_s": wall_s,
@@ -703,7 +721,57 @@ def drift_summary(buckets: list[dict[str, Any]]) -> dict[str, Any]:
                 first_summary.get("median"), last_summary.get("median")
             ),
         }
+    first_gpu_vectors = gpu_memory_vectors(first)
+    last_gpu_vectors = gpu_memory_vectors(last)
+    result["gpu_memory_total_mib"] = drift_field_summary(
+        [sum(sample) for sample in first_gpu_vectors],
+        [sum(sample) for sample in last_gpu_vectors],
+    )
+    result["gpu_memory_by_device_mib"] = {}
+    device_count = max(
+        [len(sample) for sample in first_gpu_vectors + last_gpu_vectors] or [0]
+    )
+    for device_index in range(device_count):
+        first_values = [
+            sample[device_index]
+            for sample in first_gpu_vectors
+            if device_index < len(sample)
+        ]
+        last_values = [
+            sample[device_index]
+            for sample in last_gpu_vectors
+            if device_index < len(sample)
+        ]
+        result["gpu_memory_by_device_mib"][str(device_index)] = drift_field_summary(
+            first_values, last_values
+        )
     return result
+
+
+def gpu_memory_vectors(buckets: list[dict[str, Any]]) -> list[list[int]]:
+    vectors = []
+    for bucket in buckets:
+        sample = (bucket.get("resource_after") or {}).get("gpu_memory_used_mib")
+        if isinstance(sample, list) and sample:
+            values = [int(value) for value in sample if isinstance(value, int)]
+            if values:
+                vectors.append(values)
+    return vectors
+
+
+def drift_field_summary(
+    first_values: list[float | int | None],
+    last_values: list[float | int | None],
+) -> dict[str, Any]:
+    first_summary = numeric_summary(first_values)
+    last_summary = numeric_summary(last_values)
+    return {
+        "first_quartile": first_summary,
+        "last_quartile": last_summary,
+        "median_delta_pct": delta_pct(
+            first_summary.get("median"), last_summary.get("median")
+        ),
+    }
 
 
 def resource_summary(samples: list[ResourceSample]) -> dict[str, Any]:
@@ -713,11 +781,31 @@ def resource_summary(samples: list[ResourceSample]) -> dict[str, Any]:
         for sample in samples
         if sample.gpu_memory_used_mib
     ]
+    gpu_total = [
+        sum(sample.gpu_memory_used_mib)
+        for sample in samples
+        if sample.gpu_memory_used_mib
+    ]
+    gpu_device_count = max(
+        [len(sample.gpu_memory_used_mib) for sample in samples] or [0]
+    )
+    gpu_by_device = {
+        str(device_index): numeric_summary(
+            [
+                sample.gpu_memory_used_mib[device_index]
+                for sample in samples
+                if device_index < len(sample.gpu_memory_used_mib)
+            ]
+        )
+        for device_index in range(gpu_device_count)
+    }
     return {
         "schema_version": RESOURCE_SAMPLE_VERSION,
         "samples": [asdict(sample) for sample in samples],
         "rss_kib": numeric_summary(rss),
         "gpu_memory_max_mib": numeric_summary(gpu_max),
+        "gpu_memory_total_mib": numeric_summary(gpu_total),
+        "gpu_memory_by_device_mib": gpu_by_device,
         "gpu_memory_scope": "device_total",
     }
 
@@ -770,6 +858,22 @@ def build_summary(
         ]
         for concurrency in args.concurrency
     }
+    duration_coverage = {
+        str(concurrency): {
+            "required_s": args.duration_s,
+            "observed_bucket_wall_s": sum(
+                float(bucket.get("wall_s") or 0.0)
+                for bucket in concurrency_buckets
+            ),
+            "bucket_count": len(concurrency_buckets),
+        }
+        for concurrency, concurrency_buckets in by_concurrency.items()
+    }
+    for record in duration_coverage.values():
+        record["passed"] = (
+            args.max_buckets is None
+            and record["observed_bucket_wall_s"] >= record["required_s"]
+        )
     total_counts = {"completed": 0, "failed": 0, "timeouts": 0}
     terminal_reasons: dict[str, int] = {}
     errors: dict[str, int] = {}
@@ -820,18 +924,26 @@ def build_summary(
     bucket_coverage_passed = bool(buckets) and all(
         by_concurrency[str(concurrency)] for concurrency in args.concurrency
     )
+    duration_coverage_passed = bool(duration_coverage) and all(
+        bool(record["passed"]) for record in duration_coverage.values()
+    )
+    clean_followup_passed = (
+        clean_summary is not None and clean_summary["passed"] is True
+    )
     leaf_commands_passed = bucket_coverage_passed and all(
         bucket.get("benchmark_returncode") == 0
         and bucket.get("report_loaded") is True
+        and bucket_leaf_artifacts_loaded(bucket)
         for bucket in buckets
     )
     passed = (
         not run_errors
         and leaf_commands_passed
+        and duration_coverage_passed
         and total_counts["failed"] == 0
         and total_counts["timeouts"] == 0
         and trace_passed
-        and (clean_summary is None or clean_summary["passed"])
+        and clean_followup_passed
     )
 
     return {
@@ -893,20 +1005,21 @@ def build_summary(
         "soak_gate": {
             "passed": passed,
             "bucket_coverage_passed": bucket_coverage_passed,
+            "duration_coverage_passed": duration_coverage_passed,
             "leaf_commands_passed": leaf_commands_passed,
             "zero_failures": total_counts["failed"] == 0,
             "zero_timeouts": total_counts["timeouts"] == 0,
             "trace_coverage_passed": trace_passed,
-            "clean_followup_passed": None
-            if clean_summary is None
-            else clean_summary["passed"],
+            "clean_followup_passed": clean_followup_passed,
             "run_errors": run_errors,
             "rule": (
                 "This gate checks request completion, optional trace coverage, "
-                "leaf command success, and clean follow-up. Numeric drift is "
-                "reported but not a hard budget until production limits are ratified."
+                "declared-duration coverage, leaf command success, complete leaf "
+                "artifacts, and clean follow-up. Numeric drift is reported but not "
+                "a hard budget until production limits are ratified."
             ),
         },
+        "duration_coverage": duration_coverage,
         "resource_summary": resource_summary(resources),
         "drift_by_concurrency": {
             concurrency: drift_summary(concurrency_buckets)
@@ -916,6 +1029,18 @@ def build_summary(
         "clean_followup": clean_summary,
         "claim_boundary": args.claim_boundary,
     }
+
+
+def bucket_leaf_artifacts_loaded(bucket: dict[str, Any]) -> bool:
+    artifacts = bucket.get("leaf_artifacts")
+    if isinstance(artifacts, list) and artifacts:
+        return all(
+            isinstance(artifact, dict)
+            and artifact.get("report_loaded") is True
+            and bool(artifact.get("sha256"))
+            for artifact in artifacts
+        )
+    return bucket.get("report_loaded") is True and bool(bucket.get("sha256"))
 
 
 def run_backend(args: argparse.Namespace) -> int:
@@ -1127,7 +1252,7 @@ def build_combined_report(
         and bool(contract_documents)
     )
     child_gates = {
-        backend: (summary.get("soak_gate") or {}).get("passed") is True
+        backend: child_gate_passed(summary)
         for backend, (_path, summary) in found.items()
     }
     runtime_boundaries = {}
@@ -1200,6 +1325,7 @@ def build_combined_report(
                 "workload": summary["workload"],
                 "summary": summary["summary"],
                 "soak_gate": summary["soak_gate"],
+                "duration_coverage": summary.get("duration_coverage"),
                 "resource_summary": summary["resource_summary"],
                 "drift_by_concurrency": summary["drift_by_concurrency"],
                 "clean_followup": summary["clean_followup"],
@@ -1208,6 +1334,21 @@ def build_combined_report(
         ],
         "claim_boundary": DEFAULT_CLAIM_BOUNDARY,
     }
+
+
+def child_gate_passed(summary: dict[str, Any]) -> bool:
+    gate = summary.get("soak_gate") or {}
+    required_true_fields = (
+        "passed",
+        "bucket_coverage_passed",
+        "duration_coverage_passed",
+        "leaf_commands_passed",
+        "zero_failures",
+        "zero_timeouts",
+        "trace_coverage_passed",
+        "clean_followup_passed",
+    )
+    return all(gate.get(field) is True for field in required_true_fields)
 
 
 def combine(args: argparse.Namespace) -> int:

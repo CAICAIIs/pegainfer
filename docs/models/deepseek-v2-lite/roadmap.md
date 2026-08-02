@@ -41,7 +41,7 @@ Issue #465 is the sustained evidence milestone. The retained 2026-07-18 run cove
 
 This closes the first retained soak baseline. It does not set hard latency or drift budgets, does not cover long-prefill scheduling, and does not claim production readiness.
 
-The tooling now guards the evidence boundary directly: backend summaries fail on missing bucket coverage, leaf command errors, missing trace coverage, or failed clean follow-up, and the combined report fails on missing host-staged/NCCL children, failed child gates, provenance drift, commit drift, or missing/generic runtime boundaries. Long-duration and long/mixed-prompt soaks still need separate versioned contracts before Stable promotion.
+The tooling now guards the evidence boundary directly: backend summaries fail on missing declared-duration coverage, capped retained runs, missing bucket coverage, unreadable leaf artifacts, leaf command errors, missing trace coverage, or failed/missing clean follow-up. The combined report fails on missing host-staged/NCCL children, failed child sub-gates, provenance drift, commit drift, contract drift, or missing/generic runtime boundaries. Long-duration and long/mixed-prompt soaks still need separate versioned contracts before Stable promotion.
 
 ## Sequence
 

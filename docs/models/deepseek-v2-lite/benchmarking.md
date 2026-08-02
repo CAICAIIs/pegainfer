@@ -170,15 +170,16 @@ Each backend summary records:
 - leaf artifact path and SHA-256 for every leaf chunk inside each bucket;
 - completed, failed, timeout, terminal-reason, and error counts;
 - TTFT, TPOT, ITL, request throughput, and output-token throughput per bucket;
-- first/last-quartile drift summaries for tails, throughput, RSS, and VRAM;
+- first/last-quartile drift summaries for tails, throughput, RSS, per-device
+  VRAM, and total VRAM;
 - active-set, pending-queue, decode-batch, token-timing, and missing-trace coverage when server traces are available;
 - output hash distribution and combined hash;
-- process RSS and total device memory samples;
+- process RSS plus per-device, total, and max device-memory samples;
 - post-soak clean follow-up result.
 
-`soak_gate.passed` means every requested concurrency has loaded bucket evidence, leaf commands completed successfully with zero failures/timeouts, optional trace coverage passed for every bucket, and the clean follow-up completed. Numeric drift is reported but not a hard budget until deployment limits are ratified.
+`soak_gate.passed` means every requested concurrency has loaded bucket evidence for the declared duration, every leaf artifact is readable and hashed, leaf commands completed successfully with zero failures/timeouts, optional trace coverage passed for every bucket, and the clean follow-up completed. Runs capped by `--max-buckets` are smoke/debug evidence and do not pass the retained gate. Numeric drift is reported but not a hard budget until deployment limits are ratified.
 
-The combined host-staged/NCCL report hard-fails when either backend is missing, a child `soak_gate` fails, the child commits differ, model/server provenance differs, or a backend runtime boundary is missing or generic. This keeps NCCL selector evidence attached to the soak result instead of turning a conservative runtime run into a default-runtime claim.
+The combined host-staged/NCCL report hard-fails when either backend is missing, a child `soak_gate` fails any required sub-gate, the child commits differ, model/server provenance differs, the soak contract differs, or a backend runtime boundary is missing or generic. This keeps NCCL selector evidence attached to the soak result instead of turning a conservative runtime run into a default-runtime claim.
 
 ## Local Tooling Gate
 
@@ -197,7 +198,7 @@ Regenerate retained reports when their profile, schema, or measurement contract 
 
 ### Issue #465 Retained HTTP Soak
 
-The retained #465 latest-HEAD rerun used code commit `a5703d0424d917ce99b4bd8691b0b86eecde966f`, model revision `604d5664dddd88a0433dbae533b7fe9472482de0`, 2x RTX 5090, `prompt_words=64`, `max_tokens=64`, greedy sampling, ignore-EOS, concurrency `4,8`, `duration_s=120`, `bucket_s=60`, `num_requests=8`, and full required trace coverage. Later commits may update docs or tooling gates; regenerate the artifacts before claiming evidence for a changed benchmark schema or runtime path. The combined report SHA-256 is `1c06e8825da70888277f1485f54d7f4fb9b2f61d617149d3ac7357cd5a03e7f1`.
+The retained #465 rerun used code commit `a5703d0424d917ce99b4bd8691b0b86eecde966f`, model revision `604d5664dddd88a0433dbae533b7fe9472482de0`, 2x RTX 5090, `prompt_words=64`, `max_tokens=64`, greedy sampling, ignore-EOS, concurrency `4,8`, `duration_s=120`, `bucket_s=60`, `num_requests=8`, and full required trace coverage. Later commits harden the retained gate semantics; regenerate the artifacts before claiming final-head evidence for the changed benchmark schema or runtime path. The combined report SHA-256 is `1c06e8825da70888277f1485f54d7f4fb9b2f61d617149d3ac7357cd5a03e7f1`.
 
 | Artifact basename | Backend | SHA-256 | Result | Boundary |
 | --- | --- | --- | --- | --- |

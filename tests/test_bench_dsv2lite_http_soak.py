@@ -31,12 +31,12 @@ def args(**overrides: object) -> SimpleNamespace:
         "base_url": "http://127.0.0.1:18000",
         "model": "DeepSeek-V2-Lite",
         "model_path": "models/DeepSeek-V2-Lite",
-        "server_command": "openinfer --model-path models/DeepSeek-V2-Lite",
+        "server_command": "pegainfer --model-path models/DeepSeek-V2-Lite",
         "server_log": Path("server.log"),
         "server_pid": None,
         "commit": "a" * 12,
         "model_revision": "model-rev",
-        "server_binary": Path("target/release/openinfer"),
+        "server_binary": Path("target/release/pegainfer"),
         "backend_runtime_version": "host-staged",
         "duration_s": 60.0,
         "bucket_s": 30.0,
@@ -66,6 +66,13 @@ def resource(wall_s: float, rss_kib: int, gpu_mib: list[int]):
         gpu_memory_used_mib=gpu_mib,
         gpu_memory_scope="device_total",
     )
+
+
+def mark_artifact_loaded(record: dict[str, object], digest: str) -> dict[str, object]:
+    record["sha256"] = digest
+    for artifact in record["leaf_artifacts"]:
+        artifact["sha256"] = digest
+    return record
 
 
 def leaf_report(
@@ -159,7 +166,7 @@ def bucket_record(
     timeouts: int = 0,
     returncode: int = 0,
 ) -> dict[str, object]:
-    return bench_dsv2lite_http_soak.bucket_record(
+    record = bench_dsv2lite_http_soak.bucket_record(
         bucket_index=0,
         concurrency=concurrency,
         report_path=Path(f"bucket-c{concurrency}.json"),
@@ -168,12 +175,13 @@ def bucket_record(
         resource_before=resource(0.0, 100, [1000, 1000]),
         resource_after=resource(10.0, 110, [1100, 1100]),
     )
+    return mark_artifact_loaded(record, "f" * 64)
 
 
 def clean_followup_record(
     *, completed: int = 1, failed: int = 0, timeouts: int = 0, returncode: int = 0
 ) -> dict[str, object]:
-    return bench_dsv2lite_http_soak.bucket_record(
+    record = bench_dsv2lite_http_soak.bucket_record(
         bucket_index=-1,
         concurrency=1,
         report_path=Path("clean_followup.json"),
@@ -182,6 +190,7 @@ def clean_followup_record(
         resource_before=resource(10.0, 110, [1100, 1100]),
         resource_after=resource(11.0, 111, [1101, 1101]),
     )
+    return mark_artifact_loaded(record, "e" * 64)
 
 
 def passing_summary(
@@ -192,6 +201,7 @@ def passing_summary(
             backend=backend,
             backend_runtime_version=runtime,
             concurrency=[4],
+            duration_s=4.0,
             required_trace_coverage=1.0,
         ),
         buckets=[bucket_record(concurrency=4)],
@@ -307,6 +317,7 @@ class BenchDsv2LiteHttpSoakTests(unittest.TestCase):
             resource_before=resource(0.0, 100, [1000, 1000]),
             resource_after=resource(10.0, 110, [1100, 1100]),
         )
+        mark_artifact_loaded(first, "a" * 64)
         last = bench_dsv2lite_http_soak.bucket_record(
             bucket_index=1,
             concurrency=4,
@@ -316,6 +327,7 @@ class BenchDsv2LiteHttpSoakTests(unittest.TestCase):
             resource_before=resource(10.0, 110, [1100, 1100]),
             resource_after=resource(20.0, 120, [1200, 1200]),
         )
+        mark_artifact_loaded(last, "b" * 64)
         followup = bench_dsv2lite_http_soak.bucket_record(
             bucket_index=-1,
             concurrency=1,
@@ -325,11 +337,15 @@ class BenchDsv2LiteHttpSoakTests(unittest.TestCase):
             resource_before=resource(20.0, 120, [1200, 1200]),
             resource_after=resource(21.0, 121, [1201, 1201]),
         )
+        mark_artifact_loaded(followup, "c" * 64)
 
         summary = bench_dsv2lite_http_soak.build_summary(
-            args(concurrency=[4], required_trace_coverage=1.0),
+            args(concurrency=[4], duration_s=8.0, required_trace_coverage=1.0),
             buckets=[first, last],
-            resources=[resource(0.0, 100, [1000, 1000]), resource(20.0, 120, [1200, 1200])],
+            resources=[
+                resource(0.0, 100, [1000, 1000]),
+                resource(20.0, 120, [1200, 1200]),
+            ],
             clean_followup=followup,
             run_errors=[],
             started_wall_s=100.0,
@@ -338,6 +354,7 @@ class BenchDsv2LiteHttpSoakTests(unittest.TestCase):
 
         self.assertTrue(summary["soak_gate"]["passed"])
         self.assertTrue(summary["soak_gate"]["bucket_coverage_passed"])
+        self.assertTrue(summary["soak_gate"]["duration_coverage_passed"])
         self.assertTrue(summary["soak_gate"]["leaf_commands_passed"])
         self.assertEqual(summary["summary"]["completed"], 16)
         self.assertEqual(summary["summary"]["terminal_reasons"], {"completed_length": 16})
@@ -393,19 +410,100 @@ class BenchDsv2LiteHttpSoakTests(unittest.TestCase):
         self.assertFalse(summary["soak_gate"]["passed"])
         self.assertFalse(summary["soak_gate"]["bucket_coverage_passed"])
 
-    def test_backend_summary_fails_clean_followup_error(self) -> None:
+    def test_backend_summary_rejects_non_retained_gate_shapes(self) -> None:
+        cases = [
+            (
+                "short_duration",
+                args(concurrency=[4], duration_s=60.0, required_trace_coverage=1.0),
+                clean_followup_record(),
+                "duration_coverage_passed",
+            ),
+            (
+                "capped_duration",
+                args(
+                    concurrency=[4],
+                    duration_s=10.0,
+                    max_buckets=1,
+                    required_trace_coverage=1.0,
+                ),
+                clean_followup_record(),
+                "duration_coverage_passed",
+            ),
+            (
+                "missing_clean_followup",
+                args(concurrency=[4], duration_s=10.0, required_trace_coverage=1.0),
+                None,
+                "clean_followup_passed",
+            ),
+            (
+                "failed_clean_followup",
+                args(concurrency=[4], duration_s=10.0, required_trace_coverage=1.0),
+                clean_followup_record(completed=0, failed=1, returncode=1),
+                "clean_followup_passed",
+            ),
+        ]
+        for name, case_args, clean_followup, failed_gate in cases:
+            with self.subTest(name=name):
+                summary = bench_dsv2lite_http_soak.build_summary(
+                    case_args,
+                    buckets=[bucket_record(concurrency=4)],
+                    resources=[],
+                    clean_followup=clean_followup,
+                    run_errors=[],
+                    started_wall_s=0.0,
+                    ended_wall_s=11.0,
+                )
+
+                self.assertFalse(summary["soak_gate"]["passed"])
+                self.assertFalse(summary["soak_gate"][failed_gate])
+
+    def test_backend_summary_fails_missing_leaf_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            first_path = Path(tmp) / "bucket0000_leaf000.json"
+            missing_path = Path(tmp) / "bucket0000_leaf001.json"
+            first_path.write_text('{"leaf": 0}\n', encoding="utf-8")
+            bucket = bench_dsv2lite_http_soak.aggregate_bucket_record(
+                bucket_index=0,
+                concurrency=4,
+                leaf_runs=[
+                    {
+                        "report_path": first_path,
+                        "report": leaf_report(),
+                        "returncode": 0,
+                    },
+                    {
+                        "report_path": missing_path,
+                        "report": None,
+                        "returncode": 0,
+                    },
+                ],
+                resource_before=resource(0.0, 100, [1000, 1001]),
+                resource_after=resource(10.0, 120, [1100, 1110]),
+            )
+
         summary = bench_dsv2lite_http_soak.build_summary(
-            args(concurrency=[4], required_trace_coverage=1.0),
-            buckets=[bucket_record(concurrency=4)],
+            args(concurrency=[4], duration_s=10.0, required_trace_coverage=1.0),
+            buckets=[bucket],
             resources=[],
-            clean_followup=clean_followup_record(completed=0, failed=1, returncode=1),
+            clean_followup=clean_followup_record(),
             run_errors=[],
             started_wall_s=0.0,
             ended_wall_s=11.0,
         )
 
+        self.assertFalse(bucket["report_loaded"])
         self.assertFalse(summary["soak_gate"]["passed"])
-        self.assertFalse(summary["soak_gate"]["clean_followup_passed"])
+        self.assertFalse(summary["soak_gate"]["leaf_commands_passed"])
+
+    def test_drift_summary_reports_per_device_gpu_growth(self) -> None:
+        first = {"resource_after": {"gpu_memory_used_mib": [10000, 8000]}}
+        last = {"resource_after": {"gpu_memory_used_mib": [10000, 9000]}}
+
+        drift = bench_dsv2lite_http_soak.drift_summary([first, last])
+
+        self.assertEqual(drift["gpu_memory_max_mib"]["median_delta_pct"], 0.0)
+        self.assertEqual(drift["gpu_memory_total_mib"]["median_delta_pct"], 1000 / 18000 * 100)
+        self.assertEqual(drift["gpu_memory_by_device_mib"]["1"]["median_delta_pct"], 12.5)
 
     def test_combined_report_requires_host_and_nccl(self) -> None:
         host = passing_summary()
