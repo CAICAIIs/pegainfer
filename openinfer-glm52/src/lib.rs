@@ -625,36 +625,87 @@ const GLM52_POST_BUILD_MIN_FREE_BYTES: usize = 1 << 30;
 
 /// The launch-time context-cap decision and the numbers behind it — the log
 /// line and the tests consume the same values the decision used, so they
-/// cannot drift apart.
+/// cannot drift apart. The pool block count is NOT decided here anymore:
+/// the ledger only provides the fill floor, and the authoritative count
+/// comes from the measured two-phase build (`build_rank_models`).
 #[derive(Clone, Copy, Debug)]
 struct Glm52ContextBudget {
     max_model_len: usize,
-    /// Exact bytes the cap costs a rank (build arenas + drafter lane).
+    /// Exact bytes the cap costs a rank at the floor pool (build arenas +
+    /// drafter lane) — an initial estimate for the startup log.
     arena_bytes: usize,
     reserve_bytes: usize,
     budget_bytes: usize,
+    /// The measured fill's floor: the legacy nominal `slots x cap` pool when
+    /// the ledger says it fits, else a one-request pool (the
+    /// explicit-big-cap shape the pool decoupling exists for).
+    floor_blocks: usize,
 }
 
 /// Exact cap-scaled bytes a rank allocates for a candidate cap: the build
 /// arenas plus the selected speculative lane.
 fn glm52_cap_bytes(
     max_model_len: usize,
+    pool_blocks: usize,
     drafter: &Glm52Drafter,
     prefill_only: bool,
     moe_topo: Glm52MoeTopo,
 ) -> Result<usize> {
-    // Prefill-only sizes the full slot count too (it used to hold exactly one
-    // request): the prefix cache needs blocks to retain released prefixes
-    // across turns, and the headroom lets prefills overlap.
-    let pool_slots = model::glm52_decode_slots();
-    Ok(glm52_arena_bytes(max_model_len, pool_slots, prefill_only)?
+    Ok(glm52_arena_bytes(max_model_len, pool_blocks, prefill_only)?
         + if drafter.is_dspark() {
             crate::dspark::glm52_dspark_arena_bytes(max_model_len)
         } else if drafter.is_mtp() {
-            crate::mtp::glm52_mtp_arena_bytes(max_model_len, moe_topo)?
+            crate::mtp::glm52_mtp_arena_bytes(max_model_len, pool_blocks, moe_topo)?
         } else {
             0
         })
+}
+
+/// The smallest useful pool: one max-length request's pages plus the
+/// padding block and one spare.
+fn glm52_one_request_pool_blocks(max_model_len: usize) -> usize {
+    (max_model_len + 1).div_ceil(GLM52_MODEL_LEN_ALIGN) + 2
+}
+
+/// Free VRAM held back from the measured KV fill on every rank — the ONLY
+/// remaining estimate in the pool sizing. Everything the fill can measure is
+/// already resident when the workers report free VRAM (the fixed build), and
+/// the exactly-known post-finish charges (DeepGEMM buffers, the DSpark lane)
+/// are subtracted separately; this covers what allocates after FinishKv and
+/// has no exact ledger — the whole-step CUDA graph instantiations (captured
+/// lazily by the engines), cuBLAS/FlashInfer workspaces, and allocator
+/// fragmentation. `GLM52_GRAPH_RESERVE_GIB` overrides.
+fn glm52_graph_reserve_bytes() -> usize {
+    (std::env::var("GLM52_GRAPH_RESERVE_GIB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(3))
+        << 30
+}
+
+/// The measured KV fill (#818, two-phase build): after every rank built its
+/// fixed half, the fleet-minimum free VRAM — minus the graph reserve and the
+/// exactly-known post-finish charges — is spent on pool blocks at the
+/// ledger's exact per-block slab cost. The floor is never reduced (the
+/// nominal pool where affordable, else one max-length request).
+fn glm52_measured_pool_blocks(
+    min_free_bytes: usize,
+    post_finish_bytes: usize,
+    slab_bytes_per_block: usize,
+    floor_blocks: usize,
+) -> usize {
+    let usable = min_free_bytes.saturating_sub(glm52_graph_reserve_bytes() + post_finish_bytes);
+    if slab_bytes_per_block == 0 {
+        return floor_blocks;
+    }
+    (usable / slab_bytes_per_block).max(floor_blocks)
+}
+
+/// The legacy `slots x cap` pool sizing — the cap-derivation NOMINAL (the
+/// binary search finds the largest cap whose nominal-pool cost fits), and
+/// the floor the budget fill starts from.
+fn glm52_nominal_pool_blocks(max_model_len: usize) -> usize {
+    glm52_pool_blocks(max_model_len, model::glm52_decode_slots())
 }
 
 fn glm52_prefill_scratch_reservation(
@@ -709,12 +760,29 @@ fn derive_max_model_len(
             requested / GLM52_MODEL_LEN_ALIGN * GLM52_MODEL_LEN_ALIGN,
             requested.next_multiple_of(GLM52_MODEL_LEN_ALIGN),
         );
-        let required = glm52_cap_bytes(requested, drafter, prefill_only, moe_topo)?;
+        // The pool no longer multiplies the cap by the slot count (#818):
+        // an explicit cap only has to fit the fixed arenas plus a pool that
+        // can hold ONE max-length request — admission's lifetime reservation
+        // guards each request, concurrency comes from whatever pool the
+        // budget fill provides.
+        let required = glm52_cap_bytes(
+            requested,
+            glm52_one_request_pool_blocks(requested),
+            drafter,
+            prefill_only,
+            moe_topo,
+        )?;
+        // The graph reserve must survive the fill: without it a cap in the
+        // band (budget - reserve, budget] passes here, the measured fill
+        // floors at the one-request pool anyway, and FinishKv or the lazy
+        // graph capture OOMs raw instead of failing at this door.
         ensure!(
-            required <= budget_bytes,
-            "GLM5.2 --max-model-len {requested} needs {} of cache per rank but only {} \
-             fits (min rank free VRAM {} - reserve {}); lower it or free VRAM",
+            required + glm52_graph_reserve_bytes() <= budget_bytes,
+            "GLM5.2 --max-model-len {requested} needs {} of cache per rank (fixed arenas + a \
+             one-request pool + {} graph reserve) but only {} fits (min rank free VRAM {} - \
+             reserve {}); lower it or free VRAM",
             ByteSize(required as u64),
+            ByteSize(glm52_graph_reserve_bytes() as u64),
             ByteSize(budget_bytes as u64),
             ByteSize(min_free_vram_bytes as u64),
             ByteSize(reserve_bytes as u64),
@@ -726,8 +794,13 @@ fn derive_max_model_len(
         let (mut lo, mut hi) = (0, GLM52_MAX_CONTEXT / GLM52_MODEL_LEN_ALIGN);
         while lo < hi {
             let mid = (lo + hi).div_ceil(2);
-            if glm52_cap_bytes(mid * GLM52_MODEL_LEN_ALIGN, drafter, prefill_only, moe_topo)?
-                <= budget_bytes
+            if glm52_cap_bytes(
+                mid * GLM52_MODEL_LEN_ALIGN,
+                glm52_nominal_pool_blocks(mid * GLM52_MODEL_LEN_ALIGN),
+                drafter,
+                prefill_only,
+                moe_topo,
+            )? <= budget_bytes
             {
                 lo = mid;
             } else {
@@ -745,9 +818,24 @@ fn derive_max_model_len(
         );
         derived
     };
+    // Fill floor for the measured pool sizing (#818): the legacy nominal
+    // (`slots x cap`) where the ledger says it still fits — identical
+    // defaults — otherwise a pool holding one max-length request (the
+    // explicit-big-cap shape the decoupling exists for). The ledger's job
+    // ends here: the authoritative block count comes from the measured
+    // two-phase fill between the workers' build phases.
+    let nominal = glm52_nominal_pool_blocks(max_model_len);
+    let floor_blocks = if glm52_cap_bytes(max_model_len, nominal, drafter, prefill_only, moe_topo)?
+        <= budget_bytes
+    {
+        nominal
+    } else {
+        glm52_one_request_pool_blocks(max_model_len)
+    };
     Ok(Glm52ContextBudget {
         max_model_len,
-        arena_bytes: glm52_cap_bytes(max_model_len, drafter, prefill_only, moe_topo)?,
+        floor_blocks,
+        arena_bytes: glm52_cap_bytes(max_model_len, floor_blocks, drafter, prefill_only, moe_topo)?,
         reserve_bytes,
         budget_bytes,
     })
@@ -848,7 +936,7 @@ fn start_engine(
     let max_model_len = budget.max_model_len;
     log::info!(
         "GLM5.2 max_model_len={max_model_len} ({}): min rank free VRAM {} after weights \
-         (qa|kv_a twins {} + DeepGEMM post-weight delta {} charged), cap-scaled arenas {} \
+         (qa|kv_a twins {} + DeepGEMM post-weight delta {} charged), floor-pool arenas {} \
          across {} slots{}, reserve {}, budget {}{}",
         if requested_max_model_len.is_some() {
             "--max-model-len"
@@ -878,6 +966,17 @@ fn start_engine(
     );
 
     let eos_token_ids = read_eos_token_ids(model_path)?;
+    // Exactly-known VRAM that lands AFTER the workers' free-VRAM measurement
+    // (post-FinishKv): the DeepEP/DeepGEMM buffers created in SetupComm, and
+    // — when DSpark is on — the draft weights reserve plus its cap-scaled
+    // states loaded after comm setup. The measured KV fill holds these back
+    // alongside the graph reserve.
+    let post_finish_reserve_bytes = deepgemm_vram_charge_bytes
+        + if drafter.is_dspark() {
+            GLM52_DSPARK_VRAM_RESERVE_BYTES + crate::dspark::glm52_dspark_arena_bytes(max_model_len)
+        } else {
+            0
+        };
     // build_rank_models sends SetupComm, so from inside it the DeepEP
     // contexts exist and their destruction is COLLECTIVE: any startup failure
     // from here on must broadcast Shutdown to every rank BEFORE the workers'
@@ -887,7 +986,7 @@ fn start_engine(
     // down, and the launch error surfaces only after the ~100 s DeepEP
     // device timeout. The TP LL rendezvous rejecting a topology (poison
     // pill, NVLink probe) is a real failure landing exactly in this window.
-    let rank_arenas = match build_rank_models(
+    let (rank_arenas, pool_blocks) = match build_rank_models(
         &loaded.workers,
         max_model_len,
         moe_topo,
@@ -895,6 +994,8 @@ fn start_engine(
         prefill_only.map(|options| options.chunk_size),
         &startup.ranks,
         startup.rendezvous.as_deref(),
+        budget.floor_blocks,
+        post_finish_reserve_bytes,
     ) {
         Ok(rank_arenas) => rank_arenas,
         Err(err) => {
@@ -928,7 +1029,7 @@ fn start_engine(
         }
     };
     let logical_ranks = moe_topo.logical_rank_count();
-    let kv_total_blocks = glm52_pool_blocks(max_model_len, model::glm52_decode_slots()) - 1;
+    let kv_total_blocks = pool_blocks - 1;
     // One autonomous engine per LOCAL logical rank (a mirrored topology
     // collapses to a single engine driving every worker). Each engine owns
     // its submit queue and load feed, so the frontend sees one scheduler
@@ -991,6 +1092,7 @@ fn start_engine(
             eos_token_ids: eos_token_ids.clone(),
             drafter: drafter.clone(),
             prefill_chunk_size: prefill_only.map(|prefill| prefill.chunk_size),
+            pool_blocks,
             max_model_len,
             no_prefix_cache,
             offload: engine_offload,
@@ -1171,12 +1273,16 @@ fn ensure_post_build_headroom(workers: &[Glm52Worker]) -> Result<()> {
     Ok(())
 }
 
-/// Build every rank's resident model, then create the collective contexts.
-/// Two phases on purpose: the build is per-rank and can fail (OOM, packaging
-/// drift) — every rank must report success BEFORE anyone enters context
-/// creation, or a single failure strands peer ranks in a collective init with
-/// no useful error. TP4 currently stops after the per-rank build, before
-/// entering any EP/TP collective setup.
+/// Build every rank's resident model in the measured two phases, then create
+/// the collective contexts. Phases on purpose: the build is per-rank and can
+/// fail (OOM, packaging drift) — every rank must report success BEFORE
+/// anyone enters context creation, or a single failure strands peer ranks in
+/// a collective init with no useful error. Between the phases the fleet's
+/// measured free-VRAM minimum decides the KV pool block count, published
+/// process-wide (the schedulers' `BlockPool` reads it) before any FinishKv
+/// dispatch. TP4 currently stops after the per-rank build, before entering
+/// any EP/TP collective setup.
+#[allow(clippy::too_many_arguments)]
 fn build_rank_models(
     workers: &[Glm52Worker],
     max_model_len: usize,
@@ -1185,19 +1291,110 @@ fn build_rank_models(
     prefill_chunk_size: Option<usize>,
     ranks: &Range<usize>,
     rendezvous: Option<&str>,
-) -> Result<Vec<Vec<KvArena>>> {
+    floor_blocks: usize,
+    post_finish_reserve_bytes: usize,
+) -> Result<(Vec<Vec<KvArena>>, usize)> {
     let build_started = Instant::now();
+    let prefill_only = prefill_chunk_size.is_some();
     let responses = workers
         .iter()
         .map(|worker| {
-            worker.build_model_async(max_model_len, moe_topo, drafter.clone(), prefill_chunk_size)
+            worker.build_fixed_async(max_model_len, moe_topo, drafter.clone(), prefill_chunk_size)
         })
         .collect::<Result<Vec<_>>>()?;
-    let mut rank_arenas = Vec::with_capacity(responses.len());
+    let mut rank_free_bytes = Vec::with_capacity(responses.len());
     for (local_index, response) in responses.into_iter().enumerate() {
         // Label with the global rank, not the local worker slot — on a
         // multi-process fleet every process would otherwise call its first
         // worker "rank 0".
+        let rank = ranks.start + local_index;
+        rank_free_bytes.push(
+            response.recv().map_err(|_| {
+                anyhow::anyhow!("GLM5.2 rank {rank} dropped its fixed-build response")
+            })?? as usize,
+        );
+    }
+    let min_free_bytes = rank_free_bytes
+        .iter()
+        .copied()
+        .min()
+        .expect("at least one rank built");
+    // The exact per-block slab cost, taken from the SAME ledger the
+    // allocations use (linear in blocks, so one difference is the marginal):
+    // 78 MLA pages + the full-indexer index-K blocks + the MTP mirror and
+    // the prefill unpacked page, whichever of those this launch carries.
+    let slab_bytes_per_block = glm52_cap_bytes(
+        max_model_len,
+        floor_blocks + 1,
+        drafter,
+        prefill_only,
+        moe_topo,
+    )?
+    .saturating_sub(glm52_cap_bytes(
+        max_model_len,
+        floor_blocks,
+        drafter,
+        prefill_only,
+        moe_topo,
+    )?);
+    let pool_blocks = match std::env::var("GLM52_KV_POOL_BLOCKS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        Some(pinned) => {
+            // A pin below the one-request floor would advertise a cap no
+            // request can ever fit — admission then parks the impossible
+            // request at the FIFO head forever. And a pin above the measured
+            // affordable count would either fail slab allocation outright or
+            // eat into the graph reserve and die at pre-capture — the A/B
+            // knob must stay inside both fences. Refuse loudly either way.
+            let one_request = glm52_one_request_pool_blocks(max_model_len);
+            ensure!(
+                pinned >= one_request,
+                "GLM52_KV_POOL_BLOCKS={pinned} is below the {one_request}-block one-request \
+                 floor for max_model_len {max_model_len}"
+            );
+            let affordable = glm52_measured_pool_blocks(
+                min_free_bytes,
+                post_finish_reserve_bytes,
+                slab_bytes_per_block,
+                one_request,
+            );
+            ensure!(
+                pinned <= affordable,
+                "GLM52_KV_POOL_BLOCKS={pinned} exceeds the {affordable}-block measured \
+                 affordable count (min rank free {} - reserves at {} per block)",
+                ByteSize(min_free_bytes as u64),
+                ByteSize(slab_bytes_per_block as u64),
+            );
+            pinned
+        }
+        None => glm52_measured_pool_blocks(
+            min_free_bytes,
+            post_finish_reserve_bytes,
+            slab_bytes_per_block,
+            floor_blocks,
+        ),
+    };
+    log::info!(
+        "GLM5.2 KV pool: {} blocks ({} tokens, {} past the {}-slot nominal) — the measured \
+         free-VRAM fill (min rank free {} after the fixed build, graph reserve {}, post-finish \
+         charges {}, {}/block) decouples pool capacity from the {max_model_len}-token cap (#818)",
+        pool_blocks,
+        pool_blocks * GLM52_MODEL_LEN_ALIGN,
+        pool_blocks.saturating_sub(glm52_nominal_pool_blocks(max_model_len)),
+        model::glm52_decode_slots(),
+        ByteSize(min_free_bytes as u64),
+        ByteSize(glm52_graph_reserve_bytes() as u64),
+        ByteSize(post_finish_reserve_bytes as u64),
+        ByteSize(slab_bytes_per_block as u64),
+    );
+    let responses = workers
+        .iter()
+        .map(|worker| worker.finish_kv_async(pool_blocks))
+        .collect::<Result<Vec<_>>>()?;
+    let mut rank_arenas = Vec::with_capacity(responses.len());
+    for (local_index, response) in responses.into_iter().enumerate() {
         let rank = ranks.start + local_index;
         rank_arenas.push(
             response
@@ -1246,7 +1443,7 @@ fn build_rank_models(
         build_started.elapsed().as_secs_f64(),
         moe_topo
     );
-    Ok(rank_arenas)
+    Ok((rank_arenas, pool_blocks))
 }
 
 /// One shared pegaflow host (one pinned pool) with each rank's arenas
@@ -1533,7 +1730,15 @@ mod max_model_len_tests {
                 0
             }
             + prefill_scratch_bytes;
-        reserve + glm52_cap_bytes(cap, drafter, false, TEST_TOPO).expect("cap bytes")
+        reserve
+            + glm52_cap_bytes(
+                cap,
+                glm52_nominal_pool_blocks(cap),
+                drafter,
+                false,
+                TEST_TOPO,
+            )
+            .expect("cap bytes")
     }
 
     #[test]
@@ -1564,6 +1769,55 @@ mod max_model_len_tests {
     }
 
     #[test]
+    fn floor_is_the_nominal_pool_when_the_ledger_affords_it() {
+        // Identical defaults to the pre-measured fill: a budget that covers
+        // the legacy `slots x cap` pool floors the measured fill there.
+        let drafter = Glm52Drafter::NativeMtp;
+        let free = free_for(50_048, &drafter, 0) + (64 << 20);
+        let budget = derive_max_model_len(Some(50_048), free, &drafter, 0, false, TEST_TOPO)
+            .expect("derive");
+        assert_eq!(budget.floor_blocks, glm52_nominal_pool_blocks(50_048));
+    }
+
+    #[test]
+    fn floor_falls_back_to_a_one_request_pool_for_an_explicit_big_cap() {
+        // The decoupling's raison d'être: an explicit cap whose nominal
+        // `slots x cap` pool overflows the budget still launches, floored at
+        // a pool holding ONE max-length request.
+        let cap = 99_968;
+        let one_request = glm52_one_request_pool_blocks(cap);
+        let free = GLM52_VRAM_RESERVE_BYTES
+            + glm52_cap_bytes(cap, one_request, &Glm52Drafter::None, false, TEST_TOPO)
+                .expect("cap bytes")
+            + glm52_graph_reserve_bytes()
+            + (64 << 20);
+        let budget =
+            derive_max_model_len(Some(cap), free, &Glm52Drafter::None, 0, false, TEST_TOPO)
+                .expect("derive");
+        assert_eq!(budget.floor_blocks, one_request);
+        assert!(one_request < glm52_nominal_pool_blocks(cap));
+    }
+
+    #[test]
+    fn measured_fill_spends_free_vram_at_the_exact_per_block_cost() {
+        let floor = 100;
+        let slab = 1 << 20;
+        let reserve = glm52_graph_reserve_bytes();
+        // Nothing past the reserve: the floor is never reduced.
+        assert_eq!(glm52_measured_pool_blocks(reserve, 0, slab, floor), floor);
+        // Every byte past the reserve buys blocks at the exact marginal.
+        assert_eq!(
+            glm52_measured_pool_blocks(reserve + 512 * slab, 0, slab, floor),
+            512
+        );
+        // Exactly-known post-finish charges are held back alongside it.
+        assert_eq!(
+            glm52_measured_pool_blocks(reserve + 512 * slab, 12 * slab, slab, floor),
+            500
+        );
+    }
+
+    #[test]
     fn dspark_lane_shrinks_the_derived_cap() {
         let free = free_for(50_048, &Glm52Drafter::None, 0);
         let plain = derive_max_model_len(None, free, &Glm52Drafter::None, 0, false, TEST_TOPO)
@@ -1590,10 +1844,22 @@ mod max_model_len_tests {
             "native MTP cap-scaled KV must shrink the target context cap"
         );
         assert!(
-            glm52_cap_bytes(50_048, &Glm52Drafter::NativeMtp, false, TEST_TOPO)
-                .expect("MTP cap bytes")
-                > glm52_cap_bytes(50_048, &Glm52Drafter::None, false, TEST_TOPO)
-                    .expect("plain cap bytes"),
+            glm52_cap_bytes(
+                50_048,
+                glm52_nominal_pool_blocks(50_048),
+                &Glm52Drafter::NativeMtp,
+                false,
+                TEST_TOPO
+            )
+            .expect("MTP cap bytes")
+                > glm52_cap_bytes(
+                    50_048,
+                    glm52_nominal_pool_blocks(50_048),
+                    &Glm52Drafter::None,
+                    false,
+                    TEST_TOPO
+                )
+                .expect("plain cap bytes"),
             "native MTP must be represented in the exact memory ledger"
         );
     }
@@ -1601,10 +1867,22 @@ mod max_model_len_tests {
     #[test]
     fn tp4_native_mtp_charges_the_execution_and_wire_caches() {
         let cap = 16_384;
-        let tp4 = glm52_cap_bytes(cap, &Glm52Drafter::NativeMtp, true, Glm52MoeTopo::Tp4)
-            .expect("TP4 cap bytes");
-        let ep4 = glm52_cap_bytes(cap, &Glm52Drafter::NativeMtp, true, Glm52MoeTopo::Ep4)
-            .expect("EP4 cap bytes");
+        let tp4 = glm52_cap_bytes(
+            cap,
+            glm52_nominal_pool_blocks(cap),
+            &Glm52Drafter::NativeMtp,
+            true,
+            Glm52MoeTopo::Tp4,
+        )
+        .expect("TP4 cap bytes");
+        let ep4 = glm52_cap_bytes(
+            cap,
+            glm52_nominal_pool_blocks(cap),
+            &Glm52Drafter::NativeMtp,
+            true,
+            Glm52MoeTopo::Ep4,
+        )
+        .expect("EP4 cap bytes");
         assert!(
             tp4 > ep4,
             "TP4 must charge its additional execution-layout cache"
@@ -1659,15 +1937,28 @@ mod max_model_len_tests {
 
     #[test]
     fn requested_cap_beyond_the_budget_fails_at_launch() {
+        // Post-decoupling an explicit cap only has to afford the fixed
+        // arenas plus a ONE-request pool (concurrency comes from the
+        // measured fill), so the rejection boundary is a budget too small
+        // for even that — profile-independent by construction.
+        let one_request = glm52_cap_bytes(
+            99_968,
+            glm52_one_request_pool_blocks(99_968),
+            &Glm52Drafter::None,
+            false,
+            TEST_TOPO,
+        )
+        .expect("cap bytes");
+        let reserve = GLM52_VRAM_RESERVE_BYTES;
         let err = derive_max_model_len(
             Some(99_968),
-            free_for(10_048, &Glm52Drafter::None, 0),
+            reserve + one_request - (1 << 20),
             &Glm52Drafter::None,
             0,
             false,
             TEST_TOPO,
         )
-        .expect_err("over-budget cap must fail");
+        .expect_err("a budget below the one-request pool must fail");
         assert!(err.to_string().contains("--max-model-len"), "{err}");
     }
 
