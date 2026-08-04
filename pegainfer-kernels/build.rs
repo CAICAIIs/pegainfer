@@ -114,6 +114,88 @@ fn workspace_root() -> PathBuf {
     crate_root().join("..")
 }
 
+/// AOT-export the CuTe DSL tcgen05 fp8 GEMMs and compile the dispatch shim
+/// around them (csrc/glm52/glm52_fp8_dsl_gemm.c). Opt-in via
+/// `PEGAINFER_CUTEDSL_PYTHON` (a Python with torch + nvidia-cutlass-dsl on a
+/// CUDA box); without it the shim compiles as an empty-table stub and the
+/// runtime stays on the CUTLASS route. The exported objects resolve their
+/// `_cuda*` wrapper symbols from the DSL wheel's libcute_dsl_runtime.so —
+/// linked here, needed on LD_LIBRARY_PATH at run time.
+fn build_glm52_cutedsl_fp8_dsl(root: &Path, out_dir: &Path, cuda_include: &Path) {
+    println!("cargo:rerun-if-env-changed=PEGAINFER_CUTEDSL_PYTHON");
+    let shim_c = root.join("csrc/glm52/glm52_fp8_dsl_gemm.c");
+    println!("cargo:rerun-if-changed={}", shim_c.display());
+    let mut shim = cc::Build::new();
+    shim.include(cuda_include)
+        .flag("-std=c11")
+        .warnings(false)
+        .file(&shim_c);
+    if let Ok(python) = std::env::var("PEGAINFER_CUTEDSL_PYTHON") {
+        let script = root.join("tools/cutedsl/export_glm52_fp8_dsl.py");
+        let benches = workspace_root().join("pegainfer-glm52/benches");
+        let gen_dir = out_dir.join("cutedsl_fp8_dsl");
+        fs::create_dir_all(&gen_dir).expect("create the cutedsl gen dir");
+        println!("cargo:rerun-if-changed={}", script.display());
+        for source in [
+            "kernel_lab/units/fp8_gemm_dsl_tc_kernel.py",
+            "kernel_lab/units/fp8_gemm_dsl_tc.py",
+        ] {
+            println!("cargo:rerun-if-changed={}", benches.join(source).display());
+        }
+        let status = time_phase("cutedsl fp8 GEMM export", || {
+            Command::new(&python)
+                .arg(&script)
+                .arg("--benches-dir")
+                .arg(&benches)
+                .arg("--out-dir")
+                .arg(&gen_dir)
+                .status()
+        })
+        .unwrap_or_else(|err| panic!("failed to run {python}: {err}"));
+        assert!(
+            status.success(),
+            "CuTe DSL fp8 GEMM export failed (PEGAINFER_CUTEDSL_PYTHON={python})"
+        );
+        let mut objects: Vec<PathBuf> = fs::read_dir(&gen_dir)
+            .expect("read the cutedsl gen dir")
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                (path.extension().and_then(|e| e.to_str()) == Some("o")).then_some(path)
+            })
+            .collect();
+        objects.sort();
+        assert!(!objects.is_empty(), "cutedsl export produced no objects");
+        let object_count = objects.len();
+        for object in objects {
+            shim.object(object);
+        }
+        shim.define("GLM52_CUTEDSL_AOT", None).include(&gen_dir);
+        let lib_dir_probe = Command::new(&python)
+            .args([
+                "-c",
+                "import cutlass, os; print(os.path.abspath(os.path.join(os.path.dirname(cutlass.__file__), '..', '..', 'lib')))",
+            ])
+            .output()
+            .expect("probe the nvidia-cutlass-dsl lib dir");
+        let lib_dir = String::from_utf8_lossy(&lib_dir_probe.stdout)
+            .trim()
+            .to_string();
+        assert!(
+            Path::new(&lib_dir).join("libcute_dsl_runtime.so").exists(),
+            "libcute_dsl_runtime.so not found under {lib_dir}"
+        );
+        println!("cargo:rustc-link-search=native={lib_dir}");
+        println!("cargo:rustc-link-lib=dylib=cute_dsl_runtime");
+        println!(
+            "cargo:warning=GLM5.2 CuTe DSL fp8 GEMM AOT enabled: {object_count} objects; \
+             libcute_dsl_runtime.so ({lib_dir}) must be on LD_LIBRARY_PATH at run time"
+        );
+    }
+    time_phase("cc glm52_fp8_dsl_gemm", || {
+        shim.compile("glm52_fp8_dsl_gemm");
+    });
+}
+
 fn crate_root() -> PathBuf {
     PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"))
 }
@@ -707,6 +789,69 @@ fn link_deepep_nccl(nccl_root: &Path, out_dir: &Path) {
     println!("cargo:rustc-link-lib=dylib=nccl");
 }
 
+/// Link the freshly compiled CUDA objects into `libglm52_kernel_lab.so` for
+/// the kernel-lab Python harness (`PEGAINFER_KERNEL_LAB=1` only). The objects
+/// are already PIC (every nvcc task adds `--compiler-options -fPIC`), so the
+/// same .o files that feed `libkernels_cuda.a` link into a shared object
+/// without a second compile pass. DeepEP shim objects reference NCCL symbols
+/// that stay unresolved in the .so — the harness dlopens with `RTLD_LAZY` and
+/// never calls into DeepEP for these units.
+fn link_kernel_lab_shared(
+    nvcc: &str,
+    toolkit: &pegainfer_build::CudaToolkit,
+    out_dir: &Path,
+    obj_files: &[PathBuf],
+) {
+    let so_path = out_dir.join("libglm52_kernel_lab.so");
+    let _ = fs::remove_file(&so_path);
+    let mut args = vec!["-shared".to_string()];
+    args.extend(
+        obj_files
+            .iter()
+            .map(|path| path.to_string_lossy().to_string()),
+    );
+    args.extend([
+        "-o".to_string(),
+        so_path.to_string_lossy().to_string(),
+        format!("-L{}", toolkit.root.join("lib64").display()),
+        "-lcudart".to_string(),
+        "-lcublas".to_string(),
+        "-lcublasLt".to_string(),
+        "-lnvrtc".to_string(),
+        "-lcuda".to_string(),
+        "-lstdc++".to_string(),
+    ]);
+    let status = time_phase("nvcc -shared libglm52_kernel_lab.so", || {
+        Command::new(nvcc)
+            .args(&args)
+            .status()
+            .expect("Failed to run nvcc for libglm52_kernel_lab.so")
+    });
+    assert!(status.success(), "kernel-lab shared link failed");
+
+    // Stable discovery path: OUT_DIR is target/<profile>/build/<pkg>-<hash>/out,
+    // so three parents up is target/<profile>.
+    if let Some(profile_dir) = out_dir
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+    {
+        let stable = profile_dir.join("libglm52_kernel_lab.so");
+        fs::copy(&so_path, &stable).unwrap_or_else(|err| {
+            panic!(
+                "Failed to copy kernel-lab .so to {}: {err}",
+                stable.display()
+            )
+        });
+        println!("cargo:warning=kernel_lab .so: {}", stable.display());
+    } else {
+        println!(
+            "cargo:warning=kernel_lab .so: {} (no stable target/<profile> copy)",
+            so_path.display()
+        );
+    }
+}
+
 fn cuda_object_name(csrc_dir: &Path, cu_file: &Path) -> String {
     let Some(relative) = cu_file.strip_prefix(csrc_dir).ok() else {
         return format!("{}_cuda.o", cu_file.file_stem().unwrap().to_string_lossy());
@@ -1275,6 +1420,7 @@ fn main() {
     let qwen35_enabled = cfg!(feature = "qwen35");
     if glm52_enabled {
         generate_glm52_trtllm_fmha_cubins(&crate_root(), &out_dir);
+        build_glm52_cutedsl_fp8_dsl(&crate_root(), &out_dir, &cuda_include);
     }
     println!(
         "cargo:warning=Detected CUDA SM targets: {}",
@@ -1672,6 +1818,10 @@ fn main() {
     });
     obj_files.sort();
 
+    // The optional kernel-lab .so (linked below) uses the same objects; the
+    // ar invocation consumes the vector.
+    let kernel_lab_objs = obj_files.clone();
+
     let cuda_lib = out_dir.join("libkernels_cuda.a");
     let _ = fs::remove_file(&cuda_lib);
     let mut ar_args = vec!["rcs".to_string(), cuda_lib.to_string_lossy().to_string()];
@@ -1689,6 +1839,15 @@ fn main() {
     });
 
     assert!(status.success(), "ar failed");
+
+    // Optional kernel-lab shared object for the Python bench harness
+    // (pegainfer-glm52/benches/kernel_lab): the exact production objects —
+    // same sources, same nvcc flags — linked as a dlopen-able .so. Skipped
+    // entirely unless PEGAINFER_KERNEL_LAB is set, so default builds run zero
+    // extra commands and zero extra link lines.
+    if std::env::var_os("PEGAINFER_KERNEL_LAB").is_some() {
+        link_kernel_lab_shared(&nvcc, &toolkit, &out_dir, &kernel_lab_objs);
+    }
 
     if qwen35_enabled {
         compile_triton_aot_kernels(&cuda_include, &out_dir, &sm_targets);
