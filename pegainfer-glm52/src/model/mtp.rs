@@ -87,6 +87,11 @@ struct Glm52MtpBucket {
 pub(super) struct Glm52MtpProposalSeed<'a> {
     pub(super) previous: &'a Rows<GLM52_HIDDEN>,
     pub(super) draft1: &'a [u32],
+    /// Row in `previous` where this round's boundaries start. The TP4
+    /// prefill caller splits one prefill batch's boundaries into
+    /// `GLM52_TP_TOKENS`-row rounds, so a later round reads `previous`
+    /// at its own offset while `draft1` arrives pre-sliced.
+    pub(super) rows_before: usize,
 }
 
 fn mtp_cache_bytes(
@@ -611,7 +616,8 @@ impl Glm52NativeMtp {
         let context_tokens = match seed.as_ref() {
             Some(seed) => {
                 ensure!(
-                    seed.draft1.len() == appends.len() && seed.previous.tokens() >= appends.len(),
+                    seed.draft1.len() == appends.len()
+                        && seed.previous.tokens() >= seed.rows_before + appends.len(),
                     "GLM5.2 TP prefill MTP proposal seed shape mismatch"
                 );
                 seed.draft1.to_vec()
@@ -626,10 +632,12 @@ impl Glm52NativeMtp {
         let mut partial_backups = Vec::with_capacity(proposal_slots.len());
         for (packed, (&slot, &context_row)) in proposal_slots.iter().zip(&last_rows).enumerate() {
             let src_hidden = match seed.as_ref() {
-                Some(seed) => seed
-                    .previous
-                    .data()
-                    .slice(packed * GLM52_HIDDEN..(packed + 1) * GLM52_HIDDEN),
+                Some(seed) => {
+                    let row = seed.rows_before + packed;
+                    seed.previous
+                        .data()
+                        .slice(row * GLM52_HIDDEN..(row + 1) * GLM52_HIDDEN)
+                }
                 None => self.buckets[context_index]
                     .scratch
                     .final_normed

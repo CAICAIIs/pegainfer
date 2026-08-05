@@ -34,6 +34,7 @@ use pegainfer_kernels::ops::GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN;
 use pegainfer_kernels::ops::GLM52_FLASHMLA_SPARSE_PAGE_SIZE;
 use pegainfer_kernels::ops::GLM52_FLASHMLA_SPARSE_TOPK;
 use pegainfer_kernels::ops::GLM52_GEMV_MMA_SCRATCH_FLOATS_PER_ROW;
+use pegainfer_kernels::ops::GLM52_TP_TOKENS;
 use pegainfer_kernels::ops::Glm52FlashMlaSparseDecode;
 use pegainfer_kernels::ops::Glm52IndexerCacheLayout;
 use pegainfer_kernels::ops::embedding_rows_into;
@@ -1119,36 +1120,48 @@ impl Glm52RankModel {
             "GLM5.2 MTP boundary metadata count {boundary} != target outputs {}",
             output.target_tokens.len()
         );
-        let bucket = GLM52_DECODE_BUCKETS
-            .into_iter()
-            .find(|&bucket| bucket >= appends.len())
-            .context("GLM5.2 TP4 prefill proposal exceeds decode bucket capacity")?;
         mtp.reset_slots(&proposal_slots)?;
         mtp.resume_reset_slots(&proposal_slots, &appends)?;
-        let round = crate::runner::Glm52MtpRound {
-            source_bucket: bucket,
-            context_bucket: bucket,
-            draft_bucket: bucket,
-            resets: Vec::new(),
-            appends,
-            proposal_slots,
-        };
-        output.mtp_drafts = mtp.propose(
-            ctx,
-            aux,
-            None,
-            Some(tp),
-            &self.embed,
-            &self.lm_head,
-            &self.cos_table,
-            &self.sin_table,
-            executor.mtp_target_boundary(),
-            &round,
-            Some(mtp::Glm52MtpProposalSeed {
-                previous: executor.mtp_proposal_boundary(),
-                draft1: &output.mtp_draft1,
-            }),
-        )?;
+        // The proposal rounds run the decode-bucket machinery, whose TP MoE
+        // path bridges through the fixed GLM52_TP_TOKENS-row buffers — but
+        // one prefill batch can complete more boundaries than that. Split
+        // the batch into bridge-sized rounds; the surplus boundaries simply
+        // ride the later rounds. TP-safe: all four executors walk the same
+        // deterministic split, so their collective chains stay aligned.
+        let mut drafts = Vec::with_capacity(appends.len());
+        for start in (0..appends.len()).step_by(GLM52_TP_TOKENS) {
+            let end = appends.len().min(start + GLM52_TP_TOKENS);
+            let bucket = GLM52_DECODE_BUCKETS
+                .into_iter()
+                .find(|&bucket| bucket >= end - start)
+                .context("GLM5.2 TP4 prefill proposal exceeds decode bucket capacity")?;
+            let round = crate::runner::Glm52MtpRound {
+                source_bucket: bucket,
+                context_bucket: bucket,
+                draft_bucket: bucket,
+                resets: Vec::new(),
+                appends: appends[start..end].to_vec(),
+                proposal_slots: proposal_slots[start..end].to_vec(),
+            };
+            drafts.extend(mtp.propose(
+                ctx,
+                aux,
+                None,
+                Some(&mut *tp),
+                &self.embed,
+                &self.lm_head,
+                &self.cos_table,
+                &self.sin_table,
+                executor.mtp_target_boundary(),
+                &round,
+                Some(mtp::Glm52MtpProposalSeed {
+                    previous: executor.mtp_proposal_boundary(),
+                    draft1: &output.mtp_draft1[start..end],
+                    rows_before: start,
+                }),
+            )?);
+        }
+        output.mtp_drafts = drafts;
         ensure!(
             output
                 .mtp_drafts
