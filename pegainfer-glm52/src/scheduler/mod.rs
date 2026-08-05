@@ -463,11 +463,13 @@ impl Glm52Engine {
 
             // Admission freezes while a speculation is outstanding: the
             // lease pins the next step's shape, so newcomers wait one step.
+            let t_admit = std::time::Instant::now();
             if self.leased_shape.is_none()
                 && let Err(err) = self.admit()
             {
                 self.fatal(&err);
             }
+            let admit_ms = t_admit.elapsed().as_millis();
             self.publish();
 
             // A mirrored engine with nothing to run has nothing to pace: its
@@ -518,16 +520,34 @@ impl Glm52Engine {
             );
             self.leased_shape = flags.lease.then_some(shape);
             self.sample_step += 1;
+            let t_step = std::time::Instant::now();
             let (outputs, span_kinds, step_inputs) = match self.submit_and_join_step(&shape, flags)
             {
                 Ok(step) => step,
                 Err(err) => self.fatal(&err),
             };
+            let step_ms = t_step.elapsed().as_millis();
+            let t_apply = std::time::Instant::now();
             let (rank_appends, mtp_appends, mut rank_proposals) =
                 match self.apply_step_outputs(&outputs, &shape, span_kinds, &step_inputs) {
                     Ok(walked) => walked,
                     Err(err) => self.fatal(&err),
                 };
+            // Serve-iteration stall forensics: the EP free-running contract
+            // means any phase here that overruns a round period starves the
+            // whole fleet's dispatch — name the phase, don't infer it from
+            // peers' spin time.
+            let apply_ms = t_apply.elapsed().as_millis();
+            if step_ms > 300 || admit_ms > 25 || apply_ms > 25 {
+                log::warn!(
+                    "GLM5.2 slow serve iter: rank={} admit={admit_ms}ms step={step_ms}ms \
+                     apply={apply_ms}ms active_slots={} pending={} resolves_inflight={}",
+                    self.rank,
+                    self.slots.iter().flatten().count(),
+                    self.pending.len(),
+                    self.resolves_inflight(),
+                );
+            }
             // Deferred releases complete ONLY at the end of the consume
             // step: the speculation they wait on was enqueued by the lease
             // step and replays during this one — freeing the pages any
