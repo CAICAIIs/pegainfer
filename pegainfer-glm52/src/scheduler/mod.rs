@@ -622,11 +622,15 @@ impl Glm52Engine {
             }
         };
 
-        // Requests with nothing to resolve (no host tier, prefix cache off,
-        // or the prefill-only role, which never restores) go straight to the
-        // inbox; everything else resolves off-thread and arrives via
-        // `ready_rx` — the engine loop never waits on storage.
-        let wants_resolve = native.is_some() || (self.prefix_cache && !self.prefill_only());
+        // Requests with nothing to resolve (prefix cache off, and no native
+        // handoff) go straight to the inbox; everything else resolves
+        // off-thread and arrives via `ready_rx` — the engine loop never
+        // waits on storage. The prefill-only role resolves Plain prefixes
+        // like any other role: it never restores native handoffs (already
+        // dispositioned above), but its multi-turn traffic re-reads the
+        // prefixes it sealed to the host tier — and its peers' via the P2P
+        // mesh — instead of recomputing them from row one.
+        let wants_resolve = native.is_some() || self.prefix_cache;
         if !wants_resolve {
             self.pending.push_back(offload::Resolved::Plain {
                 req,
