@@ -161,9 +161,9 @@ struct ActiveRequest {
     boundary_copy: Option<BoundaryCopy>,
 }
 
-/// One page-granular D2D across every KV arena, from the restored
-/// padded-name page to the request's own page. `prefix` pins the source
-/// until the copy retires.
+/// One whole-page D2D within the KV slab, from the restored padded-name
+/// page to the request's own page (every layer's slices move together by
+/// construction). `prefix` pins the source until the copy retires.
 struct BoundaryCopy {
     src_page: i32,
     dst_page: i32,
@@ -321,9 +321,9 @@ impl Glm52Engine {
         );
         // The pool arrives pre-built (shared with the process-wide KvStore,
         // whose rank table froze at build); block ids index the rank's
-        // per-layer MLA and index-K arenas directly. Under mirrored TP the
-        // single pool drives every executor — the mirrored steps write the
-        // identical block ids on all arenas.
+        // page-first KV slab pages directly. Under mirrored TP the single
+        // pool drives every executor — the mirrored steps write the
+        // identical block ids on every mirror's slab.
         let pool = spec.pool;
         let table_width = glm52_table_width(spec.max_model_len);
         // Prefix matching policy lives in `prefix_cache_enabled`: DSpark is
@@ -463,11 +463,13 @@ impl Glm52Engine {
 
             // Admission freezes while a speculation is outstanding: the
             // lease pins the next step's shape, so newcomers wait one step.
+            let t_admit = std::time::Instant::now();
             if self.leased_shape.is_none()
                 && let Err(err) = self.admit()
             {
                 self.fatal(&err);
             }
+            let admit_ms = t_admit.elapsed().as_millis();
             self.publish();
 
             // A mirrored engine with nothing to run has nothing to pace: its
@@ -518,16 +520,34 @@ impl Glm52Engine {
             );
             self.leased_shape = flags.lease.then_some(shape);
             self.sample_step += 1;
+            let t_step = std::time::Instant::now();
             let (outputs, span_kinds, step_inputs) = match self.submit_and_join_step(&shape, flags)
             {
                 Ok(step) => step,
                 Err(err) => self.fatal(&err),
             };
+            let step_ms = t_step.elapsed().as_millis();
+            let t_apply = std::time::Instant::now();
             let (rank_appends, mtp_appends, mut rank_proposals) =
                 match self.apply_step_outputs(&outputs, &shape, span_kinds, &step_inputs) {
                     Ok(walked) => walked,
                     Err(err) => self.fatal(&err),
                 };
+            // Serve-iteration stall forensics: the EP free-running contract
+            // means any phase here that overruns a round period starves the
+            // whole fleet's dispatch — name the phase, don't infer it from
+            // peers' spin time.
+            let apply_ms = t_apply.elapsed().as_millis();
+            if step_ms > 300 || admit_ms > 25 || apply_ms > 25 {
+                log::warn!(
+                    "GLM5.2 slow serve iter: rank={} admit={admit_ms}ms step={step_ms}ms \
+                     apply={apply_ms}ms active_slots={} pending={} resolves_inflight={}",
+                    self.rank,
+                    self.slots.iter().flatten().count(),
+                    self.pending.len(),
+                    self.resolves_inflight(),
+                );
+            }
             // Deferred releases complete ONLY at the end of the consume
             // step: the speculation they wait on was enqueued by the lease
             // step and replays during this one — freeing the pages any
@@ -622,11 +642,15 @@ impl Glm52Engine {
             }
         };
 
-        // Requests with nothing to resolve (no host tier, prefix cache off,
-        // or the prefill-only role, which never restores) go straight to the
-        // inbox; everything else resolves off-thread and arrives via
-        // `ready_rx` — the engine loop never waits on storage.
-        let wants_resolve = native.is_some() || (self.prefix_cache && !self.prefill_only());
+        // Requests with nothing to resolve (prefix cache off, and no native
+        // handoff) go straight to the inbox; everything else resolves
+        // off-thread and arrives via `ready_rx` — the engine loop never
+        // waits on storage. The prefill-only role resolves Plain prefixes
+        // like any other role: it never restores native handoffs (already
+        // dispositioned above), but its multi-turn traffic re-reads the
+        // prefixes it sealed to the host tier — and its peers' via the P2P
+        // mesh — instead of recomputing them from row one.
+        let wants_resolve = native.is_some() || self.prefix_cache;
         if !wants_resolve {
             self.pending.push_back(offload::Resolved::Plain {
                 req,

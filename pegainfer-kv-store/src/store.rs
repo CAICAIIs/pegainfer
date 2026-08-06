@@ -214,7 +214,10 @@ impl KvStore {
         // the settlement — and the release of a late hit's lease — to the
         // detached task.
         let deadline = Instant::now() + self.resolve_deadline;
+        let wait_start = Instant::now();
+        let mut polls = 0u32;
         let (hit, reservation) = loop {
+            polls += 1;
             if cancel.is_cancelled() {
                 self.stats.record_degrade(req_id, DegradeReason::Cancelled);
                 return KvPrefix::none();
@@ -286,6 +289,7 @@ impl KvStore {
 
         // The DMA is uncancellable: the tracked task owns the reservation
         // until the tier settles; the deadline abandons only the wait.
+        let wait_ms = wait_start.elapsed().as_millis();
         let loaded = hit.blocks;
         let page_ids = reservation.page_ids();
         let load = tier.load(hit, page_ids);
@@ -293,9 +297,23 @@ impl KvStore {
             let result = load.await;
             (result, reservation)
         }));
+        let load_start = Instant::now();
         match tokio::time::timeout_at(deadline, join).await {
             Ok(Ok((Ok(()), reservation))) => {
+                let load_ms = load_start.elapsed().as_millis();
+                let commit_start = Instant::now();
                 pool.commit_loaded_blocks(&mut probe, reservation);
+                // Stage split for the slow tail: `wait` is producer latency
+                // (seal/registration not landed, or pool pressure), `load` is
+                // the host->device move, `commit` is radix insertion — three
+                // different owners, unreadable from the total alone.
+                let commit_ms = commit_start.elapsed().as_millis();
+                if wait_ms + load_ms + commit_ms > 50 {
+                    log::info!(
+                        "kv-store resolve timing: req={req_id} rank={rank} blocks={loaded} \
+                         wait={wait_ms}ms polls={polls} load={load_ms}ms commit={commit_ms}ms"
+                    );
+                }
                 self.stats
                     .resolve_loaded_blocks
                     .fetch_add(loaded as u64, Ordering::Relaxed);
