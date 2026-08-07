@@ -7,6 +7,7 @@ version = "0.1.0"
 
 [dependencies]
 anyhow = { workspace = true }
+clap = { workspace = true }
 bincode = { workspace = true, features = ["serde"] }
 bytesize = { workspace = true }
 crossbeam-channel = { workspace = true }
@@ -16,6 +17,7 @@ hex = { workspace = true }
 log = { workspace = true }
 memmap2 = { workspace = true }
 pegainfer-core = { workspace = true }
+pegainfer-frontend = { workspace = true }
 pegainfer-kernels = { workspace = true, features = ["glm52"] }
 pegainfer-kv-store = { workspace = true }
 pegainfer-sample = { workspace = true }
