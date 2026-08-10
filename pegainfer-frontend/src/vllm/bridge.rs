@@ -586,6 +586,22 @@ fn stop_sentinel_id(eos_token_id: Option<u32>, stop_token_ids: &[u32]) -> Option
     eos_token_id.or_else(|| stop_token_ids.first().copied())
 }
 
+/// vLLM `SchedulerStats` view of a load snapshot — what the frontend's
+/// Prometheus gauges (`scheduler_running`, `scheduler_waiting`,
+/// `kv_cache_usage`) and DP load balancer consume.
+pub(crate) fn scheduler_stats_from(snapshot: LoadSnapshot) -> SchedulerStats {
+    SchedulerStats {
+        num_running_reqs: snapshot.num_running_reqs,
+        num_waiting_reqs: snapshot.num_waiting_reqs,
+        kv_cache_usage: if snapshot.kv_total_blocks == 0 {
+            0.0
+        } else {
+            snapshot.kv_used_blocks as f64 / snapshot.kv_total_blocks as f64
+        },
+        ..SchedulerStats::default()
+    }
+}
+
 /// Forward every scheduler load snapshot as a stats-only output batch; the
 /// frontend records it into the shared Prometheus registry. Sends the current
 /// snapshot up front so the gauges initialize before the first step, then one
@@ -599,17 +615,7 @@ async fn publish_scheduler_stats(
     shutdown: CancellationToken,
 ) -> Result<()> {
     loop {
-        let snapshot = *load_rx.borrow_and_update();
-        let stats = SchedulerStats {
-            num_running_reqs: snapshot.num_running_reqs,
-            num_waiting_reqs: snapshot.num_waiting_reqs,
-            kv_cache_usage: if snapshot.kv_total_blocks == 0 {
-                0.0
-            } else {
-                snapshot.kv_used_blocks as f64 / snapshot.kv_total_blocks as f64
-            },
-            ..SchedulerStats::default()
-        };
+        let stats = scheduler_stats_from(*load_rx.borrow_and_update());
         let outputs = RequestBatchOutputs {
             engine_index,
             scheduler_stats: Some(Box::new(stats)),
@@ -708,13 +714,11 @@ async fn connect_link(
     let mut child_tasks = tokio::task::JoinSet::new();
     child_tasks.spawn(async move { ("output sender", output_loop(output, output_rx).await) });
 
-    // Republish the scheduler's load snapshots as stats-only output batches so
-    // the frontend's Prometheus gauges (scheduler_running, scheduler_waiting,
-    // kv_cache_usage) track the engine. The watch channel coalesces to at most
-    // one message per scheduler step, and the scheduler publishes a final
-    // drained snapshot before parking idle, so the gauges settle to zero
-    // instead of freezing at the last busy value. Engines without a load watch
-    // simply publish no stats.
+    // Legacy handle engines republish load snapshots as stats-only output
+    // batches: their scheduler loops park when idle, so the watch cadence is
+    // bounded. The stepped bridge passes no watch here — its driver busy-polls
+    // (every spin would become a message), so it reads the watch at send time
+    // and stamps stats onto the batches it already emits instead.
     if let Some(load_rx) = load_watch {
         let stats_output_tx = output_tx.clone();
         let stats_shutdown = shutdown.clone();
