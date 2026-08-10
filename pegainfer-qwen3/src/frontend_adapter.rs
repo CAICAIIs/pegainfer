@@ -461,6 +461,8 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
                         let req = &mut self.active[index];
                         req.last_token = token;
                         req.generated_count = completion_tokens;
+                    } else {
+                        unreachable!("active request {request_id:?} must hold a streaming handle");
                     }
                 }
                 DecodeEffect::EmitManyAndContinue {
@@ -494,6 +496,8 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
                             req.last_token = last;
                             req.generated_count = completion_tokens;
                         }
+                    } else {
+                        unreachable!("active request {request_id:?} must hold a streaming handle");
                     }
                 }
                 DecodeEffect::EmitManyAndFinish {
@@ -536,10 +540,13 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
         for effect in effects.pending {
             match effect {
                 PendingEffect::ContinuePrefill { req } => {
-                    let aborted = matches!(
-                        self.handles.get(&req.request_id),
-                        Some(HandleSlot::Streaming(handle)) if handle.aborted().is_some()
-                    );
+                    let aborted = match self.handles.get(&req.request_id) {
+                        Some(HandleSlot::Streaming(handle)) => handle.aborted().is_some(),
+                        _ => unreachable!(
+                            "prefilling request {:?} must hold a streaming handle",
+                            req.request_id
+                        ),
+                    };
                     if aborted {
                         let request_id = req.request_id;
                         let handle = self
@@ -602,6 +609,10 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
                         emitter.push_tokens(handle, &[first_token], &[logprob]);
                         self.tracker.enter_decode(request_id);
                         self.active.push(state);
+                    } else {
+                        unreachable!(
+                            "promoted request {request_id:?} must hold a streaming handle"
+                        );
                     }
                 }
             }

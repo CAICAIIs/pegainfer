@@ -193,10 +193,7 @@ impl StepEmitter {
             prompt_tokens: inner.prompt_tokens,
             completion_tokens: inner.completion_tokens,
         });
-        DeferredFinish {
-            update,
-            tx: self.tx.clone(),
-        }
+        DeferredFinish::new(update, self.tx.clone())
     }
 
     /// Fail every remaining request with one message — the teardown sweep a

@@ -478,8 +478,10 @@ fn reduce_update(
     if let Some(params) = update.kv_transfer {
         state.kv_transfer_params = Some(params);
     }
-    // Prompt logprobs (update.prompt_echo) are intentionally deferred for
-    // this bridge, matching the legacy bridge.
+    // Prompt logprobs (update.prompt_echo) are dropped here: no vLLM-protocol
+    // consumer requests echo yet (the HTTP layer rejects `echo` + `prompt_logprobs`
+    // before submission), matching the legacy bridge. Wiring it up means mapping
+    // PromptEcho into EngineCoreOutput's prompt_logprobs fields.
 
     let mut token_ids = update.tokens;
     let mut has_logprobs = false;

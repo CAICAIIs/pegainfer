@@ -228,20 +228,66 @@ impl Drop for ActiveRequest {
 /// it from any thread at any later time cannot reorder against the step
 /// stream: the whole per-request record travels as one entry.
 pub struct DeferredFinish {
+    /// `Some` until [`Self::send`] delivers; `Drop` fires on `Some`.
+    inner: Option<DeferredInner>,
+}
+
+pub(crate) struct DeferredInner {
     pub(crate) update: RequestUpdate,
     pub(crate) tx: StepSender,
 }
 
 impl DeferredFinish {
-    pub fn id(&self) -> RequestId {
-        self.update.id
+    pub(crate) fn new(update: RequestUpdate, tx: StepSender) -> Self {
+        Self {
+            inner: Some(DeferredInner { update, tx }),
+        }
     }
 
-    /// Deliver the terminal. Consumes the finish; not sending one at all
-    /// would hang the client, so holders must call this on every path.
-    pub fn send(self) {
-        let _ = self.tx.send(StepOutputs {
-            updates: vec![self.update],
+    fn inner(&self) -> &DeferredInner {
+        self.inner
+            .as_ref()
+            .expect("deferred finish accessed after consumption")
+    }
+
+    pub fn id(&self) -> RequestId {
+        self.inner().update.id
+    }
+
+    /// Deliver the terminal. Consumes the finish.
+    pub fn send(mut self) {
+        let inner = self.inner.take().expect("deferred finish sent twice");
+        let _ = inner.tx.send(StepOutputs {
+            updates: vec![inner.update],
+        });
+    }
+}
+
+/// The same drop bomb as the other handles: an unsent deferred finish is a
+/// holder bug, and it must surface as a finished stream, not a client hang.
+/// The buffered tokens still ship, but the terminal is rewritten to `Failed`
+/// — the withheld `Finished` doubles as a barrier signal (P/D KV-ready), so a
+/// dropped handle must not fake its success.
+impl Drop for DeferredFinish {
+    fn drop(&mut self) {
+        let Some(mut inner) = self.inner.take() else {
+            return;
+        };
+        let (prompt_tokens, completion_tokens) = match inner.update.terminal {
+            Some(Terminal::Finished {
+                prompt_tokens,
+                completion_tokens,
+                ..
+            }) => (prompt_tokens, completion_tokens),
+            _ => (0, inner.update.tokens.len()),
+        };
+        inner.update.terminal = Some(Terminal::Failed {
+            message: "deferred finish dropped by the engine before delivery".to_string(),
+            prompt_tokens,
+            completion_tokens,
+        });
+        let _ = inner.tx.send(StepOutputs {
+            updates: vec![inner.update],
         });
     }
 }
