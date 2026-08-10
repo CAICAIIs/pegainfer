@@ -15,25 +15,21 @@ use pegainfer_core::tensor::DeviceContext;
 use pegainfer_core::tensor::HiddenStates;
 use pegainfer_core::weight_loader::WeightPrefetch;
 use pegainfer_core::weight_loader::load_shard_info;
+use pegainfer_frontend::engine::DeferredFinish;
 use pegainfer_frontend::engine::LoadLoraAdapterRequest;
-use pegainfer_frontend::engine::TokenEvent;
 use pegainfer_frontend::engine::TokenLogprob;
-use pegainfer_frontend::engine::TokenSink;
 use pegainfer_frontend::engine::UnloadLoraAdapterRequest;
 use pegainfer_frontend::engine::panic_message;
 use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_kv_cache::KvBlockGuard;
 use pegainfer_kv_cache::KvBuffer;
-use pegainfer_kv_cache::KvCacheEvent;
 use pegainfer_kv_cache::KvCacheManager;
 use pegainfer_kv_cache::KvView;
 use pegainfer_kv_cache::LoadReservation;
 use pegainfer_kv_cache::PrefixProbe;
-use pegainfer_kv_cache::RegisteredBlock;
 use pegainfer_kv_offload::LoadHandle;
 use pegainfer_kv_offload::OffloadConfig;
 use pegainfer_kv_offload::OffloadEngine;
-use tokio::sync::broadcast;
 
 use crate::Qwen3LoraOptions;
 use crate::Qwen3OffloadOptions;
@@ -932,13 +928,15 @@ pub(crate) trait ModelExecutor: Send {
         0
     }
 
-    /// Deliver this step's withheld `Finished` events. The default sends them
-    /// inline. A P/D prefill executor (`flush_on_finish`) instead delivers
-    /// them from the offload runtime once this step's KV saves + MetaServer
+    /// Deliver this step's withheld finishes. The default sends them inline.
+    /// A P/D prefill executor (`flush_on_finish`) instead delivers them from
+    /// the offload runtime once this step's KV saves + MetaServer
     /// registrations are query-visible to peers — the client treats the HTTP
     /// response as the KV-ready signal — so the scheduler thread never waits
-    /// on the flush barrier.
-    fn release_finished_events(&self, finishes: Vec<(TokenSink, TokenEvent)>) {
+    /// on the flush barrier. Each [`DeferredFinish`] carries the request's
+    /// whole final record (tokens included), so late delivery cannot reorder
+    /// against the step stream.
+    fn release_finished_events(&self, finishes: Vec<DeferredFinish>) {
         send_finished_events(finishes);
     }
 
@@ -954,28 +952,13 @@ pub(crate) trait ModelExecutor: Send {
     fn poll_async_prefill(&mut self) -> Option<PrefillResult> {
         None
     }
-
-    // ── KV block-event feed (no-op unless built with the event feed on) ──
-
-    /// Take the raw block-event receiver, once. `None` unless the engine was
-    /// built with the KV-event feed on; drives the cache-aware router pump.
-    fn take_kv_event_receiver(&mut self) -> Option<broadcast::Receiver<KvCacheEvent>> {
-        None
-    }
-
-    /// Per-request runs of blocks newly registered (made cacheable) since the
-    /// last call, including the final run of any request dropped this step.
-    /// Empty unless the feed is on.
-    fn take_kv_store_events(&mut self) -> Vec<Vec<RegisteredBlock>> {
-        Vec::new()
-    }
 }
 
-/// Deliver withheld `Finished` events; failed sends mean the client is gone,
-/// which needs no handling this late in a request's life.
-fn send_finished_events(finishes: Vec<(TokenSink, TokenEvent)>) {
-    for (token_tx, event) in finishes {
-        let _ = token_tx.send(event);
+/// Deliver withheld finishes; a closed frontend needs no handling this late
+/// in a request's life (the send is infallible-by-contract).
+fn send_finished_events(finishes: Vec<DeferredFinish>) {
+    for finish in finishes {
+        finish.send();
     }
 }
 
@@ -1033,27 +1016,10 @@ pub struct Qwen3Executor {
     /// enters this set when its prompt finishes prefilling with captured target
     /// context, and leaves on retire or a plain (non-speculative) decode.
     dflash_ready_requests: HashSet<RequestId>,
-    /// Opt-in KV block-event feed for a cache-aware router (`Some` only when the
-    /// engine was built with events on — single-GPU, no LoRA). `None` on the
-    /// plain path, where the whole feed costs nothing.
-    kv_events: Option<ExecutorKvEvents>,
     /// CUDA device ordinal this executor was built on. Used by
     /// [`enable_decode_overlap`] to create overlap streams on the correct
     /// device (the model, KV cache, and compute stream all live here).
     device_ordinal: usize,
-}
-
-/// Executor-side state for the opt-in KV block-event feed.
-struct ExecutorKvEvents {
-    /// Raw eviction/registration stream from the block pool. Taken once by the
-    /// scheduler to drive the router pump; `None` after that.
-    rx: Option<broadcast::Receiver<KvCacheEvent>>,
-    /// Final store runs of requests dropped mid-step, captured in `drop_request`
-    /// before the `RequestKv` (and its emit cursor) is gone. A request can seal
-    /// and register its last full block in the very step it finishes, so this
-    /// closes the window between that registration and removal. Drained by
-    /// [`Qwen3Executor::take_kv_store_events`].
-    pending_dropped: Vec<Vec<RegisteredBlock>>,
 }
 
 /// One request's in-flight CPU-tier KV prefetch.
@@ -1136,7 +1102,6 @@ impl Qwen3Executor {
         max_prefill_tokens: usize,
         dflash_kv_bytes_per_token: usize,
         memory_options: Qwen3MemoryOptions,
-        enable_kv_events: bool,
     ) -> Result<Self> {
         let (model, budget) = profile_kv_budget_on_worker(
             model,
@@ -1144,33 +1109,14 @@ impl Qwen3Executor {
             dflash_kv_bytes_per_token,
             memory_options,
         )?;
-        let (kv_mgr, kv_events) = if enable_kv_events {
-            let (kv_mgr, rx) = KvCacheManager::new_with_events(
-                &model.device_ctx().stream,
-                budget.num_layers,
-                budget.num_kv_heads,
-                budget.head_dim,
-                budget.block_size,
-                budget.num_blocks,
-            )?;
-            (
-                kv_mgr,
-                Some(ExecutorKvEvents {
-                    rx: Some(rx),
-                    pending_dropped: Vec::new(),
-                }),
-            )
-        } else {
-            let kv_mgr = KvCacheManager::new(
-                &model.device_ctx().stream,
-                budget.num_layers,
-                budget.num_kv_heads,
-                budget.head_dim,
-                budget.block_size,
-                budget.num_blocks,
-            )?;
-            (kv_mgr, None)
-        };
+        let kv_mgr = KvCacheManager::new(
+            &model.device_ctx().stream,
+            budget.num_layers,
+            budget.num_kv_heads,
+            budget.head_dim,
+            budget.block_size,
+            budget.num_blocks,
+        )?;
         let device_ordinal = model.device_ctx().device_ordinal;
         let metadata = Qwen3ExecutorMetadata {
             block_size: budget.block_size,
@@ -1253,7 +1199,6 @@ impl Qwen3Executor {
             async_prefill: None,
             speculative: None,
             dflash_ready_requests: HashSet::new(),
-            kv_events,
             device_ordinal,
         })
     }
@@ -1272,7 +1217,6 @@ impl Qwen3Executor {
             crate::scheduler::DEFAULT_MAX_PREFILL_TOKENS,
             None,
             Qwen3MemoryOptions::default(),
-            false,
         )
     }
 
@@ -1289,7 +1233,6 @@ impl Qwen3Executor {
         max_prefill_tokens: usize,
         dflash_draft_path: Option<&str>,
         memory_options: Qwen3MemoryOptions,
-        enable_kv_events: bool,
     ) -> Result<Self> {
         let mut memory_options = memory_options.validate()?;
         let lora_options = lora_options.validate()?;
@@ -1302,23 +1245,6 @@ impl Qwen3Executor {
             "KV offload is only supported on the single-GPU path (tensor parallel \
              shards KV per rank); got {} devices",
             device_ordinals.len()
-        );
-        // The KV-event feed is wired through the single-GPU pool only; TP shards
-        // KV per rank with a centralized manager that has no event hookup yet.
-        anyhow::ensure!(
-            !enable_kv_events || device_ordinals.len() == 1,
-            "KV block events are only supported on the single-GPU path; got {} devices",
-            device_ordinals.len()
-        );
-        // The store cursor announces a block as cacheable the moment it is
-        // registered, assuming GPU-resident reuse. With KV offload on, a block
-        // can be evicted to the host tier and restored under a different lineage
-        // hash, which the cursor + lineage→seq map do not model — so the two are
-        // mutually exclusive by construction rather than silently mis-announced.
-        anyhow::ensure!(
-            !enable_kv_events || !offload_options.enabled,
-            "KV block events and KV offload are mutually exclusive (the event cursor \
-             assumes GPU-resident block reuse)"
         );
         if device_ordinals.len() == 1 {
             let model = Qwen3Model::from_safetensors_with_runtime(
@@ -1352,7 +1278,6 @@ impl Qwen3Executor {
                 max_prefill_tokens,
                 dflash_kv_bytes_per_token,
                 memory_options,
-                enable_kv_events,
             )?;
             executor.lora_options = lora_options;
             return Ok(executor);
@@ -1577,8 +1502,6 @@ impl Qwen3Executor {
             async_prefill: None,
             speculative: None,
             dflash_ready_requests: HashSet::new(),
-            // KV events are single-GPU only (asserted above); never wired here.
-            kv_events: None,
             device_ordinal: device_ordinals[0],
         })
     }
@@ -2278,7 +2201,7 @@ impl ModelExecutor for Qwen3Executor {
             .map_or(0, |st| st.probe.held_blocks())
     }
 
-    fn release_finished_events(&self, finishes: Vec<(TokenSink, TokenEvent)>) {
+    fn release_finished_events(&self, finishes: Vec<DeferredFinish>) {
         match &self.offload {
             // P/D prefill role: the peer treats our HTTP response as the
             // KV-ready signal, so `Finished` may leave only after this step's
@@ -2297,19 +2220,10 @@ impl ModelExecutor for Qwen3Executor {
         // RAII frees any parked prefetch's reserved/held blocks.
         let retain_completed_kv = self.retains_completed_kv_blocks();
         let mut removed = self.request_kvs.remove(&request_id);
-        // With the event feed on, capture this request's still-unflushed store
-        // run before its cursor is gone: a request can register its last full
-        // block in the very step it finishes (see `ExecutorKvEvents`).
-        if let Some(rkv) = removed.as_mut() {
-            if let Some(events) = self.kv_events.as_mut() {
-                let run = rkv.take_newly_registered_blocks();
-                if !run.is_empty() {
-                    events.pending_dropped.push(run);
-                }
-            }
-            if !retain_completed_kv {
-                rkv.mark_blocks_reset_on_release();
-            }
+        if let Some(rkv) = removed.as_mut()
+            && !retain_completed_kv
+        {
+            rkv.mark_blocks_reset_on_release();
         }
         drop(removed);
         // A parked prefetch may still have a load in flight: pegaflow's worker
@@ -2333,25 +2247,6 @@ impl ModelExecutor for Qwen3Executor {
             self.primary.drop_dflash_request(request_id)?;
         }
         Ok(())
-    }
-
-    fn take_kv_event_receiver(&mut self) -> Option<broadcast::Receiver<KvCacheEvent>> {
-        self.kv_events.as_mut().and_then(|events| events.rx.take())
-    }
-
-    fn take_kv_store_events(&mut self) -> Vec<Vec<RegisteredBlock>> {
-        // Drop early — and avoid touching `request_kvs` — on the plain path.
-        let mut runs = match self.kv_events.as_mut() {
-            Some(events) => std::mem::take(&mut events.pending_dropped),
-            None => return Vec::new(),
-        };
-        for rkv in self.request_kvs.values_mut() {
-            let run = rkv.take_newly_registered_blocks();
-            if !run.is_empty() {
-                runs.push(run);
-            }
-        }
-        runs
     }
 
     fn begin_kv_prefetch(

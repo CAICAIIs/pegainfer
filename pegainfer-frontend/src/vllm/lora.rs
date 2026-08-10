@@ -23,8 +23,8 @@ use serde::Serialize;
 use tokio::sync::RwLock;
 use tower::ServiceExt;
 
+use crate::engine::ControlClient;
 use crate::engine::EngineControlError;
-use crate::engine::EngineHandle;
 use crate::engine::LoadLoraAdapterRequest;
 use crate::engine::UnloadLoraAdapterRequest;
 use crate::vllm::wire::LORA_ADAPTER_XARG;
@@ -33,7 +33,7 @@ const LORA_ROUTE_BODY_LIMIT: usize = 128 * 1024 * 1024;
 
 #[derive(Clone)]
 struct LoraRouteState {
-    handle: EngineHandle,
+    control: ControlClient,
     adapter_names: Arc<RwLock<HashSet<String>>>,
 }
 
@@ -142,14 +142,14 @@ struct ModelCardBody {
 }
 
 pub(crate) fn lora_routes(
-    handle: EngineHandle,
+    control: ControlClient,
     adapter_names: Arc<RwLock<HashSet<String>>>,
 ) -> Router {
     Router::new()
         .route("/v1/load_lora_adapter", post(load_lora_adapter))
         .route("/v1/unload_lora_adapter", post(unload_lora_adapter))
         .with_state(LoraRouteState {
-            handle,
+            control,
             adapter_names,
         })
 }
@@ -188,7 +188,7 @@ async fn load_lora_adapter(
 
     let lora_name = request.lora_name.clone();
     match state
-        .handle
+        .control
         .load_lora_adapter(LoadLoraAdapterRequest {
             lora_name: request.lora_name,
             lora_path: request.lora_path,
@@ -234,7 +234,7 @@ async fn unload_lora_adapter(
 
     let lora_name = request.lora_name.clone();
     match state
-        .handle
+        .control
         .unload_lora_adapter(UnloadLoraAdapterRequest {
             lora_name: request.lora_name,
             lora_int_id: request.lora_int_id,
@@ -280,12 +280,12 @@ fn bad_request(message: impl Into<String>) -> Response {
 }
 
 pub(crate) async fn load_startup_lora_modules(
-    handle: &EngineHandle,
+    control: &ControlClient,
     adapter_names: &Arc<RwLock<HashSet<String>>>,
     lora_modules: &[LoraModule],
 ) -> Result<()> {
     for module in lora_modules {
-        handle
+        control
             .load_lora_adapter(LoadLoraAdapterRequest {
                 lora_name: module.name.clone(),
                 lora_path: module.path.clone(),
@@ -420,22 +420,32 @@ async fn lora_models_response(
 
 #[cfg(test)]
 mod tests {
-    use tokio::sync::mpsc;
-
     use super::*;
-    use crate::engine::SubmittedRequest;
 
-    fn route_state(handle: EngineHandle) -> LoraRouteState {
+    /// A control client whose partition runs no scheduler: a drain thread
+    /// answers every request with the unsupported sentinel, exactly like the
+    /// base `Scheduler::control` implementation.
+    fn unsupported_control_client() -> ControlClient {
+        let (handle, backend) = crate::engine::partition_pair();
+        let client = handle.control_client();
+        std::thread::spawn(move || {
+            while let Ok(request) = backend.control.recv() {
+                crate::engine::reject_unsupported_control(request);
+            }
+        });
+        client
+    }
+
+    fn route_state(control: ControlClient) -> LoraRouteState {
         LoraRouteState {
-            handle,
+            control,
             adapter_names: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
     #[tokio::test]
     async fn load_lora_adapter_route_reports_unsupported_engine() {
-        let (submit_tx, _submit_rx) = mpsc::unbounded_channel::<SubmittedRequest>();
-        let state = route_state(EngineHandle::new(submit_tx));
+        let state = route_state(unsupported_control_client());
         let response = load_lora_adapter(
             axum::extract::State(state),
             Json(LoadLoraAdapterHttpRequest {
@@ -452,8 +462,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_lora_adapter_route_rejects_pr1_unsupported_fields() {
-        let (submit_tx, _submit_rx) = mpsc::unbounded_channel::<SubmittedRequest>();
-        let state = route_state(EngineHandle::new(submit_tx));
+        let state = route_state(unsupported_control_client());
         let response = load_lora_adapter(
             axum::extract::State(state),
             Json(LoadLoraAdapterHttpRequest {
@@ -470,8 +479,7 @@ mod tests {
 
     #[tokio::test]
     async fn unload_lora_adapter_route_reports_unsupported_engine() {
-        let (submit_tx, _submit_rx) = mpsc::unbounded_channel::<SubmittedRequest>();
-        let state = route_state(EngineHandle::new(submit_tx));
+        let state = route_state(unsupported_control_client());
         let response = unload_lora_adapter(
             axum::extract::State(state),
             Json(UnloadLoraAdapterHttpRequest {

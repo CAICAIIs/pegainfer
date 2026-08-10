@@ -2,8 +2,6 @@ use std::path::PathBuf;
 
 use tokio::sync::oneshot;
 
-use super::request::GenerateRequest;
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LoadLoraAdapterRequest {
     pub lora_name: String,
@@ -31,10 +29,11 @@ pub enum EngineControlRequest {
     },
 }
 
-pub enum EngineCommand {
-    Generate(Box<GenerateRequest>),
-    Control(EngineControlRequest),
-}
+/// The reply text of the base `Scheduler::control` implementation. String
+/// because control replies are `Result<_, String>` on the wire; the control
+/// client maps it back to [`EngineControlError::Unsupported`] so route
+/// handlers keep a typed unsupported case.
+pub(crate) const UNSUPPORTED_CONTROL_MESSAGE: &str = "engine does not support control requests";
 
 #[derive(Debug, Eq, PartialEq, thiserror::Error)]
 pub enum EngineControlError {
