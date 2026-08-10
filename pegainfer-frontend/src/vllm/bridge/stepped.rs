@@ -540,7 +540,10 @@ fn reduce_update(
             finish_reason = Some(convert_finish_reason(reason));
             terminated = true;
         }
-        Some(Terminal::Rejected { message, .. }) => {
+        Some(Terminal::Rejected { reason, .. }) => {
+            // The vLLM wire only carries a string; typed classification stops
+            // here and the rendered message is what reaches the client.
+            let message = reason.to_string();
             warn!("request {} rejected: {message}", state.request_id);
             finish_reason = Some(EngineCoreFinishReason::Error);
             stop_reason = Some(StopReason::Text(message));

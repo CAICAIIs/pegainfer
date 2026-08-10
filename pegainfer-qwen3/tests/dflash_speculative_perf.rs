@@ -105,7 +105,7 @@ fn timed_generate(engine: &EngineHarness, prompt_tokens: Vec<u32>) -> (usize, Du
         match update.terminal {
             Some(Terminal::Finished { .. }) => return (count, start.elapsed()),
             Some(Terminal::Failed { message, .. }) => panic!("generation failed: {message}"),
-            Some(Terminal::Rejected { message, .. }) => panic!("generation rejected: {message}"),
+            Some(Terminal::Rejected { reason, .. }) => panic!("generation rejected: {reason}"),
             None => {}
         }
     }

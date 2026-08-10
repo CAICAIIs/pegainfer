@@ -233,7 +233,7 @@ impl RequestStream {
         let outcome = self.outcome();
         match &outcome.terminal {
             Terminal::Finished { .. } => outcome,
-            Terminal::Rejected { message, .. } => panic!("generation rejected: {message}"),
+            Terminal::Rejected { reason, .. } => panic!("generation rejected: {reason}"),
             Terminal::Failed { message, .. } => panic!("generation failed: {message}"),
         }
     }

@@ -87,8 +87,8 @@ fn in_window_prompt_past_old_rope_table_is_served() {
         Terminal::Failed { message, .. } => {
             panic!("in-window prompt errored (resized RoPE cache not exercised?): {message}")
         }
-        Terminal::Rejected { message, .. } => {
-            panic!("in-window prompt was wrongly rejected: {message}")
+        Terminal::Rejected { reason, .. } => {
+            panic!("in-window prompt was wrongly rejected: {reason}")
         }
     }
 

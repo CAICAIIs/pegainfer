@@ -162,8 +162,8 @@ impl Harness {
             Some(Terminal::Failed { message, .. }) => {
                 panic!("request {} failed: {message}", trace.label)
             }
-            Some(Terminal::Rejected { message, .. }) => {
-                panic!("request {} rejected: {message}", trace.label)
+            Some(Terminal::Rejected { reason, .. }) => {
+                panic!("request {} rejected: {reason}", trace.label)
             }
             None => {}
         }

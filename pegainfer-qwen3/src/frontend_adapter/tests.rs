@@ -15,6 +15,7 @@ use pegainfer_frontend::engine::EngineControlError;
 use pegainfer_frontend::engine::FinishReason;
 use pegainfer_frontend::engine::LivePartition;
 use pegainfer_frontend::engine::LoadLoraAdapterRequest;
+use pegainfer_frontend::engine::RejectReason;
 use pegainfer_frontend::engine::RequestId;
 use pegainfer_frontend::engine::RequestUpdate;
 use pegainfer_frontend::engine::StepReceiver;
@@ -134,10 +135,10 @@ fn unknown_lora_request_is_rejected_without_blocking_base_request() {
     assert!(tokens.is_empty());
     match terminal {
         Terminal::Rejected {
-            message,
+            reason: RejectReason::UnknownLoraAdapter { name },
             prompt_tokens,
         } => {
-            assert!(message.contains("LoRA adapter is not loaded: missing-adapter"));
+            assert_eq!(name, "missing-adapter");
             assert_eq!(prompt_tokens, 16);
         }
         other => panic!("unknown adapter request should be rejected, got {other:?}"),

@@ -668,8 +668,8 @@ fn dflash_request_in_draft_headroom_is_rejected_not_panicked() {
         "draft-headroom request was admitted instead of rejected"
     );
     match outcome.terminal {
-        Terminal::Rejected { message, .. } => {
-            eprintln!("draft-headroom request rejected as expected: {message}");
+        Terminal::Rejected { reason, .. } => {
+            eprintln!("draft-headroom request rejected as expected: {reason}");
         }
         Terminal::Finished { .. } => {
             panic!("draft-headroom request was admitted instead of rejected")

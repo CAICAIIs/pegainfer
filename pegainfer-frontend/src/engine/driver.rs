@@ -127,10 +127,6 @@ mod tests {
 
     impl Scheduler for EchoScheduler {
         fn intake(&mut self, ticket: IntakeTicket, emitter: &mut StepEmitter) {
-            if ticket.request().prompt_tokens.is_empty() {
-                emitter.reject(ticket, "empty prompt");
-                return;
-            }
             let max_tokens = ticket.request().max_tokens;
             let active = emitter.admit(ticket);
             self.running.push((active, max_tokens));

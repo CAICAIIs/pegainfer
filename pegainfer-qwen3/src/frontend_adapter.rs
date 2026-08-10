@@ -39,6 +39,7 @@ use pegainfer_frontend::engine::IntakeTicket;
 use pegainfer_frontend::engine::KvCapacity;
 use pegainfer_frontend::engine::LoadSnapshot;
 use pegainfer_frontend::engine::PromptEcho;
+use pegainfer_frontend::engine::RejectReason;
 use pegainfer_frontend::engine::Scheduler;
 use pegainfer_frontend::engine::StepEmitter;
 use pegainfer_frontend::engine::spawn_partition;
@@ -54,6 +55,7 @@ use crate::executor::Qwen3Executor;
 use crate::executor::RequestId;
 use crate::scheduler::ActiveRequestState;
 use crate::scheduler::PendingRequest;
+use crate::scheduler::RejectReason as AdmissionReject;
 use crate::scheduler::admit_deferred_requests;
 use crate::scheduler::admitted_future_blocks;
 use crate::scheduler::block_on_loading;
@@ -61,6 +63,7 @@ use crate::scheduler::effects::DecodeEffect;
 use crate::scheduler::effects::PendingEffect;
 use crate::scheduler::effects::StepEffects;
 use crate::scheduler::failure_target_ids;
+use crate::scheduler::max_request_tokens;
 use crate::scheduler::offer_prefetch;
 use crate::scheduler::phase_trace::PhaseTracker;
 use crate::scheduler::plan::ExecutionArtifacts;
@@ -68,13 +71,11 @@ use crate::scheduler::plan::ExecutionPlan;
 use crate::scheduler::plan::execute_plan;
 use crate::scheduler::reclaim_ready_prefetch;
 use crate::scheduler::reject_unknown_lora_requests;
-use crate::scheduler::rejection_message;
 use crate::scheduler::release_rejected;
 use crate::scheduler::resolve::resolve_step;
 use crate::scheduler::runtime_plan;
 use crate::scheduler::servable_len;
 use crate::scheduler::take_prefill_chunks;
-use crate::scheduler::unknown_lora_message;
 use crate::weights::Qwen3MemoryOptions;
 
 // ── Engine assembly ─────────────────────────────────────────────────────
@@ -294,11 +295,16 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
         true
     }
 
-    fn reject_pending(&mut self, req: &PendingRequest, message: String, emitter: &mut StepEmitter) {
+    fn reject_pending(
+        &mut self,
+        req: &PendingRequest,
+        reason: RejectReason,
+        emitter: &mut StepEmitter,
+    ) {
         let Some(HandleSlot::Queued(ticket)) = self.handles.remove(&req.request_id) else {
             unreachable!("rejected request must hold a queued ticket");
         };
-        emitter.reject(ticket, message);
+        emitter.reject(ticket, reason);
         release_rejected(&mut self.executor, &mut self.tracker, req);
     }
 
@@ -725,7 +731,13 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
         let lora_validation =
             reject_unknown_lora_requests(std::mem::take(&mut self.deferred), &self.executor);
         for rejected in &lora_validation.rejected {
-            self.reject_pending(rejected, unknown_lora_message(rejected), emitter);
+            let reason = RejectReason::UnknownLoraAdapter {
+                name: rejected
+                    .lora_adapter
+                    .clone()
+                    .expect("only requests naming an adapter can fail LoRA validation"),
+            };
+            self.reject_pending(rejected, reason, emitter);
         }
         let admission = admit_deferred_requests(
             lora_validation.accepted,
@@ -740,7 +752,7 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
             |id| self.executor.prefetched_blocks(id),
         );
         for (rejected, reason) in &admission.rejected {
-            self.reject_pending(rejected, rejection_message(rejected, *reason), emitter);
+            self.reject_pending(rejected, contract_reject_reason(rejected, *reason), emitter);
         }
         self.deferred = admission.deferred;
         for req in admission.pending {
@@ -860,6 +872,27 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
         // adapter swap can never race in-flight generation that depends on
         // the current adapter set.
         self.pending_control.push_back(request);
+    }
+}
+
+/// Widen a mechanics-side admission verdict into the contract's typed reason:
+/// the mechanics carry only what the decision needed, the request at hand
+/// supplies the rest.
+fn contract_reject_reason(req: &PendingRequest, reason: AdmissionReject) -> RejectReason {
+    match reason {
+        AdmissionReject::ContextLength { limit } => RejectReason::ContextLength {
+            prompt_tokens: req.prompt_tokens.len(),
+            max_tokens: req.max_tokens,
+            limit,
+        },
+        AdmissionReject::EchoPrefillTokens { limit } => RejectReason::EchoPrefillTokens {
+            prompt_tokens: req.prompt_tokens.len(),
+            limit,
+        },
+        AdmissionReject::KvBudget => RejectReason::KvBudget {
+            prompt_tokens: req.prompt_tokens.len(),
+            worst_case_tokens: max_request_tokens(req),
+        },
     }
 }
 

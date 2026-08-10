@@ -153,7 +153,7 @@ fn tp2_graph_dump_when_available_and_concurrent_decode_complete() {
         };
         match outcome.terminal {
             Terminal::Finished { .. } => {}
-            Terminal::Rejected { message, .. } => panic!("request {i} rejected: {message}"),
+            Terminal::Rejected { reason, .. } => panic!("request {i} rejected: {reason}"),
             Terminal::Failed { message, .. } => panic!("request {i} failed: {message}"),
         }
         assert!(

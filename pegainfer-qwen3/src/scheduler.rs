@@ -304,7 +304,7 @@ fn blocks_needed(token_count: usize, block_size: usize) -> usize {
 // Prefill samples the first output token but does not write its KV. A generated
 // token's KV is written only when it is fed as the next decode input. Therefore
 // N returned completion tokens occupy at most N - 1 generated-token KV slots.
-fn max_request_tokens(req: &PendingRequest) -> usize {
+pub(crate) fn max_request_tokens(req: &PendingRequest) -> usize {
     req.prompt_tokens
         .len()
         .saturating_add(req.max_tokens.saturating_sub(1))
@@ -490,33 +490,6 @@ pub(crate) fn admit_deferred_requests(
         deferred: still_deferred,
         rejected,
     }
-}
-
-pub(crate) fn rejection_message(req: &PendingRequest, reason: RejectReason) -> String {
-    match reason {
-        RejectReason::ContextLength { limit } => format!(
-            "request exceeds this model's maximum context length of {} tokens: requested {} (prompt={} + max_tokens={})",
-            limit,
-            req.prompt_tokens.len().saturating_add(req.max_tokens),
-            req.prompt_tokens.len(),
-            req.max_tokens
-        ),
-        RejectReason::EchoPrefillTokens { limit } => format!(
-            "echo request prompt exceeds the profiled prefill limit of {} tokens: prompt_tokens={}",
-            limit,
-            req.prompt_tokens.len()
-        ),
-        RejectReason::KvBudget => format!(
-            "request requires more KV blocks than this model instance can provide: prompt_tokens={}, max_request_tokens={}",
-            req.prompt_tokens.len(),
-            max_request_tokens(req)
-        ),
-    }
-}
-
-pub(crate) fn unknown_lora_message(req: &PendingRequest) -> String {
-    let adapter = req.lora_adapter.as_deref().unwrap_or("<missing>");
-    format!("LoRA adapter is not loaded: {adapter}")
 }
 
 /// Choose the step plan, preferring a speculative-decode step when the whole

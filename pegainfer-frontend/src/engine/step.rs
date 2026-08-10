@@ -8,6 +8,7 @@
 //! Cross-step ordering is enforced on the producer side by the typestate
 //! handles in [`super::ticket`].
 
+use std::fmt;
 use std::time::Instant;
 
 use super::event::FinishReason;
@@ -145,6 +146,70 @@ pub struct PromptEcho {
     pub logprobs: Vec<Option<TokenLogprob>>,
 }
 
+/// Why a request was refused at admission. Typed so a frontend can map the
+/// class onto its own error surface (HTTP status, retry policy) instead of
+/// pattern-matching rendered text; `Display` is the client-facing message.
+/// `#[non_exhaustive]`: model lines grow new refusals (frontends keep a
+/// wildcard arm), and a variant only exists once a scheduler produces it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RejectReason {
+    /// Worst-case length (`prompt + max_tokens`) exceeds the model's
+    /// position-encoding window.
+    ContextLength {
+        prompt_tokens: usize,
+        max_tokens: usize,
+        limit: usize,
+    },
+    /// Echo needs all-position logits in one forward pass, so the prompt must
+    /// fit the profiled prefill bound.
+    EchoPrefillTokens { prompt_tokens: usize, limit: usize },
+    /// Worst-case length needs more KV blocks than this instance can ever
+    /// provide to one request.
+    KvBudget {
+        prompt_tokens: usize,
+        worst_case_tokens: usize,
+    },
+    /// The named adapter is not loaded on this engine.
+    UnknownLoraAdapter { name: String },
+}
+
+impl fmt::Display for RejectReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ContextLength {
+                prompt_tokens,
+                max_tokens,
+                limit,
+            } => write!(
+                f,
+                "request exceeds this model's maximum context length of {limit} tokens: \
+                 requested {} (prompt={prompt_tokens} + max_tokens={max_tokens})",
+                prompt_tokens.saturating_add(*max_tokens)
+            ),
+            Self::EchoPrefillTokens {
+                prompt_tokens,
+                limit,
+            } => write!(
+                f,
+                "echo request prompt exceeds the profiled prefill limit of {limit} tokens: \
+                 prompt_tokens={prompt_tokens}"
+            ),
+            Self::KvBudget {
+                prompt_tokens,
+                worst_case_tokens,
+            } => write!(
+                f,
+                "request requires more KV blocks than this model instance can provide: \
+                 prompt_tokens={prompt_tokens}, max_request_tokens={worst_case_tokens}"
+            ),
+            Self::UnknownLoraAdapter { name } => {
+                write!(f, "LoRA adapter is not loaded: {name}")
+            }
+        }
+    }
+}
+
 /// Why and how a request's lifetime ended. Token counts are tallied by the
 /// emitter from what actually shipped, not hand-maintained by model code.
 #[derive(Debug)]
@@ -157,7 +222,7 @@ pub enum Terminal {
     /// Refused at admission: the request never held a slot and produced no
     /// tokens.
     Rejected {
-        message: String,
+        reason: RejectReason,
         prompt_tokens: usize,
     },
     /// Died to an engine-side error (execution failure, scheduler bug, engine

@@ -14,6 +14,7 @@ use std::time::Instant;
 use super::event::FinishReason;
 use super::event::TokenLogprob;
 use super::step::PromptEcho;
+use super::step::RejectReason;
 use super::step::RequestId;
 use super::step::RequestUpdate;
 use super::step::ScheduledInfo;
@@ -82,10 +83,10 @@ impl StepEmitter {
     }
 
     /// Refuse the request at admission.
-    pub fn reject(&mut self, ticket: IntakeTicket, message: impl Into<String>) {
+    pub fn reject(&mut self, ticket: IntakeTicket, reason: RejectReason) {
         let inner = ticket.consume();
         self.entry(inner.core.id).terminal = Some(Terminal::Rejected {
-            message: message.into(),
+            reason,
             prompt_tokens: inner.prompt_len,
         });
     }
@@ -289,7 +290,14 @@ mod tests {
         let (handle, mut backend) = partition_pair();
         let _control = handle.submit(request(vec![1; 5]));
         let ticket = backend.intake.try_recv().expect("ticket");
-        backend.emitter.reject(ticket, "too long");
+        backend.emitter.reject(
+            ticket,
+            RejectReason::ContextLength {
+                prompt_tokens: 5,
+                max_tokens: 8,
+                limit: 4,
+            },
+        );
         backend.emitter.commit_step();
 
         let step = handle_steps(handle).try_recv().expect("step");
@@ -298,7 +306,10 @@ mod tests {
         assert!(update.tokens.is_empty());
         assert!(matches!(
             &update.terminal,
-            Some(Terminal::Rejected { message, prompt_tokens: 5 }) if message == "too long"
+            Some(Terminal::Rejected {
+                reason: RejectReason::ContextLength { limit: 4, .. },
+                prompt_tokens: 5,
+            })
         ));
     }
 

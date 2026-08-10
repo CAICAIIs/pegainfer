@@ -18,6 +18,7 @@
 use std::path::Path;
 
 use pegainfer_frontend::engine::EngineLoadOptions;
+use pegainfer_frontend::engine::RejectReason;
 use pegainfer_frontend::engine::Terminal;
 use pegainfer_frontend::sampler::SamplingParams;
 use vllm_text::tokenizer::DynTokenizer;
@@ -86,10 +87,10 @@ fn oversized_prompt_is_rejected_with_context_length_error() {
         .outcome();
 
     match outcome.terminal {
-        Terminal::Rejected { message, .. } => {
+        Terminal::Rejected { reason, .. } => {
             assert!(
-                message.contains("context length"),
-                "expected a context-length rejection, got: {message}"
+                matches!(reason, RejectReason::ContextLength { .. }),
+                "expected a context-length rejection, got: {reason}"
             );
         }
         Terminal::Failed { message, .. } => {
