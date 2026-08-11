@@ -928,16 +928,26 @@ pub(crate) trait ModelExecutor: Send {
         0
     }
 
-    /// Deliver this step's withheld finishes. The default sends them inline.
-    /// A P/D prefill executor (`flush_on_finish`) instead delivers them from
-    /// the offload runtime once this step's KV saves + MetaServer
+    /// Whether this executor withholds `Finished` past the step. Only the
+    /// P/D prefill role does (`flush_on_finish`): its finishes leave through
+    /// [`Self::release_finished_events`] once KV saves are peer-visible.
+    /// Everyone else finishes through the emitter, so the terminal rides the
+    /// committed step — shipped after the driver publishes load, which keeps
+    /// a finishing batch's send-time stats reading the drained occupancy
+    /// instead of racing the publish.
+    fn withholds_finishes(&self) -> bool {
+        false
+    }
+
+    /// Deliver this step's withheld finishes once the KV saves + MetaServer
     /// registrations are query-visible to peers — the client treats the HTTP
     /// response as the KV-ready signal — so the scheduler thread never waits
     /// on the flush barrier. Each [`DeferredFinish`] carries the request's
     /// whole final record (tokens included), so late delivery cannot reorder
-    /// against the step stream.
-    fn release_finished_events(&self, finishes: Vec<DeferredFinish>) {
-        send_finished_events(finishes);
+    /// against the step stream. Called only when
+    /// [`Self::withholds_finishes`] is true.
+    fn release_finished_events(&self, _finishes: Vec<DeferredFinish>) {
+        unreachable!("executor withholds finishes without a delivery override");
     }
 
     // ── Decode-overlap async prefill ─────────────────────────────────────
@@ -2201,17 +2211,20 @@ impl ModelExecutor for Qwen3Executor {
             .map_or(0, |st| st.probe.held_blocks())
     }
 
+    fn withholds_finishes(&self) -> bool {
+        self.flush_offload_on_finish
+    }
+
     fn release_finished_events(&self, finishes: Vec<DeferredFinish>) {
-        match &self.offload {
-            // P/D prefill role: the peer treats our HTTP response as the
-            // KV-ready signal, so `Finished` may leave only after this step's
-            // saves + MetaServer registrations are peer-visible. The barrier
-            // runs on the offload runtime; the scheduler thread never waits.
-            Some(offload) if self.flush_offload_on_finish => {
-                offload.flush_saves_then(move || send_finished_events(finishes));
-            }
-            _ => send_finished_events(finishes),
-        }
+        // P/D prefill role: the peer treats our HTTP response as the
+        // KV-ready signal, so `Finished` may leave only after this step's
+        // saves + MetaServer registrations are peer-visible. The barrier
+        // runs on the offload runtime; the scheduler thread never waits.
+        let offload = self
+            .offload
+            .as_ref()
+            .expect("flush_offload_on_finish implies an offload runtime");
+        offload.flush_saves_then(move || send_finished_events(finishes));
     }
 
     fn drop_request(&mut self, request_id: RequestId) -> Result<()> {

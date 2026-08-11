@@ -1,5 +1,5 @@
-//! Contract tests: drive a full `Qwen3Scheduler` partition through the
-//! engine contract (submit → step stream → terminal) with a fake executor.
+//! Contract tests: drive a full `Qwen3Scheduler` through the engine
+//! contract (submit → step stream → terminal) with a fake executor.
 //! These pin the protocol a frontend can rely on, not scheduler internals.
 
 use std::collections::HashMap;
@@ -227,6 +227,46 @@ fn same_step_finishes_all_reach_their_terminals() {
     let mut dropped = dropped.lock().unwrap().clone();
     dropped.sort_unstable();
     assert_eq!(dropped, vec![0, 1, 2]);
+}
+
+/// A finishing request's terminal must ride the step's committed batch — one
+/// `StepOutputs` per step — not leave mid-step as its own message. Mid-step
+/// delivery raced the driver's load publish, so the finishing batch's
+/// send-time stats could report the pre-drain occupancy and freeze the idle
+/// gauges there.
+#[test]
+fn finish_rides_the_committed_step_batch() {
+    let dropped = Arc::new(Mutex::new(Vec::new()));
+    let executor = FakeExecutor::new(8, Arc::clone(&dropped));
+    let mut engine: Engine = start_with_executor(executor, 42, DEFAULT_MAX_PREFILL_TOKENS, false);
+    let mut scheduler = engine.schedulers.remove(0);
+    let mut steps = scheduler
+        .handle
+        .take_steps()
+        .expect("a fresh scheduler yields its step stream once");
+
+    // The bystander outlives the finisher, so whichever step finishes the
+    // finisher also decodes the bystander.
+    let bystander = scheduler.handle.submit(request(16, 8));
+    let finisher = scheduler.handle.submit(request(16, 2));
+
+    loop {
+        let step = steps.blocking_recv().expect("engine step stream closed");
+        let finished = step
+            .updates
+            .iter()
+            .any(|update| update.id == finisher.id() && update.terminal.is_some());
+        if !finished {
+            continue;
+        }
+        assert!(
+            step.updates
+                .iter()
+                .any(|update| update.id == bystander.id()),
+            "the finisher's terminal left mid-step instead of riding the committed batch"
+        );
+        break;
+    }
 }
 
 #[test]

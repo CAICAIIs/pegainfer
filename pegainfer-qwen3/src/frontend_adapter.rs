@@ -16,9 +16,10 @@
 //!
 //! Cancellation is reactive: the frontend flips a request's abort flag and
 //! this adapter retires it on its next touch — the scheduler mechanics never
-//! see aborts. Finishes route through [`StepEmitter::defer_finish`] and
-//! [`ModelExecutor::release_finished_events`], so a P/D prefill executor can
-//! withhold a request's final record until its KV saves are peer-visible.
+//! see aborts. Finishes ride the committed step unless the executor withholds
+//! them ([`ModelExecutor::withholds_finishes`]): a P/D prefill executor takes
+//! them as [`StepEmitter::defer_finish`] tokens and delivers each request's
+//! final record once its KV saves are peer-visible.
 
 #[cfg(test)]
 mod tests;
@@ -34,6 +35,7 @@ use pegainfer_frontend::engine::ActiveRequest;
 use pegainfer_frontend::engine::DeferredFinish;
 use pegainfer_frontend::engine::Engine;
 use pegainfer_frontend::engine::EngineInfo;
+use pegainfer_frontend::engine::FinishReason;
 use pegainfer_frontend::engine::IntakeTicket;
 use pegainfer_frontend::engine::KvCapacity;
 use pegainfer_frontend::engine::LoadSnapshot;
@@ -374,13 +376,16 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
     /// bookkeeping, and state transitions. The old per-token send-failure
     /// signal is replaced by explicit abort probes on the handles.
     fn apply_effects(&mut self, effects: StepEffects, emitter: &mut StepEmitter) {
-        // Finishes are not committed inline: they are collected and handed to
-        // the executor at the end of the step. On the plain path the executor
-        // sends them immediately; a P/D prefill executor withholds them until
-        // this step's KV saves are peer-visible (`flush_on_finish`), off the
-        // scheduler thread. Each deferred finish carries the request's whole
-        // buffered record, so late delivery cannot reorder.
-        let mut finishes: Vec<DeferredFinish> = Vec::new();
+        // Finishes are collected and resolved at the end of the step. A
+        // withholding executor (P/D prefill: `Finished` may leave only once
+        // this step's KV saves are peer-visible) takes them as
+        // [`DeferredFinish`] tokens and delivers off the scheduler thread —
+        // each carries the request's whole buffered record, so late delivery
+        // cannot reorder. Everyone else finishes through the emitter, so the
+        // terminal rides the committed step, which the driver ships after
+        // publishing load — the finishing batch's send-time stats then read
+        // the drained occupancy instead of racing the publish.
+        let mut finishes: Vec<(ActiveRequest, FinishReason)> = Vec::new();
 
         for cached in effects.cached {
             if let Some(HandleSlot::Streaming(handle)) = self.handles.get_mut(&cached.request_id) {
@@ -418,7 +423,7 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
                         if handle.aborted().is_some() {
                             emitter.retire(handle);
                         } else {
-                            finishes.push(emitter.defer_finish(handle, finish_reason));
+                            finishes.push((handle, finish_reason));
                         }
                     }
                     self.tracker.finish(request_id);
@@ -443,7 +448,7 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
                             emitter.retire(handle);
                         } else {
                             emitter.push_tokens(&mut handle, &[token], &[logprob]);
-                            finishes.push(emitter.defer_finish(handle, finish_reason));
+                            finishes.push((handle, finish_reason));
                         }
                     }
                     self.tracker.finish(request_id);
@@ -536,7 +541,7 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
                             emitter.retire(handle);
                         } else {
                             emitter.push_tokens(&mut handle, &tokens, &[]);
-                            finishes.push(emitter.defer_finish(handle, finish_reason));
+                            finishes.push((handle, finish_reason));
                         }
                     }
                     self.tracker.finish(request_id);
@@ -584,7 +589,7 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
                         if handle.aborted().is_some() {
                             emitter.retire(handle);
                         } else {
-                            finishes.push(emitter.defer_finish(handle, finish_reason));
+                            finishes.push((handle, finish_reason));
                         }
                     }
                     self.tracker.finish(request_id);
@@ -601,7 +606,7 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
                             emitter.retire(handle);
                         } else {
                             emitter.push_tokens(&mut handle, &[token], &[logprob]);
-                            finishes.push(emitter.defer_finish(handle, finish_reason));
+                            finishes.push((handle, finish_reason));
                         }
                     }
                     self.tracker.finish(request_id);
@@ -639,7 +644,17 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
         self.prefilling.splice(0..0, continued);
 
         if !finishes.is_empty() {
-            self.executor.release_finished_events(finishes);
+            if self.executor.withholds_finishes() {
+                let withheld: Vec<DeferredFinish> = finishes
+                    .into_iter()
+                    .map(|(handle, reason)| emitter.defer_finish(handle, reason))
+                    .collect();
+                self.executor.release_finished_events(withheld);
+            } else {
+                for (handle, reason) in finishes {
+                    emitter.finish(handle, reason);
+                }
+            }
         }
     }
 
