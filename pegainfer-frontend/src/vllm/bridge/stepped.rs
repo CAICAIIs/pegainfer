@@ -48,7 +48,6 @@ use super::stop_sentinel_id;
 use crate::engine::AbortReason;
 use crate::engine::FinishReason;
 use crate::engine::KvCapacity;
-use crate::engine::LoadSnapshot;
 use crate::engine::PartitionHandle;
 use crate::engine::Request;
 use crate::engine::RequestControl;
@@ -78,10 +77,9 @@ impl SteppedEngineBridge {
             .partition
             .take_steps()
             .context("partition step stream already taken")?;
-        // Stats are pull-at-send: no push task, the load watch is read when a
+        // Stats are pull-at-send: no push task, the load cell is read when a
         // batch goes out (and once here, so the frontend's gauges initialize
         // before any traffic). An idle engine publishes nothing.
-        let load_watch = self.partition.load_watch();
         let BridgeLink {
             mut input,
             output_tx,
@@ -101,7 +99,7 @@ impl SteppedEngineBridge {
             &output_tx,
             RequestBatchOutputs {
                 engine_index: self.engine_index,
-                scheduler_stats: Some(Box::new(scheduler_stats_from(*load_watch.borrow()))),
+                scheduler_stats: Some(Box::new(scheduler_stats_from(self.partition.load()))),
                 timestamp: now_secs_f64(),
                 ..Default::default()
             }
@@ -142,7 +140,6 @@ impl SteppedEngineBridge {
                     if let Err(error) = self.dispatch_step(
                         step,
                         &anchor,
-                        &load_watch,
                         &mut streams,
                         &mut names,
                         &output_tx,
@@ -184,7 +181,6 @@ impl SteppedEngineBridge {
         &self,
         step: StepOutputs,
         anchor: &UnixAnchor,
-        load_watch: &tokio::sync::watch::Receiver<LoadSnapshot>,
         streams: &mut HashMap<RequestId, SteppedStream>,
         names: &mut HashMap<String, RequestId>,
         output_tx: &tokio::sync::mpsc::UnboundedSender<
@@ -219,7 +215,7 @@ impl SteppedEngineBridge {
         if outputs.is_empty() {
             return Ok(());
         }
-        // The watch already holds this step's snapshot (the driver publishes
+        // The cell already holds this step's snapshot (the driver publishes
         // load before committing the step), so the batch carries stats that
         // match its own tokens — a finishing batch reports the drained state
         // and the gauges settle instead of freezing at the last busy value.
@@ -229,7 +225,7 @@ impl SteppedEngineBridge {
                 engine_index: self.engine_index,
                 outputs,
                 finished_requests: (!finished_requests.is_empty()).then_some(finished_requests),
-                scheduler_stats: Some(Box::new(scheduler_stats_from(*load_watch.borrow()))),
+                scheduler_stats: Some(Box::new(scheduler_stats_from(self.partition.load()))),
                 timestamp: now_secs_f64(),
             }
             .into(),

@@ -8,16 +8,17 @@
 //! crossbeam (sync consumer on the scheduler thread; senders never block on
 //! unbounded channels), the step stream is tokio (async consumer in the
 //! protocol stack; the sync producer's send never blocks either), load is a
-//! tokio `watch` (coalescing snapshot).
+//! shared cell (read-only pull, deliberately unsubscribable — see
+//! [`LoadPublisher`]).
 
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use tokio::sync::oneshot;
-use tokio::sync::watch;
 
 use super::control::EngineControlError;
 use super::control::EngineControlRequest;
@@ -43,15 +44,21 @@ pub struct PartitionBackend {
     pub(crate) load: LoadPublisher,
 }
 
-/// Sole writer of a partition's load feed; the driver publishes once per
+/// Sole writer of a partition's load cell; the driver publishes once per
 /// iteration from [`super::Scheduler::load`].
-pub struct LoadPublisher(watch::Sender<LoadSnapshot>);
+///
+/// Deliberately a plain cell and not a `watch` channel: the driver busy-polls,
+/// so a subscription edge (`changed()`) would fire per spin and turn any
+/// subscriber into a message flood at idle. With only [`PartitionHandle::load`]
+/// to read it, "notify me on load change" is unrepresentable — consumers pull
+/// the snapshot at the moment they need one. A `Mutex` (not per-field atomics)
+/// so a reader never sees fields torn across two steps; both sides touch it
+/// uncontended for nanoseconds.
+pub struct LoadPublisher(Arc<Mutex<LoadSnapshot>>);
 
 impl LoadPublisher {
     pub(crate) fn publish(&self, snapshot: LoadSnapshot) {
-        // `send_replace` ignores dropped receivers: the scheduler runs
-        // whether or not anyone watches the feed.
-        self.0.send_replace(snapshot);
+        *self.0.lock().expect("load cell poisoned") = snapshot;
     }
 }
 
@@ -60,7 +67,7 @@ pub struct PartitionHandle {
     intake_tx: crossbeam_channel::Sender<IntakeTicket>,
     control_tx: crossbeam_channel::Sender<EngineControlRequest>,
     steps: Option<StepReceiver>,
-    load_rx: watch::Receiver<LoadSnapshot>,
+    load: Arc<Mutex<LoadSnapshot>>,
     next_id: AtomicU64,
     /// Kept so tickets minted after the scheduler thread exits still get
     /// their drop-bomb terminal delivered (the ticket needs a live sender).
@@ -97,10 +104,11 @@ impl PartitionHandle {
         self.steps.take()
     }
 
-    /// Live load feed. Awaiting `changed` wakes at most once per scheduler
-    /// step under load and stays quiet when idle.
-    pub fn load_watch(&self) -> watch::Receiver<LoadSnapshot> {
-        self.load_rx.clone()
+    /// The scheduler's most recent load snapshot. Pull-only by design (see
+    /// [`LoadPublisher`]): read it at the moment you need one — routing a
+    /// request, stamping stats onto an outgoing batch, serving a scrape.
+    pub fn load(&self) -> LoadSnapshot {
+        *self.load.lock().expect("load cell poisoned")
     }
 
     /// A cloneable control-plane client for this partition, for consumers
@@ -188,13 +196,13 @@ pub fn partition_pair() -> (PartitionHandle, PartitionBackend) {
     let (intake_tx, intake_rx) = crossbeam_channel::unbounded();
     let (control_tx, control_rx) = crossbeam_channel::unbounded();
     let (step_tx, step_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (load_tx, load_rx) = watch::channel(LoadSnapshot::default());
+    let load = Arc::new(Mutex::new(LoadSnapshot::default()));
     (
         PartitionHandle {
             intake_tx,
             control_tx,
             steps: Some(step_rx),
-            load_rx,
+            load: Arc::clone(&load),
             next_id: AtomicU64::new(0),
             step_tx: step_tx.clone(),
         },
@@ -202,7 +210,7 @@ pub fn partition_pair() -> (PartitionHandle, PartitionBackend) {
             intake: intake_rx,
             control: control_rx,
             emitter: super::emitter::StepEmitter::new(step_tx),
-            load: LoadPublisher(load_tx),
+            load: LoadPublisher(load),
         },
     )
 }
