@@ -11,10 +11,11 @@ use std::time::Instant;
 
 use pegainfer_frontend::engine::AbortReason;
 use pegainfer_frontend::engine::Engine;
-use pegainfer_frontend::engine::EngineControlError;
 use pegainfer_frontend::engine::FinishReason;
-use pegainfer_frontend::engine::LivePartition;
+use pegainfer_frontend::engine::LiveScheduler;
 use pegainfer_frontend::engine::LoadLoraAdapterRequest;
+use pegainfer_frontend::engine::LoraClient;
+use pegainfer_frontend::engine::LoraControlError;
 use pegainfer_frontend::engine::RejectReason;
 use pegainfer_frontend::engine::RequestId;
 use pegainfer_frontend::engine::RequestUpdate;
@@ -28,15 +29,18 @@ use crate::scheduler::test_support::FakeExecutor;
 use crate::scheduler::test_support::request;
 use crate::scheduler::test_support::request_with_lora;
 
-fn launch(executor: FakeExecutor, lora_control: bool) -> (LivePartition, StepCollector) {
+fn launch(
+    executor: FakeExecutor,
+    lora_control: bool,
+) -> (LiveScheduler, Option<LoraClient>, StepCollector) {
     let mut engine: Engine =
         start_with_executor(executor, 42, DEFAULT_MAX_PREFILL_TOKENS, lora_control);
-    let mut partition = engine.partitions.remove(0);
-    let steps = partition
+    let mut scheduler = engine.schedulers.remove(0);
+    let steps = scheduler
         .handle
         .take_steps()
-        .expect("fresh partition yields its step stream once");
-    (partition, StepCollector::new(steps))
+        .expect("a fresh scheduler yields its step stream once");
+    (scheduler, engine.lora, StepCollector::new(steps))
 }
 
 /// Demultiplex the step stream per request, preserving each request's update
@@ -124,7 +128,7 @@ fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
 fn unknown_lora_request_is_rejected_without_blocking_base_request() {
     let dropped = Arc::new(Mutex::new(Vec::new()));
     let executor = FakeExecutor::new(4, dropped);
-    let (partition, mut steps) = launch(executor, false);
+    let (partition, _lora, mut steps) = launch(executor, false);
 
     let unknown = partition
         .handle
@@ -157,7 +161,7 @@ fn unknown_lora_request_is_rejected_without_blocking_base_request() {
 fn decode_error_fails_the_request_and_scheduler_recovers() {
     let dropped = Arc::new(Mutex::new(Vec::new()));
     let executor = FakeExecutor::new(4, Arc::clone(&dropped)).with_decode_failure();
-    let (partition, mut steps) = launch(executor, false);
+    let (partition, _lora, mut steps) = launch(executor, false);
 
     let will_fail = partition.handle.submit(request(16, 2));
     let (tokens, terminal) = steps.collect_terminal(will_fail.id());
@@ -200,7 +204,7 @@ fn decode_error_fails_the_request_and_scheduler_recovers() {
 fn same_step_finishes_all_reach_their_terminals() {
     let dropped = Arc::new(Mutex::new(Vec::new()));
     let executor = FakeExecutor::new(8, Arc::clone(&dropped));
-    let (partition, mut steps) = launch(executor, false);
+    let (partition, _lora, mut steps) = launch(executor, false);
 
     // Identical shapes: all three prefill in one step and finish together on
     // the same decode step, exercising the multi-retire path.
@@ -230,7 +234,7 @@ fn aborted_request_retires_silently_and_frees_engine_state() {
     let dropped = Arc::new(Mutex::new(Vec::new()));
     let executor =
         FakeExecutor::new(64, Arc::clone(&dropped)).with_decode_delay(Duration::from_millis(5));
-    let (partition, mut steps) = launch(executor, false);
+    let (partition, _lora, mut steps) = launch(executor, false);
 
     // Long enough to still be decoding when the abort lands, small enough to
     // fit the fake's per-request block cap.
@@ -265,22 +269,20 @@ fn aborted_request_retires_silently_and_frees_engine_state() {
 fn lora_control_unloads_adapter_when_idle() {
     let dropped = Arc::new(Mutex::new(Vec::new()));
     let executor = FakeExecutor::new(4, dropped).with_lora_adapters(&["adapter-a"]);
-    let (partition, _steps) = launch(executor, true);
-    let control = partition.handle.control_client();
+    let (_partition, lora, _steps) = launch(executor, true);
+    let control = lora.expect("lora engine exposes a client");
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("build runtime");
     runtime
-        .block_on(control.unload_lora_adapter(UnloadLoraAdapterRequest {
+        .block_on(control.unload(UnloadLoraAdapterRequest {
             lora_name: "adapter-a".to_string(),
             lora_int_id: None,
         }))
         .expect("unload adapter");
     assert_eq!(
-        runtime
-            .block_on(control.list_lora_adapters())
-            .expect("list adapters"),
+        runtime.block_on(control.list()).expect("list adapters"),
         Vec::<String>::new()
     );
 }
@@ -289,7 +291,7 @@ fn lora_control_unloads_adapter_when_idle() {
 fn lora_control_waits_until_scheduler_idle() {
     let dropped = Arc::new(Mutex::new(Vec::new()));
     let executor = FakeExecutor::new(4, dropped).with_decode_delay(Duration::from_millis(80));
-    let (partition, mut steps) = launch(executor, true);
+    let (partition, lora, mut steps) = launch(executor, true);
 
     let long_running = partition.handle.submit(request(16, 3));
     let first = steps.next_for(long_running.id());
@@ -301,12 +303,12 @@ fn lora_control_waits_until_scheduler_idle() {
 
     let load_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let load_done_thread = Arc::clone(&load_done);
-    let control = partition.handle.control_client();
+    let control = lora.expect("lora engine exposes a client");
     let load_thread = std::thread::spawn(move || {
         let result = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("build runtime")
-            .block_on(control.load_lora_adapter(LoadLoraAdapterRequest {
+            .block_on(control.load(LoadLoraAdapterRequest {
                 lora_name: "adapter-a".to_string(),
                 lora_path: "/tmp/adapter-a".into(),
                 load_inplace: false,
@@ -328,5 +330,5 @@ fn lora_control_waits_until_scheduler_idle() {
         .join()
         .expect("join load thread")
         .expect_err("adapter load should be a stub error");
-    assert!(matches!(error, EngineControlError::OperationFailed(_)));
+    assert!(matches!(error, LoraControlError::Failed(_)));
 }

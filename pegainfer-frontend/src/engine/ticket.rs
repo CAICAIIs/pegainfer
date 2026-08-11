@@ -56,7 +56,7 @@ impl HandleCore {
 }
 
 /// A submitted request the scheduler has not yet answered. Minted only by
-/// [`super::PartitionHandle::submit`]; consumed by exactly one of
+/// [`super::SchedulerHandle::submit`]; consumed by exactly one of
 /// [`super::StepEmitter::admit`], [`super::StepEmitter::reject`], or
 /// [`super::StepEmitter::retire_ticket`].
 pub struct IntakeTicket {
@@ -293,7 +293,7 @@ impl Drop for DeferredFinish {
 }
 
 /// The frontend's per-request cancel handle, returned by
-/// [`super::PartitionHandle::submit`]. Flipping the reason is the only abort
+/// [`super::SchedulerHandle::submit`]. Flipping the reason is the only abort
 /// mechanism: the scheduler observes it and retires the request reactively;
 /// no channel is closed.
 pub struct RequestControl {

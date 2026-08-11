@@ -73,11 +73,11 @@ fn write_zero_lora_adapter(path: &Path, config: &ModelConfig, rank: usize) {
 }
 
 fn load_adapter(engine: &EngineHarness, adapter_name: &str, adapter_path: PathBuf) {
-    let control = engine.control_client();
+    let control = engine.lora_client();
     tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("build runtime")
-        .block_on(control.load_lora_adapter(LoadLoraAdapterRequest {
+        .block_on(control.load(LoadLoraAdapterRequest {
             lora_name: adapter_name.to_string(),
             lora_path: adapter_path,
             load_inplace: false,
@@ -147,7 +147,6 @@ fn qwen3_lora_loads_rank_and_generates(rank: usize, adapter_name: &str) {
         .expect("start LoRA-capable Qwen3 engine"),
     );
 
-    assert!(engine.info.lora_control);
     load_adapter(&engine, adapter_name, adapter_dir.path().to_path_buf());
 
     let tokenizer = common::load_tokenizer(&model_path);

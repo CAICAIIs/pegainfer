@@ -409,11 +409,10 @@ async fn frontend_rejects_engine_partition_mismatch() -> Result<()> {
 }
 
 // The old "mounted LoRA routes report unsupported" sim test is gone by
-// construction: `serve_model_with_lora_routes` now requires a step-contract
-// `Engine` (it needs a `ControlClient`), which the simulated handle engine
-// cannot provide. The unsupported-control HTTP mapping is pinned by the
-// `vllm::lora` route tests; the engine-side rejection by the qwen3 adapter's
-// `control_is_unsupported_without_lora_serving` contract test.
+// construction: `serve_model_with_lora_routes` now requires an `Engine` whose
+// `lora` capability is `Some(LoraClient)` — the `Option` is the capability —
+// and the simulated handle engine cannot provide one. The gone-engine HTTP
+// mapping is pinned by the `vllm::lora` route tests.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn non_streaming_completion_returns_nonempty_output_for_positive_max_tokens() -> Result<()> {

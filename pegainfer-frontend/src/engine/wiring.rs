@@ -1,15 +1,19 @@
-//! Wiring between one frontend and one scheduler partition, plus the engine
-//! bundle a model line hands back from `launch`.
+//! Wiring between one frontend and one scheduler, plus the engine bundle a
+//! model line hands back from `launch`.
 //!
-//! Both ends of a partition are minted together by [`partition_pair`], so a
+//! Both ends of a scheduler are minted together by [`scheduler_pair`], so a
 //! model crate cannot cross-wire or forget a line: the scheduler side arrives
-//! as one [`PartitionBackend`] value, the frontend side as one
-//! [`PartitionHandle`]. Channel choices per direction: intake and control are
-//! crossbeam (sync consumer on the scheduler thread; senders never block on
-//! unbounded channels), the step stream is tokio (async consumer in the
-//! protocol stack; the sync producer's send never blocks either), load is a
-//! shared cell (read-only pull, deliberately unsubscribable — see
-//! [`LoadPublisher`]).
+//! as one [`SchedulerBackend`] value, the frontend side as one
+//! [`SchedulerHandle`]. Channel choices per direction: intake is crossbeam
+//! (sync consumer on the scheduler thread; senders never block on unbounded
+//! channels), the step stream is tokio (async consumer in the protocol
+//! stack; the sync producer's send never blocks either), load is a shared
+//! cell (read-only pull, deliberately unsubscribable — see [`LoadPublisher`]).
+//!
+//! How many schedulers an engine runs and what each one means (DP replicas,
+//! anything else) is the model line's decision; the contract carries the
+//! collection and attaches no rank semantics to it. Placement across
+//! schedulers is frontend policy.
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -18,13 +22,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use tokio::sync::oneshot;
-
-use super::control::EngineControlError;
-use super::control::EngineControlRequest;
-use super::control::EngineControlResult;
-use super::control::LoadLoraAdapterRequest;
-use super::control::UnloadLoraAdapterRequest;
+use super::control::LoraClient;
 use super::handle::LoadSnapshot;
 use super::kv::KvCapacity;
 use super::step::Request;
@@ -37,19 +35,18 @@ use super::ticket::StepReceiver;
 /// Everything the scheduler thread consumes and produces. The driver
 /// ([`super::drive`]) destructures this; model code only ever sees the
 /// emitter and, through trait arguments, the tickets.
-pub struct PartitionBackend {
+pub struct SchedulerBackend {
     pub(crate) intake: crossbeam_channel::Receiver<IntakeTicket>,
-    pub(crate) control: crossbeam_channel::Receiver<EngineControlRequest>,
     pub(crate) emitter: super::emitter::StepEmitter,
     pub(crate) load: LoadPublisher,
 }
 
-/// Sole writer of a partition's load cell; the driver publishes once per
+/// Sole writer of a scheduler's load cell; the driver publishes once per
 /// iteration from [`super::Scheduler::load`].
 ///
 /// Deliberately a plain cell and not a `watch` channel: the driver busy-polls,
 /// so a subscription edge (`changed()`) would fire per spin and turn any
-/// subscriber into a message flood at idle. With only [`PartitionHandle::load`]
+/// subscriber into a message flood at idle. With only [`SchedulerHandle::load`]
 /// to read it, "notify me on load change" is unrepresentable — consumers pull
 /// the snapshot at the moment they need one. A `Mutex` (not per-field atomics)
 /// so a reader never sees fields torn across two steps; both sides touch it
@@ -62,10 +59,9 @@ impl LoadPublisher {
     }
 }
 
-/// The frontend's end of one scheduler partition.
-pub struct PartitionHandle {
+/// The frontend's end of one running scheduler.
+pub struct SchedulerHandle {
     intake_tx: crossbeam_channel::Sender<IntakeTicket>,
-    control_tx: crossbeam_channel::Sender<EngineControlRequest>,
     steps: Option<StepReceiver>,
     load: Arc<Mutex<LoadSnapshot>>,
     next_id: AtomicU64,
@@ -74,7 +70,7 @@ pub struct PartitionHandle {
     step_tx: super::ticket::StepSender,
 }
 
-impl PartitionHandle {
+impl SchedulerHandle {
     /// Mint identity, queue timestamp, and abort flag, then hand the request
     /// to the scheduler. Never fails: if the scheduler is gone, the ticket's
     /// drop bomb answers the request with a `Failed` terminal on the step
@@ -110,122 +106,46 @@ impl PartitionHandle {
     pub fn load(&self) -> LoadSnapshot {
         *self.load.lock().expect("load cell poisoned")
     }
-
-    /// A cloneable control-plane client for this partition, for consumers
-    /// (LoRA routes) that outlive or share the handle.
-    pub fn control_client(&self) -> ControlClient {
-        ControlClient {
-            tx: self.control_tx.clone(),
-        }
-    }
 }
 
-/// Async client for a partition's control plane. Requests reach
-/// [`super::Scheduler::control`] through the driver; the base trait
-/// implementation answers every one with the unsupported sentinel, which maps
-/// back to [`EngineControlError::Unsupported`] here.
-#[derive(Clone)]
-pub struct ControlClient {
-    tx: crossbeam_channel::Sender<EngineControlRequest>,
-}
-
-impl ControlClient {
-    pub async fn load_lora_adapter(
-        &self,
-        request: LoadLoraAdapterRequest,
-    ) -> EngineControlResult<()> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.send_control(
-            EngineControlRequest::LoadLoraAdapter {
-                request,
-                response_tx,
-            },
-            response_rx,
-        )
-        .await
-    }
-
-    pub async fn unload_lora_adapter(
-        &self,
-        request: UnloadLoraAdapterRequest,
-    ) -> EngineControlResult<()> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.send_control(
-            EngineControlRequest::UnloadLoraAdapter {
-                request,
-                response_tx,
-            },
-            response_rx,
-        )
-        .await
-    }
-
-    pub async fn list_lora_adapters(&self) -> EngineControlResult<Vec<String>> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.send_control(
-            EngineControlRequest::ListLoraAdapters { response_tx },
-            response_rx,
-        )
-        .await
-    }
-
-    async fn send_control<T>(
-        &self,
-        request: EngineControlRequest,
-        response_rx: oneshot::Receiver<Result<T, String>>,
-    ) -> EngineControlResult<T> {
-        self.tx
-            .send(request)
-            .map_err(|_| EngineControlError::ChannelClosed)?;
-        let response = response_rx
-            .await
-            .map_err(|_| EngineControlError::ChannelClosed)?;
-        match response {
-            Ok(value) => Ok(value),
-            Err(message) if message == super::control::UNSUPPORTED_CONTROL_MESSAGE => Err(
-                EngineControlError::Unsupported(super::control::UNSUPPORTED_CONTROL_MESSAGE),
-            ),
-            Err(message) => Err(EngineControlError::OperationFailed(message)),
-        }
-    }
-}
-
-/// Mint both ends of one partition.
+/// Mint both ends of one scheduler's wiring.
 #[must_use]
-pub fn partition_pair() -> (PartitionHandle, PartitionBackend) {
+pub fn scheduler_pair() -> (SchedulerHandle, SchedulerBackend) {
     let (intake_tx, intake_rx) = crossbeam_channel::unbounded();
-    let (control_tx, control_rx) = crossbeam_channel::unbounded();
     let (step_tx, step_rx) = tokio::sync::mpsc::unbounded_channel();
     let load = Arc::new(Mutex::new(LoadSnapshot::default()));
     (
-        PartitionHandle {
+        SchedulerHandle {
             intake_tx,
-            control_tx,
             steps: Some(step_rx),
             load: Arc::clone(&load),
             next_id: AtomicU64::new(0),
             step_tx: step_tx.clone(),
         },
-        PartitionBackend {
+        SchedulerBackend {
             intake: intake_rx,
-            control: control_rx,
             emitter: super::emitter::StepEmitter::new(step_tx),
             load: LoadPublisher(load),
         },
     )
 }
 
-/// What `ModelLine::launch` returns for a step-driven engine. Required fields
-/// are the onboarding checklist: an engine that reports no capacity or no
+/// What `ModelLine::launch` returns for a step-driven engine — a handoff
+/// package the protocol stack dissolves at wiring time. Required fields are
+/// the onboarding checklist: an engine that reports no capacity or no
 /// servable length says so explicitly with `None`, it cannot just forget.
 pub struct Engine {
-    /// One entry per scheduler partition (logical DP rank).
-    pub partitions: Vec<LivePartition>,
+    /// The engine's running schedulers, one handle each. How many and what
+    /// they mean is the model line's business.
+    pub schedulers: Vec<LiveScheduler>,
     pub info: EngineInfo,
+    /// LoRA adapter control, for engines that serve it. The `Option` is the
+    /// capability — no separate flag exists to disagree with it.
+    pub lora: Option<LoraClient>,
 }
 
-pub struct LivePartition {
-    pub handle: PartitionHandle,
+pub struct LiveScheduler {
+    pub handle: SchedulerHandle,
     /// The driver thread. Joined by the server at shutdown, after the handles
     /// (and with them the intake senders) are dropped.
     pub join: std::thread::JoinHandle<()>,
@@ -259,7 +179,4 @@ pub struct EngineInfo {
     /// Longest servable request in tokens, or an explicit `None` to leave the
     /// protocol stack's max-length validation at the model context window.
     pub servable_len: Option<u32>,
-    /// Whether the engine answers LoRA control requests, gating the
-    /// `/v1/{load,unload}_lora_adapter` routes.
-    pub lora_control: bool,
 }

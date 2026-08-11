@@ -48,11 +48,11 @@ use super::stop_sentinel_id;
 use crate::engine::AbortReason;
 use crate::engine::FinishReason;
 use crate::engine::KvCapacity;
-use crate::engine::PartitionHandle;
 use crate::engine::Request;
 use crate::engine::RequestControl;
 use crate::engine::RequestId;
 use crate::engine::RequestUpdate;
+use crate::engine::SchedulerHandle;
 use crate::engine::StepOutputs;
 use crate::engine::Terminal;
 use crate::vllm::wire::convert_finish_reason;
@@ -64,7 +64,7 @@ use crate::vllm::wire::to_wire_position_logprobs;
 pub(crate) struct SteppedEngineBridge {
     pub(crate) input_address: String,
     pub(crate) output_address: String,
-    pub(crate) partition: PartitionHandle,
+    pub(crate) scheduler: SchedulerHandle,
     pub(crate) kv_capacity: Option<KvCapacity>,
     pub(crate) max_model_len: u32,
     pub(crate) engine_index: u32,
@@ -74,7 +74,7 @@ pub(crate) struct SteppedEngineBridge {
 impl SteppedEngineBridge {
     pub(crate) async fn run(mut self, shutdown: CancellationToken) -> Result<()> {
         let mut steps = self
-            .partition
+            .scheduler
             .take_steps()
             .context("partition step stream already taken")?;
         // Stats are pull-at-send: no push task, the load cell is read when a
@@ -99,7 +99,7 @@ impl SteppedEngineBridge {
             &output_tx,
             RequestBatchOutputs {
                 engine_index: self.engine_index,
-                scheduler_stats: Some(Box::new(scheduler_stats_from(self.partition.load()))),
+                scheduler_stats: Some(Box::new(scheduler_stats_from(self.scheduler.load()))),
                 timestamp: now_secs_f64(),
                 ..Default::default()
             }
@@ -225,7 +225,7 @@ impl SteppedEngineBridge {
                 engine_index: self.engine_index,
                 outputs,
                 finished_requests: (!finished_requests.is_empty()).then_some(finished_requests),
-                scheduler_stats: Some(Box::new(scheduler_stats_from(self.partition.load()))),
+                scheduler_stats: Some(Box::new(scheduler_stats_from(self.scheduler.load()))),
                 timestamp: now_secs_f64(),
             }
             .into(),
@@ -383,7 +383,7 @@ impl SteppedEngineBridge {
             Span::noop()
         };
         let trace_parent = SpanContext::from_span(&trace_root);
-        let control = self.partition.submit(Request {
+        let control = self.scheduler.submit(Request {
             prompt_tokens,
             params: convert_sampling(&sampling_params),
             max_tokens: sampling_params.max_tokens as usize,

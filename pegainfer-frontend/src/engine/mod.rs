@@ -8,9 +8,11 @@
 //!   consumed) that make the event protocol a move-checked state machine.
 //! - [`emitter`] — `StepEmitter`, the scheduler-side single writer of the
 //!   per-step buffer.
-//! - [`partition`] — `partition_pair` wiring, `PartitionHandle`, and the
+//! - [`wiring`] — `scheduler_pair` wiring, `SchedulerHandle`, and the
 //!   `Engine`/`EngineInfo` bundle a model line's `launch` returns.
 //! - [`driver`] — the `Scheduler` trait and the polling `drive` loop.
+//! - [`control`] — the LoRA adapter capability: vocabulary + client, outside
+//!   the scheduler contract (engines mint their own channel before spawn).
 //!
 //! Legacy per-token contract, kept until the remaining model lines migrate:
 //!
@@ -18,8 +20,6 @@
 //! - [`sink`] — the per-request `TokenSink` over the shared tagged channel.
 //! - [`kv`] — KV-prefix resolution.
 //! - [`handle`] — `EngineHandle`: routing, load feed, shutdown.
-//!
-//! [`control`] (the LoRA control plane) is shared by both contracts.
 //!
 //! Everything is re-exported flat here, so `pegainfer_frontend::engine::X`
 //! paths are unchanged by the split.
@@ -30,11 +30,11 @@ mod emitter;
 mod event;
 mod handle;
 mod kv;
-mod partition;
 mod request;
 mod sink;
 mod step;
 mod ticket;
+mod wiring;
 
 pub use control::*;
 pub use driver::*;
@@ -42,8 +42,8 @@ pub use emitter::*;
 pub use event::*;
 pub use handle::*;
 pub use kv::*;
-pub use partition::*;
 pub use request::*;
 pub use sink::*;
 pub use step::*;
 pub use ticket::*;
+pub use wiring::*;

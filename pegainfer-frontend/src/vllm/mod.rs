@@ -141,12 +141,12 @@ pub async fn serve_model_with_lora_routes(
 ) -> Result<()> {
     let model_id = model_id.into();
     let adapter_names = Arc::new(RwLock::new(HashSet::new()));
+    // The Option is the capability: only engines that minted a LoRA channel
+    // can serve these routes.
     let control = engine
-        .partitions
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("LoRA serving requires at least one scheduler partition"))?
-        .handle
-        .control_client();
+        .lora
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("engine does not expose LoRA adapter control"))?;
     load_startup_lora_modules(&control, &adapter_names, &lora_modules).await?;
     let base_model_name = served_model_name
         .first()
@@ -243,7 +243,7 @@ where
             };
             let mut bridges = tokio::task::JoinSet::new();
             // Stepped engines own their scheduler threads; reaped below after
-            // the bridges (and with them the partition handles) are gone.
+            // the bridges (and with them the scheduler handles) are gone.
             let mut scheduler_joins: Vec<std::thread::JoinHandle<()>> = Vec::new();
             match launched {
                 LaunchedEngine::Handle(handle) => {
@@ -273,23 +273,23 @@ where
                     drop(handle);
                 }
                 LaunchedEngine::Stepped(engine) => {
-                    let actual_partitions = engine.partitions.len();
-                    if actual_partitions != engine_count {
+                    let actual_schedulers = engine.schedulers.len();
+                    if actual_schedulers != engine_count {
                         server_shutdown.cancel();
                         anyhow::bail!(
                             "frontend declared {engine_count} engines but the launched engine \
-                             exposes {actual_partitions} scheduler partitions"
+                             exposes {actual_schedulers} schedulers"
                         );
                     }
                     let info = engine.info;
                     let servable_limit = info.servable_len.map(|cap| max_model_len.min(cap));
                     let max_model_len = servable_limit.unwrap_or(max_model_len);
-                    for (engine_index, partition) in engine.partitions.into_iter().enumerate() {
-                        scheduler_joins.push(partition.join);
+                    for (engine_index, scheduler) in engine.schedulers.into_iter().enumerate() {
+                        scheduler_joins.push(scheduler.join);
                         let bridge = bridge::SteppedEngineBridge {
                             input_address: input_address.clone(),
                             output_address: output_address.clone(),
-                            partition: partition.handle,
+                            scheduler: scheduler.handle,
                             kv_capacity: info.kv_capacity,
                             max_model_len,
                             engine_index: engine_index as u32,

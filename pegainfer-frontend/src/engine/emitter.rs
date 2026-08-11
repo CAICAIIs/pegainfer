@@ -233,9 +233,9 @@ impl StepEmitter {
 
 #[cfg(test)]
 mod tests {
-    use super::super::partition::partition_pair;
     use super::super::step::Request;
     use super::super::step::Terminal;
+    use super::super::wiring::scheduler_pair;
     use super::*;
 
     fn request(prompt: Vec<u32>) -> Request {
@@ -254,7 +254,7 @@ mod tests {
 
     #[test]
     fn admission_tokens_and_finish_fold_into_one_entry() {
-        let (handle, mut backend) = partition_pair();
+        let (handle, mut backend) = scheduler_pair();
         let _control = handle.submit(request(vec![1, 2, 3]));
         let ticket = backend.intake.try_recv().expect("ticket");
 
@@ -287,7 +287,7 @@ mod tests {
 
     #[test]
     fn reject_carries_prompt_len_and_no_tokens() {
-        let (handle, mut backend) = partition_pair();
+        let (handle, mut backend) = scheduler_pair();
         let _control = handle.submit(request(vec![1; 5]));
         let ticket = backend.intake.try_recv().expect("ticket");
         backend.emitter.reject(
@@ -315,7 +315,7 @@ mod tests {
 
     #[test]
     fn retire_discards_buffered_output() {
-        let (handle, mut backend) = partition_pair();
+        let (handle, mut backend) = scheduler_pair();
         let _control = handle.submit(request(vec![1]));
         let ticket = backend.intake.try_recv().expect("ticket");
         let mut active = backend.emitter.admit(ticket);
@@ -330,7 +330,7 @@ mod tests {
 
     #[test]
     fn defer_finish_folds_step_output_and_delivers_late() {
-        let (handle, mut backend) = partition_pair();
+        let (handle, mut backend) = scheduler_pair();
         let _control = handle.submit(request(vec![1, 2]));
         let ticket = backend.intake.try_recv().expect("ticket");
         let mut active = backend.emitter.admit(ticket);
@@ -362,7 +362,7 @@ mod tests {
 
     #[test]
     fn dropped_handles_answer_with_failed_terminals() {
-        let (handle, mut backend) = partition_pair();
+        let (handle, mut backend) = scheduler_pair();
         let _c0 = handle.submit(request(vec![1]));
         let _c1 = handle.submit(request(vec![2, 3]));
         let dropped_ticket = backend.intake.try_recv().expect("ticket 0");
@@ -385,7 +385,7 @@ mod tests {
 
     #[test]
     fn abort_flag_is_visible_through_both_states() {
-        let (handle, mut backend) = partition_pair();
+        let (handle, mut backend) = scheduler_pair();
         let control = handle.submit(request(vec![1]));
         let ticket = backend.intake.try_recv().expect("ticket");
         assert!(ticket.aborted().is_none());
@@ -405,7 +405,7 @@ mod tests {
 
     #[test]
     fn submit_to_a_dead_scheduler_fails_the_request() {
-        let (handle, backend) = partition_pair();
+        let (handle, backend) = scheduler_pair();
         drop(backend);
         let _control = handle.submit(request(vec![1, 2, 3, 4]));
         let step = handle_steps(handle).try_recv().expect("drop-bomb message");
@@ -418,7 +418,7 @@ mod tests {
         ));
     }
 
-    fn handle_steps(mut handle: super::super::partition::PartitionHandle) -> StepReceiver {
+    fn handle_steps(mut handle: super::super::wiring::SchedulerHandle) -> StepReceiver {
         handle.take_steps().expect("step stream not yet taken")
     }
 }

@@ -2,7 +2,7 @@
 //! file.
 //!
 //! [`Qwen3Scheduler`] implements [`pegainfer_frontend::engine::Scheduler`]:
-//! the contract's driver polls `intake`/`step`/`load`/`control`; everything
+//! the contract's driver polls `intake`/`step`/`load`; everything
 //! south of here ([`crate::scheduler`], the executor) is contract-free and
 //! deals in internal ids and pure effect data. This file owns the only two
 //! contract-facing responsibilities:
@@ -33,16 +33,18 @@ use log::warn;
 use pegainfer_frontend::engine::ActiveRequest;
 use pegainfer_frontend::engine::DeferredFinish;
 use pegainfer_frontend::engine::Engine;
-use pegainfer_frontend::engine::EngineControlRequest;
 use pegainfer_frontend::engine::EngineInfo;
 use pegainfer_frontend::engine::IntakeTicket;
 use pegainfer_frontend::engine::KvCapacity;
 use pegainfer_frontend::engine::LoadSnapshot;
+use pegainfer_frontend::engine::LoraClient;
+use pegainfer_frontend::engine::LoraControl;
+use pegainfer_frontend::engine::LoraControlReceiver;
 use pegainfer_frontend::engine::PromptEcho;
 use pegainfer_frontend::engine::RejectReason;
 use pegainfer_frontend::engine::Scheduler;
 use pegainfer_frontend::engine::StepEmitter;
-use pegainfer_frontend::engine::spawn_partition;
+use pegainfer_frontend::engine::spawn_scheduler;
 use pegainfer_kernels::ops::NumericPolicy;
 use pegainfer_kernels::ops::numeric_policy;
 use rand::SeedableRng;
@@ -164,7 +166,7 @@ pub(crate) fn start_qwen3_with_lora_control(
 }
 
 /// Wrap a ready executor in the scheduler and hand the whole thing to the
-/// contract: one partition, one driver thread, required metadata filled in.
+/// contract: one scheduler, one driver thread, required metadata filled in.
 pub(crate) fn start_with_executor<E>(
     executor: E,
     seed: u64,
@@ -191,14 +193,22 @@ where
         total_blocks: kv_total as usize,
         block_size: executor.block_size(),
     };
-    let scheduler = Qwen3Scheduler::new(executor, seed, max_prefill_tokens, kv_total, lora_control);
+    // The LoRA channel is qwen3's private wiring, minted before the thread
+    // swallows the scheduler; the contract only carries the client.
+    let (lora, lora_rx) = if lora_control {
+        let (client, rx) = LoraClient::channel();
+        (Some(client), Some(rx))
+    } else {
+        (None, None)
+    };
+    let scheduler = Qwen3Scheduler::new(executor, seed, max_prefill_tokens, kv_total, lora_rx);
     Engine {
-        partitions: vec![spawn_partition("qwen3-scheduler", scheduler)],
+        schedulers: vec![spawn_scheduler("qwen3-scheduler", scheduler)],
         info: EngineInfo {
             kv_capacity: Some(kv_capacity),
             servable_len: Some(servable),
-            lora_control,
         },
+        lora,
     }
 }
 
@@ -217,7 +227,6 @@ pub(crate) struct Qwen3Scheduler<E: ModelExecutor> {
     rng: StdRng,
     max_prefill_tokens: usize,
     kv_total: u64,
-    lora_control: bool,
     next_request_id: u64,
     /// Contract handle per live request, keyed by the internal id every
     /// queue and effect uses. Entries leave exactly at terminal transitions.
@@ -237,10 +246,14 @@ pub(crate) struct Qwen3Scheduler<E: ModelExecutor> {
     /// Decode-overlap async prefill: pending requests whose prefill is
     /// in-flight on the prefill overlap stream.
     inflight_prefill_pending: Option<Vec<PendingRequest>>,
-    /// Control commands wait here until the scheduler drains idle; generation
-    /// submitted behind a pending control waits in `post_control_deferred` so
-    /// it cannot run against an adapter set the control was about to change.
-    pending_control: VecDeque<EngineControlRequest>,
+    /// The engine's private LoRA channel, minted before spawn; `None` when
+    /// this engine serves no adapter control. Drained at the top of every
+    /// step into `pending_control`.
+    lora_rx: Option<LoraControlReceiver>,
+    /// LoRA commands wait here until the scheduler drains idle; generation
+    /// submitted behind a pending command waits in `post_control_deferred` so
+    /// it cannot run against an adapter set the command was about to change.
+    pending_control: VecDeque<LoraControl>,
     post_control_deferred: Vec<PendingRequest>,
 }
 
@@ -250,14 +263,13 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
         seed: u64,
         max_prefill_tokens: usize,
         kv_total: u64,
-        lora_control: bool,
+        lora_rx: Option<LoraControlReceiver>,
     ) -> Self {
         Self {
             executor,
             rng: StdRng::seed_from_u64(seed),
             max_prefill_tokens,
             kv_total,
-            lora_control,
             next_request_id: 0,
             handles: HashMap::new(),
             tracker: PhaseTracker::default(),
@@ -266,6 +278,7 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
             prefilling: Vec::new(),
             active: Vec::new(),
             inflight_prefill_pending: None,
+            lora_rx,
             pending_control: VecDeque::new(),
             post_control_deferred: Vec::new(),
         }
@@ -657,7 +670,15 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
     }
 
     fn step(&mut self, emitter: &mut StepEmitter) -> Result<()> {
-        // 0. Poll in-flight async prefill (decode-overlap mode).
+        // 0. Pull queued LoRA commands off the engine's private channel; they
+        // apply only once the scheduler drains idle (`drain_idle_control`).
+        if let Some(lora_rx) = &self.lora_rx {
+            while let Ok(control) = lora_rx.try_recv() {
+                self.pending_control.push_back(control);
+            }
+        }
+
+        // 1. Poll in-flight async prefill (decode-overlap mode).
         if self.inflight_prefill_pending.is_some()
             && let Some(prefill_result) = self.executor.poll_async_prefill()
         {
@@ -677,7 +698,7 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
             self.apply_effects(effects, emitter);
         }
 
-        // 1. Reclaim settled prefetches, then offer fresh requests to
+        // 2. Reclaim settled prefetches, then offer fresh requests to
         // prefetch. Control commands gate generation, so only offer once no
         // control is pending (a prefetch must not race ahead of an adapter
         // load it depends on).
@@ -697,7 +718,7 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
             );
         }
 
-        // 2. Once idle, apply pending control commands before admitting newer
+        // 3. Once idle, apply pending control commands before admitting newer
         // generation requests that arrived behind them.
         if self.idle() {
             self.drain_idle_control();
@@ -706,7 +727,7 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
             }
         }
 
-        // 3. Still nothing runnable → wait on an in-flight prefetch DMA (its
+        // 4. Still nothing runnable → wait on an in-flight prefetch DMA (its
         // request prefills next), else hand control back to the polling
         // driver.
         if self.idle() {
@@ -723,7 +744,7 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
             return Ok(());
         }
 
-        // 4. Validate + admit; every verdict consumes the request's ticket.
+        // 5. Validate + admit; every verdict consumes the request's ticket.
         let lora_validation =
             reject_unknown_lora_requests(std::mem::take(&mut self.deferred), &self.executor);
         for rejected in &lora_validation.rejected {
@@ -757,7 +778,7 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
             }
         }
 
-        // 5. Chunk selection. While an async prefill is in flight, only
+        // 6. Chunk selection. While an async prefill is in flight, only
         // decode runs.
         let pending = if self.inflight_prefill_pending.is_some() {
             Vec::new()
@@ -783,7 +804,7 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
             return Ok(());
         };
 
-        // 6. Decode-overlap path: when a Unified plan appears and overlap
+        // 7. Decode-overlap path: when a Unified plan appears and overlap
         // streams are active (and no async prefill is already in-flight),
         // execute_unified internally uses SplitConcurrent which only syncs
         // decode and defers the prefill sync. The prefill result is polled at
@@ -822,7 +843,7 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
             return Ok(());
         }
 
-        // 7. Execute, resolve, apply. A step failure kills the touched batch
+        // 8. Execute, resolve, apply. A step failure kills the touched batch
         // but not the engine.
         let targets = failure_target_ids(&self.active, &plan);
         let artifacts =
@@ -858,17 +879,6 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
                 + self.post_control_deferred.len()) as u64,
         }
     }
-
-    fn control(&mut self, request: EngineControlRequest) {
-        if !self.lora_control {
-            pegainfer_frontend::engine::reject_unsupported_control(request);
-            return;
-        }
-        // Queued; applied by `step` once the scheduler drains idle, so an
-        // adapter swap can never race in-flight generation that depends on
-        // the current adapter set.
-        self.pending_control.push_back(request);
-    }
 }
 
 /// Widen a mechanics-side admission verdict into the contract's typed reason:
@@ -892,39 +902,33 @@ fn contract_reject_reason(req: &PendingRequest, reason: AdmissionReject) -> Reje
     }
 }
 
-fn handle_control_request(executor: &mut impl ModelExecutor, control: EngineControlRequest) {
+fn handle_control_request(executor: &mut impl ModelExecutor, control: LoraControl) {
     match control {
-        EngineControlRequest::LoadLoraAdapter {
-            request,
-            response_tx,
-        } => {
+        LoraControl::Load { request, reply } => {
             info!(
-                "LoRA adapter load requested while scheduler is idle: name={}, path={}",
+                "LoRA adapter load applied while scheduler is idle: name={}, path={}",
                 request.lora_name,
                 request.lora_path.display()
             );
-            let _ = response_tx.send(
+            let _ = reply.send(
                 executor
                     .load_lora_adapter(&request)
                     .map_err(|error| error.to_string()),
             );
         }
-        EngineControlRequest::UnloadLoraAdapter {
-            request,
-            response_tx,
-        } => {
+        LoraControl::Unload { request, reply } => {
             info!(
-                "LoRA adapter unload requested while scheduler is idle: name={}",
+                "LoRA adapter unload applied while scheduler is idle: name={}",
                 request.lora_name
             );
-            let _ = response_tx.send(
+            let _ = reply.send(
                 executor
                     .unload_lora_adapter(&request)
                     .map_err(|error| error.to_string()),
             );
         }
-        EngineControlRequest::ListLoraAdapters { response_tx } => {
-            let _ = response_tx.send(Ok(executor.list_lora_adapters()));
+        LoraControl::List { reply } => {
+            let _ = reply.send(executor.list_lora_adapters());
         }
     }
 }

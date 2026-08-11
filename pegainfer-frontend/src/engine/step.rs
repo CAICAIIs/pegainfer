@@ -15,7 +15,7 @@ use super::event::FinishReason;
 use super::event::TokenLogprob;
 
 /// In-process routing id for one generate request, minted by
-/// [`super::PartitionHandle::submit`] from a per-partition counter. `Copy` and
+/// [`super::SchedulerHandle::submit`] from a per-scheduler counter. `Copy` and
 /// integer-keyed on purpose: the external protocol's string request id stays in
 /// the protocol stack, which maps it to this id at its own boundary.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -127,7 +127,7 @@ impl RequestUpdate {
 }
 
 /// Admission facts stamped by the contract layer, never by model code:
-/// `queued_at` at [`super::PartitionHandle::submit`], `scheduled_at` at
+/// `queued_at` at [`super::SchedulerHandle::submit`], `scheduled_at` at
 /// [`super::StepEmitter::admit`]. Monotonic `Instant`s — the wall-clock
 /// rendering some protocols need (vLLM's unix floats) is the protocol stack's
 /// translation, done against its own anchor.

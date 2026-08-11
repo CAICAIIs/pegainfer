@@ -23,9 +23,9 @@ use serde::Serialize;
 use tokio::sync::RwLock;
 use tower::ServiceExt;
 
-use crate::engine::ControlClient;
-use crate::engine::EngineControlError;
 use crate::engine::LoadLoraAdapterRequest;
+use crate::engine::LoraClient;
+use crate::engine::LoraControlError;
 use crate::engine::UnloadLoraAdapterRequest;
 use crate::vllm::wire::LORA_ADAPTER_XARG;
 
@@ -33,7 +33,7 @@ const LORA_ROUTE_BODY_LIMIT: usize = 128 * 1024 * 1024;
 
 #[derive(Clone)]
 struct LoraRouteState {
-    control: ControlClient,
+    control: LoraClient,
     adapter_names: Arc<RwLock<HashSet<String>>>,
 }
 
@@ -142,7 +142,7 @@ struct ModelCardBody {
 }
 
 pub(crate) fn lora_routes(
-    control: ControlClient,
+    control: LoraClient,
     adapter_names: Arc<RwLock<HashSet<String>>>,
 ) -> Router {
     Router::new()
@@ -189,7 +189,7 @@ async fn load_lora_adapter(
     let lora_name = request.lora_name.clone();
     match state
         .control
-        .load_lora_adapter(LoadLoraAdapterRequest {
+        .load(LoadLoraAdapterRequest {
             lora_name: request.lora_name,
             lora_path: request.lora_path,
             load_inplace: request.load_inplace,
@@ -204,21 +204,14 @@ async fn load_lora_adapter(
             )
                 .into_response()
         }
-        Err(EngineControlError::Unsupported(message)) => (
-            StatusCode::NOT_FOUND,
-            Json(ErrorBody {
-                error: message.to_string(),
-            }),
-        )
-            .into_response(),
-        Err(EngineControlError::ChannelClosed) => (
+        Err(error @ LoraControlError::EngineGone) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorBody {
-                error: EngineControlError::ChannelClosed.to_string(),
+                error: error.to_string(),
             }),
         )
             .into_response(),
-        Err(EngineControlError::OperationFailed(message)) => {
+        Err(LoraControlError::Failed(message)) => {
             (StatusCode::BAD_REQUEST, Json(ErrorBody { error: message })).into_response()
         }
     }
@@ -235,7 +228,7 @@ async fn unload_lora_adapter(
     let lora_name = request.lora_name.clone();
     match state
         .control
-        .unload_lora_adapter(UnloadLoraAdapterRequest {
+        .unload(UnloadLoraAdapterRequest {
             lora_name: request.lora_name,
             lora_int_id: request.lora_int_id,
         })
@@ -249,21 +242,14 @@ async fn unload_lora_adapter(
             )
                 .into_response()
         }
-        Err(EngineControlError::Unsupported(message)) => (
-            StatusCode::NOT_FOUND,
-            Json(ErrorBody {
-                error: message.to_string(),
-            }),
-        )
-            .into_response(),
-        Err(EngineControlError::ChannelClosed) => (
+        Err(error @ LoraControlError::EngineGone) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorBody {
-                error: EngineControlError::ChannelClosed.to_string(),
+                error: error.to_string(),
             }),
         )
             .into_response(),
-        Err(EngineControlError::OperationFailed(message)) => {
+        Err(LoraControlError::Failed(message)) => {
             (StatusCode::BAD_REQUEST, Json(ErrorBody { error: message })).into_response()
         }
     }
@@ -280,13 +266,13 @@ fn bad_request(message: impl Into<String>) -> Response {
 }
 
 pub(crate) async fn load_startup_lora_modules(
-    control: &ControlClient,
+    control: &LoraClient,
     adapter_names: &Arc<RwLock<HashSet<String>>>,
     lora_modules: &[LoraModule],
 ) -> Result<()> {
     for module in lora_modules {
         control
-            .load_lora_adapter(LoadLoraAdapterRequest {
+            .load(LoadLoraAdapterRequest {
                 lora_name: module.name.clone(),
                 lora_path: module.path.clone(),
                 load_inplace: false,
@@ -422,21 +408,16 @@ async fn lora_models_response(
 mod tests {
     use super::*;
 
-    /// A control client whose partition runs no scheduler: a drain thread
-    /// answers every request with the unsupported sentinel, exactly like the
-    /// base `Scheduler::control` implementation.
-    fn unsupported_control_client() -> ControlClient {
-        let (handle, backend) = crate::engine::partition_pair();
-        let client = handle.control_client();
-        std::thread::spawn(move || {
-            while let Ok(request) = backend.control.recv() {
-                crate::engine::reject_unsupported_control(request);
-            }
-        });
+    /// A client whose engine is already gone: the receiver is dropped, so
+    /// every roundtrip answers `EngineGone`. (An engine without LoRA never
+    /// mounts these routes at all — the `Option` on `Engine::lora` is the
+    /// capability — so "unsupported" is not a reachable route state.)
+    fn gone_engine_client() -> LoraClient {
+        let (client, _rx) = LoraClient::channel();
         client
     }
 
-    fn route_state(control: ControlClient) -> LoraRouteState {
+    fn route_state(control: LoraClient) -> LoraRouteState {
         LoraRouteState {
             control,
             adapter_names: Arc::new(RwLock::new(HashSet::new())),
@@ -444,8 +425,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_lora_adapter_route_reports_unsupported_engine() {
-        let state = route_state(unsupported_control_client());
+    async fn load_lora_adapter_route_reports_gone_engine() {
+        let state = route_state(gone_engine_client());
         let response = load_lora_adapter(
             axum::extract::State(state),
             Json(LoadLoraAdapterHttpRequest {
@@ -457,12 +438,12 @@ mod tests {
         )
         .await;
 
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
     async fn load_lora_adapter_route_rejects_pr1_unsupported_fields() {
-        let state = route_state(unsupported_control_client());
+        let state = route_state(gone_engine_client());
         let response = load_lora_adapter(
             axum::extract::State(state),
             Json(LoadLoraAdapterHttpRequest {
@@ -478,8 +459,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unload_lora_adapter_route_reports_unsupported_engine() {
-        let state = route_state(unsupported_control_client());
+    async fn unload_lora_adapter_route_reports_gone_engine() {
+        let state = route_state(gone_engine_client());
         let response = unload_lora_adapter(
             axum::extract::State(state),
             Json(UnloadLoraAdapterHttpRequest {
@@ -489,7 +470,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]

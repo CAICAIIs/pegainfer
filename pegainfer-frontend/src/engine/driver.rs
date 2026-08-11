@@ -3,19 +3,20 @@
 //! The loop lives here — once, for every model line — so its conventions
 //! (drain order, one load publish and one commit per iteration, shutdown and
 //! fatal handling) are code, not per-crate discipline. A model line's runtime
-//! obligation is exactly the three [`Scheduler`] methods plus, optionally,
-//! [`Scheduler::control`].
+//! obligation is exactly the three [`Scheduler`] methods. Anything beyond
+//! them (e.g. LoRA control) is not the contract's business: a scheduler that
+//! serves an extra capability captures its own channel before spawn and
+//! drains it inside `step`.
 
-use super::control::EngineControlRequest;
 use super::emitter::StepEmitter;
 use super::handle::LoadSnapshot;
-use super::partition::LivePartition;
-use super::partition::PartitionBackend;
-use super::partition::partition_pair;
 use super::ticket::IntakeTicket;
+use super::wiring::LiveScheduler;
+use super::wiring::SchedulerBackend;
+use super::wiring::scheduler_pair;
 
-/// One scheduler partition's runtime behavior. Runs on a dedicated OS thread
-/// spawned by [`spawn_partition`]; `Send` suffices.
+/// One scheduler's runtime behavior. Runs on a dedicated OS thread spawned
+/// by [`spawn_scheduler`]; `Send` suffices.
 pub trait Scheduler: Send {
     /// Take ownership of one submitted request. Ownership transfer only —
     /// every verdict (admit/reject/retire) is emitted from [`Self::step`],
@@ -36,54 +37,30 @@ pub trait Scheduler: Send {
 
     /// Occupancy snapshot; the driver publishes it once per iteration.
     fn load(&self) -> LoadSnapshot;
-
-    /// Handle a control-plane request. The base implementation answers
-    /// "unsupported"; an engine with a control plane (LoRA) overrides.
-    fn control(&mut self, request: EngineControlRequest) {
-        reject_unsupported_control(request);
-    }
 }
 
-/// Answer a control request with the unsupported sentinel on every variant.
-pub fn reject_unsupported_control(request: EngineControlRequest) {
-    let message = super::control::UNSUPPORTED_CONTROL_MESSAGE.to_string();
-    match request {
-        EngineControlRequest::LoadLoraAdapter { response_tx, .. }
-        | EngineControlRequest::UnloadLoraAdapter { response_tx, .. } => {
-            let _ = response_tx.send(Err(message));
-        }
-        EngineControlRequest::ListLoraAdapters { response_tx } => {
-            let _ = response_tx.send(Err(message));
-        }
-    }
-}
-
-/// Spawn one partition: mint the wiring, start the driver thread, return the
+/// Spawn one scheduler: mint the wiring, start the driver thread, return the
 /// frontend end. `name` names the OS thread (shows in `top`/gdb).
-pub fn spawn_partition<S: Scheduler + 'static>(name: &str, scheduler: S) -> LivePartition {
-    let (handle, backend) = partition_pair();
+pub fn spawn_scheduler<S: Scheduler + 'static>(name: &str, scheduler: S) -> LiveScheduler {
+    let (handle, backend) = scheduler_pair();
     let join = std::thread::Builder::new()
         .name(name.to_string())
         .spawn(move || drive(scheduler, backend))
         .expect("failed to spawn scheduler thread");
-    LivePartition { handle, join }
+    LiveScheduler { handle, join }
 }
 
 /// The polling loop. Exits when the frontend is gone (intake disconnected)
 /// and the scheduler reports itself drained, or when `step` reports a fatal
 /// error.
-pub fn drive<S: Scheduler>(mut scheduler: S, backend: PartitionBackend) {
-    let PartitionBackend {
+pub fn drive<S: Scheduler>(mut scheduler: S, backend: SchedulerBackend) {
+    let SchedulerBackend {
         intake,
-        control,
         mut emitter,
         load,
     } = backend;
     let mut intake_open = true;
     loop {
-        while let Ok(request) = control.try_recv() {
-            scheduler.control(request);
-        }
         loop {
             match intake.try_recv() {
                 Ok(ticket) => scheduler.intake(ticket),
@@ -184,7 +161,7 @@ mod tests {
 
     #[test]
     fn driven_engine_streams_and_drains_on_shutdown() {
-        let partition = spawn_partition("test-echo", EchoScheduler::default());
+        let partition = spawn_scheduler("test-echo", EchoScheduler::default());
         let mut handle = partition.handle;
         let mut steps = handle.take_steps().expect("step stream");
 
@@ -218,7 +195,7 @@ mod tests {
 
     #[test]
     fn fatal_step_fails_in_flight_requests_via_drop_bombs() {
-        let partition = spawn_partition(
+        let partition = spawn_scheduler(
             "test-fatal",
             EchoScheduler {
                 fatal_next_step: true,
@@ -245,23 +222,5 @@ mod tests {
             .join
             .join()
             .expect("driver thread exits after fatal");
-    }
-
-    #[test]
-    fn default_control_answers_unsupported() {
-        let partition = spawn_partition("test-nocontrol", EchoScheduler::default());
-        let handle = partition.handle;
-        let error = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime")
-            .block_on(handle.control_client().list_lora_adapters())
-            .expect_err("control must be unsupported");
-        assert!(matches!(
-            error,
-            crate::engine::EngineControlError::Unsupported(_)
-        ));
-        drop(handle);
-        partition.join.join().expect("driver thread exits");
     }
 }

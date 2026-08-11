@@ -16,15 +16,15 @@ use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
 
-use pegainfer_frontend::engine::ControlClient;
 use pegainfer_frontend::engine::Engine;
 use pegainfer_frontend::engine::EngineInfo;
-use pegainfer_frontend::engine::PartitionHandle;
+use pegainfer_frontend::engine::LoraClient;
 use pegainfer_frontend::engine::PromptEcho;
 use pegainfer_frontend::engine::Request;
 use pegainfer_frontend::engine::RequestControl;
 use pegainfer_frontend::engine::RequestId;
 use pegainfer_frontend::engine::RequestUpdate;
+use pegainfer_frontend::engine::SchedulerHandle;
 use pegainfer_frontend::engine::Terminal;
 use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_frontend::sampler::SamplingParams;
@@ -50,7 +50,8 @@ pub(crate) fn request(
 }
 
 pub(crate) struct EngineHarness {
-    handle: Option<PartitionHandle>,
+    handle: Option<SchedulerHandle>,
+    lora: Option<LoraClient>,
     scheduler_join: Option<std::thread::JoinHandle<()>>,
     pump_join: Option<std::thread::JoinHandle<()>>,
     inbox: Arc<Inbox>,
@@ -70,15 +71,15 @@ struct InboxState {
 impl EngineHarness {
     pub(crate) fn new(mut engine: Engine) -> Self {
         assert_eq!(
-            engine.partitions.len(),
+            engine.schedulers.len(),
             1,
-            "test harness drives single-partition engines"
+            "test harness drives single-scheduler engines"
         );
-        let mut partition = engine.partitions.remove(0);
-        let mut steps = partition
+        let mut scheduler = engine.schedulers.remove(0);
+        let mut steps = scheduler
             .handle
             .take_steps()
-            .expect("fresh partition yields its step stream once");
+            .expect("a fresh scheduler yields its step stream once");
         let inbox = Arc::new(Inbox {
             state: Mutex::new(InboxState {
                 updates: HashMap::new(),
@@ -104,8 +105,9 @@ impl EngineHarness {
             pump_inbox.cv.notify_all();
         });
         Self {
-            handle: Some(partition.handle),
-            scheduler_join: Some(partition.join),
+            handle: Some(scheduler.handle),
+            lora: engine.lora,
+            scheduler_join: Some(scheduler.join),
             pump_join: Some(pump_join),
             inbox,
             info: engine.info,
@@ -125,11 +127,10 @@ impl EngineHarness {
         }
     }
 
-    pub(crate) fn control_client(&self) -> ControlClient {
-        self.handle
-            .as_ref()
-            .expect("harness handle lives until drop")
-            .control_client()
+    /// The engine's LoRA client; panics when the engine serves no adapter
+    /// control — the `Option` on `Engine::lora` is the capability.
+    pub(crate) fn lora_client(&self) -> LoraClient {
+        self.lora.clone().expect("engine exposes LoRA control")
     }
 
     /// Submit one request and return its generated token ids, panicking on any

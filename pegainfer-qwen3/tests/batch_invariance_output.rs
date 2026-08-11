@@ -14,9 +14,9 @@ use std::sync::Mutex;
 
 use pegainfer_frontend::engine::Engine;
 use pegainfer_frontend::engine::EngineLoadOptions;
-use pegainfer_frontend::engine::PartitionHandle;
 use pegainfer_frontend::engine::RequestId;
 use pegainfer_frontend::engine::RequestUpdate;
+use pegainfer_frontend::engine::SchedulerHandle;
 use pegainfer_frontend::engine::StepReceiver;
 use pegainfer_frontend::engine::Terminal;
 use pegainfer_frontend::sampler::SamplingParams;
@@ -68,7 +68,7 @@ impl Trace {
 /// order over every request's admission and token facts, which only the
 /// undemultiplexed stream provides.
 struct Harness {
-    handle: Option<PartitionHandle>,
+    handle: Option<SchedulerHandle>,
     scheduler_join: Option<std::thread::JoinHandle<()>>,
     rx: StepReceiver,
     traces: HashMap<RequestId, Trace>,
@@ -78,18 +78,18 @@ struct Harness {
 impl Harness {
     fn new(mut engine: Engine) -> Self {
         assert_eq!(
-            engine.partitions.len(),
+            engine.schedulers.len(),
             1,
-            "test drives a single-partition engine"
+            "test drives a single-scheduler engine"
         );
-        let mut partition = engine.partitions.remove(0);
-        let rx = partition
+        let mut scheduler = engine.schedulers.remove(0);
+        let rx = scheduler
             .handle
             .take_steps()
-            .expect("fresh partition yields its step stream once");
+            .expect("a fresh scheduler yields its step stream once");
         Self {
-            handle: Some(partition.handle),
-            scheduler_join: Some(partition.join),
+            handle: Some(scheduler.handle),
+            scheduler_join: Some(scheduler.join),
             rx,
             traces: HashMap::new(),
             order: 0,
