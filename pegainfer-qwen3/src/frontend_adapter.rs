@@ -638,13 +638,9 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
 }
 
 impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
-    fn intake(&mut self, mut ticket: IntakeTicket, emitter: &mut StepEmitter) {
-        if ticket.aborted().is_some() {
-            // Nothing was built for this request yet; retiring the ticket is
-            // the whole cleanup.
-            emitter.retire_ticket(ticket);
-            return;
-        }
+    fn intake(&mut self, mut ticket: IntakeTicket) {
+        // Already-aborted tickets ride the normal path: admission re-checks
+        // the abort flag and retires them (`admit_or_retire`).
         let request = ticket
             .take_request()
             .expect("intake receives tickets with their payload");

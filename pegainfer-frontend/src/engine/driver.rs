@@ -17,11 +17,12 @@ use super::ticket::IntakeTicket;
 /// One scheduler partition's runtime behavior. Runs on a dedicated OS thread
 /// spawned by [`spawn_partition`]; `Send` suffices.
 pub trait Scheduler: Send {
-    /// Answer one submitted request: validate, then take exactly one ticket
-    /// exit — `emitter.admit` (keeping the returned handle in scheduler
-    /// state), `emitter.reject`, or `emitter.retire_ticket` for a request
-    /// whose frontend already aborted.
-    fn intake(&mut self, ticket: IntakeTicket, emitter: &mut StepEmitter);
+    /// Take ownership of one submitted request. Ownership transfer only —
+    /// every verdict (admit/reject/retire) is emitted from [`Self::step`],
+    /// the single emission site. Nothing is lost by deferring: the driver
+    /// commits once per iteration, so a verdict buffered in `step` lands in
+    /// the same commit an intake-time verdict would have.
+    fn intake(&mut self, ticket: IntakeTicket);
 
     /// Advance one step: admission, GPU work, and per-request emission. The
     /// driver loops over this without pause — an idle scheduler returns
@@ -85,7 +86,7 @@ pub fn drive<S: Scheduler>(mut scheduler: S, backend: PartitionBackend) {
         }
         loop {
             match intake.try_recv() {
-                Ok(ticket) => scheduler.intake(ticket, &mut emitter),
+                Ok(ticket) => scheduler.intake(ticket),
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
                     intake_open = false;
@@ -121,20 +122,24 @@ mod tests {
     /// Emits one token per step per request and finishes at `max_tokens`.
     #[derive(Default)]
     struct EchoScheduler {
+        queued: Vec<IntakeTicket>,
         running: Vec<(ActiveRequest, usize)>,
         fatal_next_step: bool,
     }
 
     impl Scheduler for EchoScheduler {
-        fn intake(&mut self, ticket: IntakeTicket, emitter: &mut StepEmitter) {
-            let max_tokens = ticket.request().max_tokens;
-            let active = emitter.admit(ticket);
-            self.running.push((active, max_tokens));
+        fn intake(&mut self, ticket: IntakeTicket) {
+            self.queued.push(ticket);
         }
 
         fn step(&mut self, emitter: &mut StepEmitter) -> anyhow::Result<()> {
             if self.fatal_next_step {
                 anyhow::bail!("injected fatal");
+            }
+            for ticket in self.queued.drain(..) {
+                let max_tokens = ticket.request().max_tokens;
+                let active = emitter.admit(ticket);
+                self.running.push((active, max_tokens));
             }
             let mut still_running = Vec::new();
             for (mut active, max_tokens) in self.running.drain(..) {
@@ -157,6 +162,7 @@ mod tests {
         fn load(&self) -> LoadSnapshot {
             LoadSnapshot {
                 num_running_reqs: self.running.len() as u64,
+                num_waiting_reqs: self.queued.len() as u64,
                 ..LoadSnapshot::default()
             }
         }
@@ -215,8 +221,8 @@ mod tests {
         let partition = spawn_partition(
             "test-fatal",
             EchoScheduler {
-                running: Vec::new(),
                 fatal_next_step: true,
+                ..EchoScheduler::default()
             },
         );
         let mut handle = partition.handle;

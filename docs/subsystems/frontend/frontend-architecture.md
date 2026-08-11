@@ -36,12 +36,12 @@ Design decisions worth knowing before touching it:
 - **Emitter as single writer.** Schedulers never touch the channel; they call `StepEmitter` methods against their handles. The emitter stamps `ScheduledInfo` at admission, tallies token counts (terminal counts derive from the tally, never from model-side arithmetic), and `commit_step` publishes the whole step in one send.
 - **Pure polling driver.** `spawn_partition` owns the serve loop: drain control, drain intake, `Scheduler::step`, publish load, commit. No idle/park distinction — the scheduler owns the GPU and spinning on it costs nothing anyone else could use; async KV I/O (prefetch, decode-overlap prefill) is naturally absorbed by polling. The loop exits when the frontend drops the handle and the queue drains.
 - **Abort is a flag, not channel teardown.** `PartitionHandle::submit` returns a `RequestControl`; the frontend flips its `AbortReason` and the scheduler retires the request silently on its next touch (no terminal — the frontend already dropped its state for that id).
-- **Channels:** intake/control are crossbeam (sync consumer on the scheduler thread), steps are tokio mpsc (async consumer in the bridge), load is a tokio watch. All unbounded on purpose — admission control is the scheduler's job, expressed as `Rejected`, never as backpressure on submit.
+- **Channels:** intake/control are crossbeam (sync consumer on the scheduler thread), steps are tokio mpsc (async consumer in the bridge); load is a shared cell read via `PartitionHandle::load()` — pull-only by design, "notify me on load change" is deliberately unrepresentable (the driver busy-polls, so a subscription edge would fire per spin). All channels unbounded on purpose — admission control is the scheduler's job, expressed as `Rejected`, never as backpressure on submit.
 
 ### Onboarding checklist for a new model line
 
 1. Implement `Scheduler` (see `Qwen3Scheduler` in `pegainfer-qwen3/src/frontend_adapter.rs` — the whole adaptation is deliberately in one file):
-   - `intake(ticket, emitter)` — take the payload (`ticket.take_request()`), mint your internal id, park the ticket in a registry.
+   - `intake(ticket)` — ownership transfer only: take the payload (`ticket.take_request()`), mint your internal id, park the ticket in a registry. No emitter here by design — `step` is the single emission site, and the driver commits once per iteration so nothing is gained by emitting earlier.
    - `step(emitter)` — one scheduling step: admit (consume tickets via `emitter.admit`/`reject`), execute, push tokens, finish/fail/retire. Return `Err` only for engine-fatal states.
    - `load()` — KV occupancy + running/waiting counts for routers.
    - `control(request)` — optional (LoRA etc.); default rejects as unsupported.
