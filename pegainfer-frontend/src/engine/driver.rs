@@ -52,7 +52,9 @@ pub fn spawn_scheduler<S: Scheduler + 'static>(name: &str, scheduler: S) -> Live
 
 /// The polling loop. Exits when the frontend is gone (intake disconnected)
 /// and the scheduler reports itself drained, or when `step` reports a fatal
-/// error.
+/// error. An idle iteration (nothing running or waiting) ends in a
+/// [`std::hint::spin_loop`] before the next probe; busy iterations never
+/// pause.
 pub fn drive<S: Scheduler>(mut scheduler: S, backend: SchedulerBackend) {
     let SchedulerBackend {
         intake,
@@ -81,9 +83,15 @@ pub fn drive<S: Scheduler>(mut scheduler: S, backend: SchedulerBackend) {
             log::error!("scheduler fatal, engine winding down: {error:#}");
             return;
         }
-        if !intake_open && snapshot.num_running_reqs == 0 && snapshot.num_waiting_reqs == 0 {
-            log::info!("scheduler drained after frontend shutdown, exiting");
-            return;
+        if snapshot.num_running_reqs == 0 && snapshot.num_waiting_reqs == 0 {
+            if !intake_open {
+                log::info!("scheduler drained after frontend shutdown, exiting");
+                return;
+            }
+            // The iteration did no work; relax the core's issue slots before
+            // probing again. Latency is untouched — busy iterations never
+            // reach this hint.
+            std::hint::spin_loop();
         }
     }
 }
