@@ -233,26 +233,3 @@ pub enum Terminal {
         completion_tokens: usize,
     },
 }
-
-/// Why a frontend stopped wanting a request's output. Stored in the shared
-/// per-request atomic (0 = not aborted); the scheduler observes it through
-/// [`super::IntakeTicket::aborted`] / [`super::ActiveRequest::aborted`] and
-/// retires the request without emitting further output.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u8)]
-pub enum AbortReason {
-    /// The frontend explicitly cancelled after the stream started.
-    Cancelled = 1,
-    /// The client disconnected before consuming the response.
-    Disconnected = 2,
-}
-
-impl AbortReason {
-    pub(crate) fn from_raw(raw: u8) -> Option<Self> {
-        match raw {
-            1 => Some(Self::Cancelled),
-            2 => Some(Self::Disconnected),
-            _ => None,
-        }
-    }
-}

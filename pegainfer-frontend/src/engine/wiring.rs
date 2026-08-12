@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::AtomicU8;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -77,7 +77,7 @@ impl SchedulerHandle {
     /// stream, which the caller observes like any other terminal.
     pub fn submit(&self, request: Request) -> RequestControl {
         let id = RequestId::new(self.next_id.fetch_add(1, Ordering::Relaxed));
-        let abort = Arc::new(AtomicU8::new(0));
+        let abort = Arc::new(AtomicBool::new(false));
         let control = RequestControl::new(id, Arc::clone(&abort));
         let ticket = IntakeTicket::new(
             HandleCore {

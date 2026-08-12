@@ -388,18 +388,12 @@ mod tests {
         let (handle, mut backend) = scheduler_pair();
         let control = handle.submit(request(vec![1]));
         let ticket = backend.intake.try_recv().expect("ticket");
-        assert!(ticket.aborted().is_none());
+        assert!(!ticket.is_aborted());
 
-        control.abort(super::super::step::AbortReason::Disconnected);
-        assert_eq!(
-            ticket.aborted(),
-            Some(super::super::step::AbortReason::Disconnected)
-        );
+        control.abort();
+        assert!(ticket.is_aborted());
         let active = backend.emitter.admit(ticket);
-        assert_eq!(
-            active.aborted(),
-            Some(super::super::step::AbortReason::Disconnected)
-        );
+        assert!(active.is_aborted());
         backend.emitter.retire(active);
     }
 

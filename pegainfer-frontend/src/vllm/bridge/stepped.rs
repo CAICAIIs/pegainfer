@@ -45,7 +45,6 @@ use super::send_outputs;
 use super::send_terminal_output;
 use super::send_utility_response;
 use super::stop_sentinel_id;
-use crate::engine::AbortReason;
 use crate::engine::FinishReason;
 use crate::engine::KvCapacity;
 use crate::engine::Request;
@@ -168,7 +167,7 @@ impl SteppedEngineBridge {
         // them on its next touch; dropping the partition handle afterwards
         // disconnects intake and lets the driver drain out.
         for state in streams.values() {
-            state.control.abort(AbortReason::Cancelled);
+            state.control.abort();
         }
         drop(output_tx);
         child_tasks.abort_all();
@@ -199,9 +198,6 @@ impl SteppedEngineBridge {
             let id = update.id;
             let (output, terminated) = reduce_update(state, update, anchor);
             if let Some(output) = output {
-                if !output.new_token_ids.is_empty() {
-                    state.has_emitted_tokens = true;
-                }
                 outputs.push(output);
             }
             if terminated {
@@ -262,19 +258,12 @@ impl SteppedEngineBridge {
                     // Drop our state first, then flip the abort flag (whose
                     // `Release` store orders after the removal); the
                     // scheduler's next touch retires the request, and any
-                    // update already in flight finds no stream entry. An
-                    // abort before the first client-visible token is a
-                    // disconnect; after it, a stream cancellation.
+                    // update already in flight finds no stream entry.
                     let Some(id) = names.remove(&request_id) else {
                         continue;
                     };
                     if let Some(state) = streams.remove(&id) {
-                        let reason = if state.has_emitted_tokens {
-                            AbortReason::Cancelled
-                        } else {
-                            AbortReason::Disconnected
-                        };
-                        state.control.abort(reason);
+                        state.control.abort();
                     }
                 }
                 Ok(())
@@ -421,7 +410,6 @@ struct SteppedStream {
     /// The vLLM text decoder removes the final token from a stop-finished
     /// output. Keep an EOS or explicit stop token as that removable sentinel.
     stop_sentinel_id: Option<u32>,
-    has_emitted_tokens: bool,
     /// Request-lifetime root span; held only for its `Drop`, which closes the
     /// trace when the stream state is removed.
     #[allow(dead_code)]
@@ -444,7 +432,6 @@ impl SteppedStream {
             prefill_stats_sent: false,
             kv_transfer_params: None,
             stop_sentinel_id,
-            has_emitted_tokens: false,
             trace_root,
         }
     }
