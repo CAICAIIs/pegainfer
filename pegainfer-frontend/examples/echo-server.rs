@@ -119,7 +119,7 @@ impl Scheduler for EchoScheduler {
 
     fn step(&mut self, emitter: &mut StepEmitter) -> Result<()> {
         for ticket in self.queued.drain(..) {
-            if ticket.aborted().is_some() {
+            if ticket.is_aborted() {
                 emitter.retire_ticket(ticket);
                 continue;
             }
@@ -137,7 +137,7 @@ impl Scheduler for EchoScheduler {
         }
         let mut still_running = Vec::new();
         for mut running in self.running.drain(..) {
-            if running.active.aborted().is_some() {
+            if running.active.is_aborted() {
                 emitter.retire(running.active);
                 continue;
             }

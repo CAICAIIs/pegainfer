@@ -299,7 +299,7 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
         let Some(HandleSlot::Queued(ticket)) = self.handles.remove(&req.request_id) else {
             unreachable!("admitted request must hold a queued ticket");
         };
-        if ticket.aborted().is_some() {
+        if ticket.is_aborted() {
             emitter.retire_ticket(ticket);
             release_rejected(&mut self.executor, &mut self.tracker, req);
             return false;
@@ -420,7 +420,7 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
                         continue;
                     };
                     if let Some(handle) = self.take_streaming(request_id) {
-                        if handle.aborted().is_some() {
+                        if handle.is_aborted() {
                             emitter.retire(handle);
                         } else {
                             finishes.push((handle, finish_reason));
@@ -444,7 +444,7 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
                         continue;
                     };
                     if let Some(mut handle) = self.take_streaming(request_id) {
-                        if handle.aborted().is_some() {
+                        if handle.is_aborted() {
                             emitter.retire(handle);
                         } else {
                             emitter.push_tokens(&mut handle, &[token], &[logprob]);
@@ -470,7 +470,7 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
                     };
                     let aborted = matches!(
                         self.handles.get(&request_id),
-                        Some(HandleSlot::Streaming(handle)) if handle.aborted().is_some()
+                        Some(HandleSlot::Streaming(handle)) if handle.is_aborted()
                     );
                     if aborted {
                         let handle = self
@@ -503,7 +503,7 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
                     };
                     let aborted = matches!(
                         self.handles.get(&request_id),
-                        Some(HandleSlot::Streaming(handle)) if handle.aborted().is_some()
+                        Some(HandleSlot::Streaming(handle)) if handle.is_aborted()
                     );
                     if aborted {
                         let handle = self
@@ -537,7 +537,7 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
                         continue;
                     };
                     if let Some(mut handle) = self.take_streaming(request_id) {
-                        if handle.aborted().is_some() {
+                        if handle.is_aborted() {
                             emitter.retire(handle);
                         } else {
                             emitter.push_tokens(&mut handle, &tokens, &[]);
@@ -565,7 +565,7 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
             match effect {
                 PendingEffect::ContinuePrefill { req } => {
                     let aborted = match self.handles.get(&req.request_id) {
-                        Some(HandleSlot::Streaming(handle)) => handle.aborted().is_some(),
+                        Some(HandleSlot::Streaming(handle)) => handle.is_aborted(),
                         _ => unreachable!(
                             "prefilling request {:?} must hold a streaming handle",
                             req.request_id
@@ -586,7 +586,7 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
                     finish_reason,
                 } => {
                     if let Some(handle) = self.take_streaming(request_id) {
-                        if handle.aborted().is_some() {
+                        if handle.is_aborted() {
                             emitter.retire(handle);
                         } else {
                             finishes.push((handle, finish_reason));
@@ -602,7 +602,7 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
                     finish_reason,
                 } => {
                     if let Some(mut handle) = self.take_streaming(request_id) {
-                        if handle.aborted().is_some() {
+                        if handle.is_aborted() {
                             emitter.retire(handle);
                         } else {
                             emitter.push_tokens(&mut handle, &[token], &[logprob]);
@@ -620,7 +620,7 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
                     let request_id = state.request_id;
                     let aborted = matches!(
                         self.handles.get(&request_id),
-                        Some(HandleSlot::Streaming(handle)) if handle.aborted().is_some()
+                        Some(HandleSlot::Streaming(handle)) if handle.is_aborted()
                     );
                     if aborted {
                         let handle = self

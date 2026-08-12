@@ -18,7 +18,6 @@
 use std::path::Path;
 use std::time::Duration;
 
-use pegainfer_frontend::engine::AbortReason;
 use pegainfer_frontend::engine::EngineLoadOptions;
 use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_kernels::ops::NumericPolicy;
@@ -104,7 +103,7 @@ fn scheduler_survives_client_abort() {
         SamplingParams::default(),
         10,
     ));
-    stream.control.abort(AbortReason::Disconnected);
+    stream.control.abort();
     drop(stream);
     std::thread::sleep(Duration::from_millis(500));
 

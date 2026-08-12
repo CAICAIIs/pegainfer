@@ -128,7 +128,7 @@ mod tests {
             }
             let mut still_running = Vec::new();
             for (mut active, max_tokens) in self.running.drain(..) {
-                if active.aborted().is_some() {
+                if active.is_aborted() {
                     emitter.retire(active);
                     continue;
                 }

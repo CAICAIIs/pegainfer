@@ -9,7 +9,6 @@ use std::sync::Mutex;
 use std::time::Duration;
 use std::time::Instant;
 
-use pegainfer_frontend::engine::AbortReason;
 use pegainfer_frontend::engine::Engine;
 use pegainfer_frontend::engine::FinishReason;
 use pegainfer_frontend::engine::LiveScheduler;
@@ -285,7 +284,7 @@ fn aborted_request_retires_silently_and_frees_engine_state() {
         "request must be admitted, not rejected: {first:?}"
     );
 
-    control.abort(AbortReason::Cancelled);
+    control.abort();
     assert!(
         wait_until(Duration::from_secs(1), || dropped
             .lock()

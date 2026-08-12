@@ -17,11 +17,10 @@
 //! driver drops the scheduler, the handles fall, the terminals ship.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicU8;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use super::step::AbortReason;
 use super::step::Request;
 use super::step::RequestId;
 use super::step::RequestUpdate;
@@ -36,13 +35,13 @@ pub type StepReceiver = tokio::sync::mpsc::UnboundedReceiver<StepOutputs>;
 
 pub(crate) struct HandleCore {
     pub(crate) id: RequestId,
-    pub(crate) abort: Arc<AtomicU8>,
+    pub(crate) abort: Arc<AtomicBool>,
     pub(crate) tx: StepSender,
 }
 
 impl HandleCore {
-    fn aborted(&self) -> Option<AbortReason> {
-        AbortReason::from_raw(self.abort.load(Ordering::Acquire))
+    fn is_aborted(&self) -> bool {
+        self.abort.load(Ordering::Acquire)
     }
 
     /// Ship a lone update outside any step batch (drop bombs, deferred
@@ -127,8 +126,8 @@ impl IntakeTicket {
 
     /// The frontend stopped wanting this request while it queued. The
     /// scheduler answers by [`super::StepEmitter::retire_ticket`].
-    pub fn aborted(&self) -> Option<AbortReason> {
-        self.inner().core.aborted()
+    pub fn is_aborted(&self) -> bool {
+        self.inner().core.is_aborted()
     }
 }
 
@@ -201,8 +200,8 @@ impl ActiveRequest {
 
     /// The frontend stopped wanting this request's output. The scheduler
     /// answers by [`super::StepEmitter::retire`] on its next touch.
-    pub fn aborted(&self) -> Option<AbortReason> {
-        self.inner().core.aborted()
+    pub fn is_aborted(&self) -> bool {
+        self.inner().core.is_aborted()
     }
 }
 
@@ -293,16 +292,16 @@ impl Drop for DeferredFinish {
 }
 
 /// The frontend's per-request cancel handle, returned by
-/// [`super::SchedulerHandle::submit`]. Flipping the reason is the only abort
+/// [`super::SchedulerHandle::submit`]. Flipping the flag is the only abort
 /// mechanism: the scheduler observes it and retires the request reactively;
 /// no channel is closed.
 pub struct RequestControl {
     id: RequestId,
-    abort: Arc<AtomicU8>,
+    abort: Arc<AtomicBool>,
 }
 
 impl RequestControl {
-    pub(crate) fn new(id: RequestId, abort: Arc<AtomicU8>) -> Self {
+    pub(crate) fn new(id: RequestId, abort: Arc<AtomicBool>) -> Self {
         Self { id, abort }
     }
 
@@ -313,7 +312,7 @@ impl RequestControl {
     /// Mark the request aborted. `Release` orders the store after the
     /// caller's own teardown of per-request state, mirroring the scheduler's
     /// `Acquire` load.
-    pub fn abort(&self, reason: AbortReason) {
-        self.abort.store(reason as u8, Ordering::Release);
+    pub fn abort(&self) {
+        self.abort.store(true, Ordering::Release);
     }
 }
