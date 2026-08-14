@@ -24,7 +24,6 @@ use pegainfer_kernels::ops::K3_KDA_HEAD_DIM;
 use pegainfer_kernels::ops::K3_KDA_HEADS;
 use pegainfer_kernels::ops::K3_MLA_HEADS;
 use pegainfer_kernels::ops::K3_MOE_QUANT_GROUP;
-use pegainfer_kernels::ops::K3_QK_DIM;
 use pegainfer_kernels::ops::K3_ROUTER_TOPK;
 use pegainfer_kernels::ops::K3_V_DIM;
 use pegainfer_kernels::ops::K3MegaSymmLayout;
@@ -33,15 +32,14 @@ use pegainfer_kernels::ops::k3_mega_open_peer_access;
 use pegainfer_kernels::ops::k3_mega_symm_buffer_layout;
 use pegainfer_kernels::ops::k3_mega_token_alignment;
 use pegainfer_kernels::tensor::DeviceContext;
-use pegainfer_kernels::tensor::HiddenStates;
 
+use super::paged_kv::K3PagedKv;
 use crate::config::K3_ATTN_INNER;
 use crate::config::K3_DENSE_INTERMEDIATE;
 use crate::config::K3_EXPERT_INTERMEDIATE;
 use crate::config::K3_HEAD_DIM;
 use crate::config::K3_HIDDEN;
 use crate::config::K3_KV_A_OUT;
-use crate::config::K3_KV_B_OUT;
 use crate::config::K3_KV_LORA_RANK;
 use crate::config::K3_Q_B_OUT;
 use crate::config::K3_Q_LORA_RANK;
@@ -65,8 +63,7 @@ pub(crate) const K3_MLA_FUSED: usize =
 pub(crate) const K3_CONV_STATE: usize = K3_CONV_WIDTH - 1;
 /// Elements of one row's KDA recurrent state.
 pub(crate) const K3_KDA_STATE: usize = K3_KDA_HEADS * K3_KDA_HEAD_DIM * K3_KDA_HEAD_DIM;
-/// Per-slot MLA cache row widths.
-pub(crate) const K3_MLA_K_ROW: usize = K3_MLA_HEADS * K3_QK_DIM;
+/// Width of the MLA attention output, `heads * v_head_dim`.
 pub(crate) const K3_MLA_V_ROW: usize = K3_MLA_HEADS * K3_V_DIM;
 
 /// One KDA layer's per-slot state: recurrent matrix plus the three convolution
@@ -78,17 +75,11 @@ pub(crate) struct K3KdaState {
     pub(crate) conv: [[CudaSlice<bf16>; 3]; 2],
 }
 
-/// One MLA layer's per-slot slot-indexed cache. Each slot owns a fixed
-/// `max_ctx` window, so the buffers are the batched kernel's `[rows, cap, w]`
-/// and, seen as `[rows * cap, w]`, the indexed row write's destination.
-pub(crate) struct K3MlaState {
-    pub(crate) k_cache: HiddenStates,
-    pub(crate) v_cache: HiddenStates,
-}
-
 pub(crate) enum K3LayerState {
     Kda(Box<K3KdaState>),
-    Mla(Box<K3MlaState>),
+    /// MLA state lives in the pool-wide paged latent cache ([`K3PagedKv`]),
+    /// not per layer.
+    Mla,
 }
 
 /// Everything about a slot that outlives a step.
@@ -96,6 +87,8 @@ pub(crate) struct K3StatePool {
     pub(crate) rows: usize,
     pub(crate) max_ctx: usize,
     pub(crate) layers: Vec<K3LayerState>,
+    /// The paged MLA latent cache all MLA layers share.
+    pub(crate) kv: K3PagedKv,
     /// Attention-residual snapshot history, `[rows, blocks, hidden]` bf16.
     pub(crate) blocks: CudaSlice<bf16>,
     pub(crate) block_count: usize,
@@ -111,8 +104,14 @@ impl K3StatePool {
         max_ctx: usize,
         num_layers: usize,
         block_count: usize,
+        kv_pages: usize,
     ) -> Result<Self> {
         let stream = &ctx.stream;
+        let mla_layers = (0..num_layers)
+            .filter(|layer| k3_layer_kind(*layer) == K3LayerKind::Mla)
+            .count()
+            .max(1);
+        let kv = K3PagedKv::new(ctx, rows, max_ctx, mla_layers, kv_pages)?;
         let mut layers = Vec::with_capacity(num_layers);
         for layer in 0..num_layers {
             layers.push(match k3_layer_kind(layer) {
@@ -144,28 +143,14 @@ impl K3StatePool {
                         conv: [conv_even, conv_odd],
                     }))
                 }
-                K3LayerKind::Mla => K3LayerState::Mla(Box::new(K3MlaState {
-                    k_cache: HiddenStates {
-                        data: stream
-                            .alloc_zeros::<bf16>(rows * max_ctx * K3_MLA_K_ROW)
-                            .context("alloc K3 MLA key cache")?,
-                        hidden_dim: K3_MLA_K_ROW,
-                        seq_len: rows * max_ctx,
-                    },
-                    v_cache: HiddenStates {
-                        data: stream
-                            .alloc_zeros::<bf16>(rows * max_ctx * K3_MLA_V_ROW)
-                            .context("alloc K3 MLA value cache")?,
-                        hidden_dim: K3_MLA_V_ROW,
-                        seq_len: rows * max_ctx,
-                    },
-                })),
+                K3LayerKind::Mla => K3LayerState::Mla,
             });
         }
         Ok(Self {
             rows,
             max_ctx,
             layers,
+            kv,
             blocks: stream
                 .alloc_zeros::<bf16>(rows * block_count * K3_HIDDEN)
                 .context("alloc K3 attention-residual snapshots")?,
@@ -189,25 +174,13 @@ impl K3StatePool {
                         }
                     }
                 }
-                K3LayerState::Mla(mla) => {
-                    zero_rows(
-                        ctx,
-                        &mut mla.k_cache.data,
-                        row * self.max_ctx,
-                        self.max_ctx,
-                        K3_MLA_K_ROW,
-                    )?;
-                    zero_rows(
-                        ctx,
-                        &mut mla.v_cache.data,
-                        row * self.max_ctx,
-                        self.max_ctx,
-                        K3_MLA_V_ROW,
-                    )?;
-                }
+                // The paged latent cache is released below; freed pages are
+                // zeroed when next claimed, not here.
+                K3LayerState::Mla => {}
             }
         }
         zero_rows(ctx, &mut self.blocks, row, 1, self.block_count * K3_HIDDEN)?;
+        self.kv.release_row(row);
         self.positions[row] = 0;
         Ok(())
     }
@@ -261,26 +234,9 @@ impl K3StatePool {
                         )?;
                     }
                 }
-                (K3LayerState::Mla(target), K3LayerState::Mla(origin)) => {
-                    copy_rows(
-                        ctx,
-                        &origin.k_cache.data,
-                        source_row * self.max_ctx,
-                        &mut target.k_cache.data,
-                        row * self.max_ctx,
-                        self.max_ctx,
-                        K3_MLA_K_ROW,
-                    )?;
-                    copy_rows(
-                        ctx,
-                        &origin.v_cache.data,
-                        source_row * self.max_ctx,
-                        &mut target.v_cache.data,
-                        row * self.max_ctx,
-                        self.max_ctx,
-                        K3_MLA_V_ROW,
-                    )?;
-                }
+                // The paged latent cache is adopted once for the whole pool,
+                // below the layer walk.
+                (K3LayerState::Mla, K3LayerState::Mla) => {}
                 _ => anyhow::bail!("K3 state pools disagree on layer kinds"),
             }
         }
@@ -292,6 +248,13 @@ impl K3StatePool {
             row,
             1,
             self.block_count * K3_HIDDEN,
+        )?;
+        self.kv.adopt_row(
+            ctx,
+            &source.kv,
+            source_row,
+            row,
+            source.positions[source_row],
         )?;
         self.positions[row] = source.positions[source_row];
         Ok(())
@@ -315,7 +278,7 @@ fn zero_rows<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits>(
         .context("zero a K3 state row")
 }
 
-fn copy_rows<T: cudarc::driver::DeviceRepr>(
+pub(super) fn copy_rows<T: cudarc::driver::DeviceRepr>(
     ctx: &DeviceContext,
     source: &CudaSlice<T>,
     source_row: usize,
@@ -579,12 +542,9 @@ pub(crate) struct K3Scratch {
     pub(crate) token_ids: CudaSlice<u32>,
     /// Per-row MLA context length, i.e. valid cache slots including this step.
     pub(crate) context_len: CudaSlice<i32>,
-    /// Per-row destination of this step's cache write, `row * cap + position`,
-    /// or `-1` for a row this step does not own.
-    pub(crate) cache_row: CudaSlice<i32>,
-    /// `head_row[r * heads + h] = r`, the broadcast of one row's shared rope
-    /// half to every MLA head. Static.
-    pub(crate) head_row: CudaSlice<i32>,
+    /// Per-row destination of this step's paged latent write
+    /// ([`K3PagedKv::write_index`]), or `-1` for a row this step does not own.
+    pub(crate) kv_row: CudaSlice<i32>,
     // Residual stream.
     pub(crate) hidden: CudaSlice<bf16>,
     pub(crate) prefix: CudaSlice<bf16>,
@@ -617,13 +577,8 @@ pub(crate) struct K3Scratch {
     pub(crate) mla_gate: CudaSlice<bf16>,
     pub(crate) q_partial: CudaSlice<f32>,
     pub(crate) query: CudaSlice<bf16>,
-    pub(crate) kv_partial: CudaSlice<f32>,
-    pub(crate) kv: CudaSlice<bf16>,
-    pub(crate) k_nope: CudaSlice<bf16>,
-    pub(crate) k_new: HiddenStates,
-    pub(crate) v_new: HiddenStates,
-    pub(crate) rope: HiddenStates,
-    pub(crate) rope_heads: HiddenStates,
+    /// The shared per-token rope half, `[rows, 64]` — cached verbatim (NoPE).
+    pub(crate) rope: CudaSlice<bf16>,
     pub(crate) attn: CudaSlice<bf16>,
     // MLP / MoE.
     pub(crate) hidden_partial: CudaSlice<f32>,
@@ -673,18 +628,13 @@ impl K3Scratch {
         mega: Option<K3MegaGeometry>,
     ) -> Result<Self> {
         let stream = &ctx.stream;
-        let heads = K3_MLA_HEADS;
-        let head_row: Vec<i32> = (0..rows * heads)
-            .map(|entry| (entry / heads) as i32)
-            .collect();
         let wide = |width: usize| stream.alloc_zeros::<bf16>(rows * width);
         let partial = |width: usize| stream.alloc_zeros::<f32>(rows * width);
         let argmax_partials = argmax_batch_bf16_split_partials_len(rows, K3_VOCAB);
         Ok(Self {
             token_ids: stream.alloc_zeros(rows)?,
             context_len: stream.alloc_zeros(rows)?,
-            cache_row: stream.alloc_zeros(rows)?,
-            head_row: stream.clone_htod(&head_row)?,
+            kv_row: stream.clone_htod(&vec![-1i32; rows])?,
             hidden: wide(K3_HIDDEN)?,
             prefix: wide(K3_HIDDEN)?,
             mixed: wide(K3_HIDDEN)?,
@@ -714,29 +664,7 @@ impl K3Scratch {
             mla_gate: wide(K3_ATTN_INNER)?,
             q_partial: partial(K3_Q_B_OUT)?,
             query: wide(K3_Q_B_OUT)?,
-            kv_partial: partial(K3_KV_B_OUT)?,
-            kv: wide(K3_KV_B_OUT)?,
-            k_nope: wide(heads * K3_HEAD_DIM)?,
-            k_new: HiddenStates {
-                data: wide(K3_MLA_K_ROW)?,
-                hidden_dim: K3_MLA_K_ROW,
-                seq_len: rows,
-            },
-            v_new: HiddenStates {
-                data: wide(K3_MLA_V_ROW)?,
-                hidden_dim: K3_MLA_V_ROW,
-                seq_len: rows,
-            },
-            rope: HiddenStates {
-                data: wide(K3_QK_ROPE_HEAD_DIM)?,
-                hidden_dim: K3_QK_ROPE_HEAD_DIM,
-                seq_len: rows,
-            },
-            rope_heads: HiddenStates {
-                data: wide(heads * K3_QK_ROPE_HEAD_DIM)?,
-                hidden_dim: K3_QK_ROPE_HEAD_DIM,
-                seq_len: rows * heads,
-            },
+            rope: wide(K3_QK_ROPE_HEAD_DIM)?,
             attn: wide(K3_MLA_V_ROW)?,
             hidden_partial: partial(K3_HIDDEN)?,
             router_partial: partial(routed_experts)?,

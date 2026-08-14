@@ -56,6 +56,7 @@
 mod buffers;
 pub mod ep;
 mod gemm;
+mod paged_kv;
 mod step;
 
 use std::path::Path;
@@ -71,7 +72,6 @@ use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_kernels::ops::K3_BATCH_BUCKETS;
 use pegainfer_kernels::ops::K3_DEEPGEMM_SM100_GROUPS;
 use pegainfer_kernels::ops::K3_MAX_BATCH;
-use pegainfer_kernels::ops::K3_MAX_CTX;
 use pegainfer_kernels::ops::k3_batch_bucket;
 use pegainfer_kernels::tensor::DeviceContext;
 
@@ -111,6 +111,12 @@ const K3_CUDA_GRAPH_ENV: &str = "PEGAINFER_K3_CUDA_GRAPH";
 /// Concurrent slots per rank; rounded up to a compiled bucket, capped at the
 /// widest one.
 const K3_MAX_BATCH_ENV: &str = "PEGAINFER_K3_MAX_BATCH";
+/// Context ceiling per slot (tokens); the paged pool is sized from it when
+/// `kv_pages` is not set explicitly.
+const K3_MAX_CTX_ENV: &str = "PEGAINFER_K3_MAX_CTX";
+/// Default per-slot context ceiling. Free to raise: the cost is pool pages
+/// (27.6 KB per token across the 24 MLA layers), not compiled kernels.
+const K3_DEFAULT_MAX_CTX: usize = 4096;
 /// The only SM count the fused MegaMoE kernel is AOT-instantiated for. Its
 /// grid sync spans the whole grid, so the launch geometry is baked in.
 const K3_MEGA_SMS: usize = 152;
@@ -120,9 +126,14 @@ const K3_MEGA_SMS: usize = 152;
 const K3_MEGA_EP_SIZES: [usize; 2] = [1, 4];
 
 /// Slots per rank an expert-parallel launch takes when nothing says otherwise.
-/// Well inside the fused kernel's 384-row protocol maximum, and the value every
-/// EP gate and serve run has been measured at.
-const K3_EP_DEFAULT_MAX_BATCH: usize = 16;
+///
+/// The fused kernel's protocol maximum is 384 rows per rank, so the compiled
+/// bucket ceiling (128) is the target once the backbone goes FP8. Today the
+/// binding constraint is the KDA state slab: ~929 MB per slot (f32 recurrent
+/// x2 parity + conv windows across 69 layers), so 64 slots cost ~58 GiB —
+/// what fits next to the 224-expert rank's weights with room left for the
+/// paged MLA pool. An explicit `PEGAINFER_K3_MAX_BATCH` still wins.
+const K3_EP_DEFAULT_MAX_BATCH: usize = 64;
 
 /// What a launch decides about an executor before its weights are read.
 #[derive(Clone, Copy, Debug)]
@@ -130,8 +141,15 @@ pub struct K3ExecutorConfig {
     /// Concurrent slots, i.e. the row capacity of every state slab. Rounded up
     /// to a compiled bucket.
     pub max_batch: usize,
-    /// Cache slots per sequence. Must be a compiled MLA capacity.
+    /// Context ceiling per slot, in tokens. A runtime number: the paged
+    /// attention kernel walks block tables, so nothing is compiled per
+    /// capacity.
     pub max_ctx: usize,
+    /// Pages in the MLA latent KV pool (64 tokens per page, all MLA layers'
+    /// slices inside one page). `0` derives full coverage — every slot can
+    /// reach `max_ctx` — so allocation can only fail when this is set lower
+    /// (oversubscription is the caller's explicit choice).
+    pub kv_pages: usize,
     /// Layers to build; `K3_LAYERS` for the whole model.
     pub num_layers: usize,
     /// Capture and replay the step, rather than launching it eagerly.
@@ -188,7 +206,8 @@ impl Default for K3ExecutorConfig {
     fn default() -> Self {
         Self {
             max_batch: K3_MAX_BATCH,
-            max_ctx: K3_MAX_CTX[0],
+            max_ctx: K3_DEFAULT_MAX_CTX,
+            kv_pages: 0,
             num_layers: K3_LAYERS,
             cuda_graph: true,
             moe_transport: K3MoeTransport::MEGA,
@@ -214,6 +233,12 @@ impl K3ExecutorConfig {
             && (1..=K3_MAX_BATCH).contains(&slots)
         {
             self.max_batch = slots;
+        }
+        if let Ok(raw) = std::env::var(K3_MAX_CTX_ENV)
+            && let Ok(tokens) = raw.parse::<usize>()
+            && (1..=crate::config::K3_MAX_CONTEXT).contains(&tokens)
+        {
+            self.max_ctx = tokens;
         }
         self
     }
@@ -261,7 +286,7 @@ pub struct K3Executor {
     /// Step inputs, staged on the host and copied in before every step.
     token_host: Vec<u32>,
     context_len_host: Vec<i32>,
-    cache_row_host: Vec<i32>,
+    kv_row_host: Vec<i32>,
     sampled_host: Vec<i32>,
     thread_bound: bool,
     /// Present exactly when `ep_size > 1`: this rank's slab handshake with its
@@ -368,9 +393,10 @@ impl K3Executor {
     ) -> Result<Self> {
         let max_batch = k3_batch_bucket(config.max_batch)?;
         ensure!(
-            K3_MAX_CTX.contains(&config.max_ctx),
-            "K3 max_ctx {} is not a compiled MLA capacity {K3_MAX_CTX:?}",
-            config.max_ctx
+            (1..=crate::config::K3_MAX_CONTEXT).contains(&config.max_ctx),
+            "K3 max_ctx {} is outside 1..={}",
+            config.max_ctx,
+            crate::config::K3_MAX_CONTEXT
         );
         let num_sms = ctx
             .ctx
@@ -401,8 +427,23 @@ impl K3Executor {
             cuda_graph = false;
         }
 
-        let decode_state = K3StatePool::new(&ctx, max_batch, config.max_ctx, num_layers, blocks)?;
-        let prefill_state = K3StatePool::new(&ctx, 1, config.max_ctx, num_layers, blocks)?;
+        let slot_pages = config.max_ctx.div_ceil(paged_kv::K3_KV_PAGE_TOKENS);
+        let kv_pages = if config.kv_pages == 0 {
+            max_batch * slot_pages
+        } else {
+            config.kv_pages
+        };
+        let decode_state = K3StatePool::new(
+            &ctx,
+            max_batch,
+            config.max_ctx,
+            num_layers,
+            blocks,
+            kv_pages,
+        )?;
+        // The prefill pool is one row, so full coverage is one slot's pages.
+        let prefill_state =
+            K3StatePool::new(&ctx, 1, config.max_ctx, num_layers, blocks, slot_pages)?;
         if mega {
             ensure!(
                 K3_MEGA_EP_SIZES.contains(&ep_size),
@@ -496,7 +537,7 @@ impl K3Executor {
             prefill_graphs: (0..2).map(|_| CudaGraphState::new()).collect(),
             token_host: vec![0; max_batch],
             context_len_host: vec![1; max_batch],
-            cache_row_host: vec![-1; max_batch],
+            kv_row_host: vec![-1; max_batch],
             sampled_host: vec![0; max_batch],
             thread_bound: false,
             ep,
@@ -550,7 +591,6 @@ impl K3Executor {
             bucket,
             live_rows,
             parity,
-            max_ctx: self.max_ctx,
             groups: self.groups,
             masked_cap: K3_MASKED_CAP,
             num_sms: self.num_sms,
@@ -568,8 +608,8 @@ impl K3Executor {
             .memcpy_htod(&self.context_len_host, &mut self.scratch.context_len)
             .map_err(|error| anyhow::anyhow!("K3 context-length feed failed: {error}"))?;
         stream
-            .memcpy_htod(&self.cache_row_host, &mut self.scratch.cache_row)
-            .map_err(|error| anyhow::anyhow!("K3 cache-row feed failed: {error}"))
+            .memcpy_htod(&self.kv_row_host, &mut self.scratch.kv_row)
+            .map_err(|error| anyhow::anyhow!("K3 KV-row feed failed: {error}"))
     }
 
     /// Run one step against `pool`, through its graph when graphs are on.
@@ -593,6 +633,9 @@ impl K3Executor {
         let ctx = &self.ctx;
         let model = &self.model;
         let scratch = &mut self.scratch;
+        // The block table rides outside capture with the rest of the step
+        // inputs; the captured kernels read the device table by pointer.
+        pool.kv.sync_table(ctx)?;
         if !self.cuda_graph {
             let launches = self.mega_launches_per_step;
             if let Some(mega) = scratch.mega.as_mut() {
@@ -681,6 +724,15 @@ impl K3Executor {
         Ok(sampled)
     }
 
+    /// Test hook: reverse the decode pool's free page list, so the next
+    /// sequence's pages land at different physical ids in a different order.
+    /// The paged cache's core gate (`tests/paged_kv.rs`) is that no page
+    /// permutation can move a single logit bit.
+    #[doc(hidden)]
+    pub fn scramble_kv_pages(&mut self) {
+        self.decode_state.kv.reverse_free_list();
+    }
+
     /// Bring-up diagnostics: the logit row the most recent step left for
     /// `row`, widened to f32. Costs a device round trip; not a serving path.
     pub fn last_logits(&mut self, row: usize) -> Result<Vec<f32>> {
@@ -701,11 +753,14 @@ impl K3Executor {
     fn prefill_token(&mut self, token: u32, position: usize, parity: usize) -> Result<u32> {
         self.token_host[0] = token;
         self.context_len_host[0] = i32::try_from(position + 1)?;
-        self.cache_row_host[0] = i32::try_from(position)?;
+        self.prefill_state
+            .kv
+            .ensure_mapped(&self.ctx, 0, position)?;
+        self.kv_row_host[0] = self.prefill_state.kv.write_index(0, position)?;
         for row in 1..self.max_batch {
             self.token_host[row] = 0;
             self.context_len_host[row] = 1;
-            self.cache_row_host[row] = -1;
+            self.kv_row_host[row] = -1;
         }
         self.feed()?;
         self.run_step(true, 1, parity, 1)?;
@@ -825,7 +880,7 @@ impl K3Executor {
         for row in 0..self.max_batch {
             self.token_host[row] = 0;
             self.context_len_host[row] = 1;
-            self.cache_row_host[row] = -1;
+            self.kv_row_host[row] = -1;
         }
         for entry in batch {
             let position = self.decode_state.positions[entry.slot];
@@ -837,7 +892,11 @@ impl K3Executor {
             );
             self.token_host[entry.slot] = entry.last_token;
             self.context_len_host[entry.slot] = i32::try_from(position + 1)?;
-            self.cache_row_host[entry.slot] = i32::try_from(entry.slot * self.max_ctx + position)?;
+            self.decode_state
+                .kv
+                .ensure_mapped(&self.ctx, entry.slot, position)?;
+            self.kv_row_host[entry.slot] =
+                self.decode_state.kv.write_index(entry.slot, position)?;
         }
 
         self.feed()?;
