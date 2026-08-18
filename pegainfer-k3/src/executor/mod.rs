@@ -20,14 +20,23 @@
 //!
 //! ## Prefill
 //!
-//! Bring-up prefill is the decode step run once per prompt token, which is what
-//! produced the golden fixture this executor is gated against. It runs on a
-//! **separate one-row state pool** rather than on the sequence's own slot,
-//! because a batched step advances every row of its bucket: prefilling in place
-//! would step the sequences already decoding. When the prompt is consumed the
-//! one-row pool's state is copied into the slot, and the slot joins the batch.
-//! Chunked prefill is the phase that removes both the sequential loop and the
-//! second pool.
+//! Prefill runs the batched step over **chunks of one sequence**: the bucket's
+//! rows carry up to `chunk_tokens` consecutive prompt tokens (default: the
+//! 4224-row MegaMoE protocol maximum, clamped to `max_ctx`), so every
+//! row-independent stage (norms, projections, MoE) digests the whole chunk
+//! in one launch, the MLA layers attend `[context | chunk]` through one
+//! dense FlashMLA FMHA call per layer over kv_b-expanded scratch, and the
+//! KDA recurrence crosses the chunk as one chunkwise FlashKDA forward per
+//! layer ([`step::k3_prefill_chunk_step`]). Chunk steps skip the batched
+//! epilogue; the boundary token is sampled once after the final chunk
+//! ([`step::k3_prefill_boundary_sample`]). It runs on a
+//! **separate state pool**
+//! rather than on the sequence's own slot, because a batched step advances
+//! every row of its bucket: prefilling in place would step the sequences
+//! already decoding. The pool keeps one row of KDA/conv state (the recurrence
+//! is sequential anyway) but a full bucket of attention-residual snapshots and
+//! block-table rows. When the prompt is consumed the pool's state is copied
+//! into the slot, and the slot joins the batch.
 //!
 //! ## Graphs
 //!
@@ -72,7 +81,9 @@ use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_kernels::ops::K3_BATCH_BUCKETS;
 use pegainfer_kernels::ops::K3_DEEPGEMM_SM100_GROUPS;
 use pegainfer_kernels::ops::K3_MAX_BATCH;
+use pegainfer_kernels::ops::K3_MAX_CHUNK;
 use pegainfer_kernels::ops::k3_batch_bucket;
+use pegainfer_kernels::ops::k3_chunk_bucket;
 use pegainfer_kernels::tensor::DeviceContext;
 
 use self::buffers::K3MegaGeometry;
@@ -84,6 +95,8 @@ use self::ep::K3EpRuntime;
 use self::ep::ep_fatal;
 use self::step::K3StepShape;
 use self::step::k3_decode_step;
+use self::step::k3_prefill_boundary_sample;
+use self::step::k3_prefill_chunk_step;
 use crate::config::K3_DENSE_LAYERS;
 use crate::config::K3_LAYERS;
 use crate::config::K3MoeTopo;
@@ -127,7 +140,8 @@ const K3_MEGA_EP_SIZES: [usize; 2] = [1, 4];
 
 /// Slots per rank an expert-parallel launch takes when nothing says otherwise.
 ///
-/// The fused kernel's protocol maximum is 384 rows per rank, so the compiled
+/// The fused kernel's protocol maximum is 4224 rows per rank (sized for
+/// chunked prefill), so the compiled
 /// bucket ceiling (128) is the target once the backbone goes FP8. Today the
 /// binding constraint is the KDA state slab: ~929 MB per slot (f32 recurrent
 /// x2 parity + conv windows across 69 layers), so 64 slots cost ~58 GiB —
@@ -152,6 +166,11 @@ pub struct K3ExecutorConfig {
     pub kv_pages: usize,
     /// Layers to build; `K3_LAYERS` for the whole model.
     pub num_layers: usize,
+    /// Prefill chunk cap in tokens. `0` derives the widest the transport
+    /// carries: the MegaMoE protocol maximum (4224, clamped to `max_ctx`)
+    /// under the fused kernel, `max_batch` under the masked chain (whose
+    /// layout reserves at most [`K3_MASKED_CAP`] rows per expert).
+    pub chunk_tokens: usize,
     /// Capture and replay the step, rather than launching it eagerly.
     pub cuda_graph: bool,
     /// Which kernel runs the routed experts. Production is always
@@ -209,6 +228,7 @@ impl Default for K3ExecutorConfig {
             max_ctx: K3_DEFAULT_MAX_CTX,
             kv_pages: 0,
             num_layers: K3_LAYERS,
+            chunk_tokens: 0,
             cuda_graph: true,
             moe_transport: K3MoeTransport::MEGA,
         }
@@ -270,6 +290,8 @@ pub struct K3Executor {
     scratch: K3Scratch,
     max_batch: usize,
     max_ctx: usize,
+    /// Prefill chunk cap in tokens (see [`K3ExecutorConfig::chunk_tokens`]).
+    chunk_tokens: usize,
     groups: usize,
     num_sms: usize,
     /// Which half of the ping-pong state slabs the next decode step reads.
@@ -280,9 +302,8 @@ pub struct K3Executor {
     /// Mega launches this step must make: one per MoE layer. Zero single-rank,
     /// where there are no peers to fall out of step with.
     mega_launches_per_step: usize,
-    /// One graph per (bucket, parity); the prefill pool has its own pair.
+    /// One graph per (bucket, parity). Prefill chunks run eagerly.
     decode_graphs: Vec<CudaGraphState>,
-    prefill_graphs: Vec<CudaGraphState>,
     /// Step inputs, staged on the host and copied in before every step.
     token_host: Vec<u32>,
     context_len_host: Vec<i32>,
@@ -436,14 +457,44 @@ impl K3Executor {
         let decode_state = K3StatePool::new(
             &ctx,
             max_batch,
+            max_batch,
             config.max_ctx,
             num_layers,
             blocks,
             kv_pages,
         )?;
-        // The prefill pool is one row, so full coverage is one slot's pages.
-        let prefill_state =
-            K3StatePool::new(&ctx, 1, config.max_ctx, num_layers, blocks, slot_pages)?;
+        // The prefill chunk cap: the MegaMoE protocol maximum under the fused
+        // kernel (clamped to the context — a chunk can never exceed the
+        // prompt), the decode row capacity under the masked chain, whose
+        // layout caps rows per expert.
+        let chunk_tokens = if config.chunk_tokens > 0 {
+            config.chunk_tokens
+        } else if mega {
+            K3_MAX_CHUNK.min(config.max_ctx)
+        } else {
+            max_batch
+        };
+        ensure!(
+            mega || chunk_tokens <= K3_MASKED_CAP,
+            "K3 masked chain caps prefill chunks at {K3_MASKED_CAP} tokens, got {chunk_tokens}"
+        );
+        let chunk_bucket = k3_chunk_bucket(chunk_tokens)?;
+        // Every per-layer scratch buffer spans the widest bucket any step
+        // runs; the epilogue buffers stay at the decode rows (a prefill chunk
+        // samples its boundary token through a one-row pass instead).
+        let scratch_rows = max_batch.max(chunk_bucket);
+        // The prefill pool holds ONE sequence (one row of KDA state, one page
+        // chain — full coverage is one slot's pages) but steps it a chunk at
+        // a time, so its snapshot slab and block table span the chunk bucket.
+        let prefill_state = K3StatePool::new(
+            &ctx,
+            1,
+            chunk_bucket,
+            config.max_ctx,
+            num_layers,
+            blocks,
+            slot_pages,
+        )?;
         if mega {
             ensure!(
                 K3_MEGA_EP_SIZES.contains(&ep_size),
@@ -476,7 +527,9 @@ impl K3Executor {
         }
         let mut scratch = K3Scratch::new(
             &ctx,
+            scratch_rows,
             max_batch,
+            config.max_ctx,
             routed_experts,
             groups,
             K3_MASKED_CAP,
@@ -531,13 +584,13 @@ impl K3Executor {
             } else {
                 0
             },
+            chunk_tokens,
             decode_graphs: (0..2 * bucket_count)
                 .map(|_| CudaGraphState::new())
                 .collect(),
-            prefill_graphs: (0..2).map(|_| CudaGraphState::new()).collect(),
-            token_host: vec![0; max_batch],
-            context_len_host: vec![1; max_batch],
-            kv_row_host: vec![-1; max_batch],
+            token_host: vec![0; scratch_rows],
+            context_len_host: vec![1; scratch_rows],
+            kv_row_host: vec![-1; scratch_rows],
             sampled_host: vec![0; max_batch],
             thread_bound: false,
             ep,
@@ -591,6 +644,7 @@ impl K3Executor {
             bucket,
             live_rows,
             parity,
+            chunk_start: 0,
             groups: self.groups,
             masked_cap: K3_MASKED_CAP,
             num_sms: self.num_sms,
@@ -612,24 +666,15 @@ impl K3Executor {
             .map_err(|error| anyhow::anyhow!("K3 KV-row feed failed: {error}"))
     }
 
-    /// Run one step against `pool`, through its graph when graphs are on.
-    fn run_step(
-        &mut self,
-        prefill: bool,
-        bucket: usize,
-        parity: usize,
-        live_rows: usize,
-    ) -> Result<()> {
+    /// Run one decode step, through its graph when graphs are on.
+    fn run_step(&mut self, bucket: usize, parity: usize, live_rows: usize) -> Result<()> {
         let shape = self.shape(bucket, parity, live_rows);
-        let (pool, graph_index) = if prefill {
-            (&mut self.prefill_state, parity)
-        } else {
-            let bucket_index = K3_BATCH_BUCKETS
-                .iter()
-                .position(|candidate| *candidate == bucket)
-                .expect("bucket comes from k3_batch_bucket");
-            (&mut self.decode_state, 2 * bucket_index + parity)
-        };
+        let bucket_index = K3_BATCH_BUCKETS
+            .iter()
+            .position(|candidate| *candidate == bucket)
+            .expect("bucket comes from k3_batch_bucket");
+        let graph_index = 2 * bucket_index + parity;
+        let pool = &mut self.decode_state;
         let ctx = &self.ctx;
         let model = &self.model;
         let scratch = &mut self.scratch;
@@ -647,21 +692,11 @@ impl K3Executor {
                 .as_ref()
                 .map_or(Ok(()), K3MegaScratch::end_step);
         }
-        let graphs = if prefill {
-            &mut self.prefill_graphs
-        } else {
-            &mut self.decode_graphs
-        };
-        let mut graph = std::mem::take(&mut graphs[graph_index]);
+        let mut graph = std::mem::take(&mut self.decode_graphs[graph_index]);
         // Capture is off above one rank, so a captured body is always a
         // single-rank step with nobody to fall out of phase with.
         let result = graph.run_or_capture(ctx, || k3_decode_step(ctx, model, shape, pool, scratch));
-        let graphs = if prefill {
-            &mut self.prefill_graphs
-        } else {
-            &mut self.decode_graphs
-        };
-        graphs[graph_index] = graph;
+        self.decode_graphs[graph_index] = graph;
         result
     }
 
@@ -747,32 +782,19 @@ impl K3Executor {
         self.gpu.sync()?;
         Ok(logits.into_iter().map(f32::from).collect())
     }
-
-    /// The decode step this executor's tests drive directly: feed one row's
-    /// token at `position`, step the prefill pool, return the argmax.
-    fn prefill_token(&mut self, token: u32, position: usize, parity: usize) -> Result<u32> {
-        self.token_host[0] = token;
-        self.context_len_host[0] = i32::try_from(position + 1)?;
-        self.prefill_state
-            .kv
-            .ensure_mapped(&self.ctx, 0, position)?;
-        self.kv_row_host[0] = self.prefill_state.kv.write_index(0, position)?;
-        for row in 1..self.max_batch {
-            self.token_host[row] = 0;
-            self.context_len_host[row] = 1;
-            self.kv_row_host[row] = -1;
-        }
-        self.feed()?;
-        self.run_step(true, 1, parity, 1)?;
-        self.prefill_state.positions[0] = position + 1;
-        Ok(self.sampled(1)?[0] as u32)
-    }
 }
 
 fn read_config(model_path: &Path) -> Result<serde_json::Value> {
     let raw = std::fs::read_to_string(model_path.join("config.json"))
         .with_context(|| format!("read {}/config.json", model_path.display()))?;
     serde_json::from_str(&raw).context("parse the K3 config.json")
+}
+
+impl K3Executor {
+    /// The prefill chunk cap this executor runs, in tokens.
+    pub fn chunk_tokens(&self) -> usize {
+        self.chunk_tokens
+    }
 }
 
 impl StepExecutor for K3Executor {
@@ -827,15 +849,73 @@ impl K3Executor {
         self.enter_step()?;
         self.prefill_state.reset_row(&self.ctx, 0)?;
 
+        // Walk the prompt in chunks of up to `max_batch` tokens; each chunk is
+        // one batched step whose rows are the chunk's consecutive tokens.
+        // Prefill always runs eagerly — the chunk's KDA loop makes its launch
+        // count depend on the token count, so there is no fixed body to
+        // capture per bucket.
         let mut parity = 0usize;
-        let mut sampled = 0u32;
-        for (position, token) in prompt.iter().enumerate() {
-            sampled = self.prefill_token(*token, position, parity)?;
+        let mut consumed = 0usize;
+        let mut last_tokens = 1usize;
+        while consumed < prompt.len() {
+            let tokens = self.chunk_tokens.min(prompt.len() - consumed);
+            let bucket = k3_chunk_bucket(tokens)?;
+            for (row, token) in prompt[consumed..consumed + tokens].iter().enumerate() {
+                let position = consumed + row;
+                self.token_host[row] = *token;
+                self.context_len_host[row] = i32::try_from(position + 1)?;
+                self.prefill_state
+                    .kv
+                    .ensure_mapped(&self.ctx, 0, position)?;
+                self.kv_row_host[row] = self.prefill_state.kv.write_index(0, position)?;
+            }
+            for row in tokens..bucket {
+                self.token_host[row] = 0;
+                self.context_len_host[row] = 1;
+                self.kv_row_host[row] = -1;
+            }
+            // Every row of the bucket reads the one sequence's pages; a padded
+            // row sees context length 1 and its result is discarded.
+            self.prefill_state.kv.mirror_row_table(0, bucket)?;
+            self.feed()?;
+            self.prefill_state.kv.sync_table(&self.ctx)?;
+            let mut shape = self.shape(bucket, parity, tokens);
+            shape.chunk_start = consumed;
+            let launches = self.mega_launches_per_step;
+            if let Some(mega) = self.scratch.mega.as_mut() {
+                mega.begin_step(launches);
+            }
+            k3_prefill_chunk_step(
+                &self.ctx,
+                &self.model,
+                shape,
+                &mut self.prefill_state,
+                &mut self.scratch,
+            )?;
+            if let Some(mega) = self.scratch.mega.as_ref() {
+                mega.end_step()?;
+            }
+            // Under the chunkwise KDA kernel parity is a per-chunk double
+            // buffer: every chunk reads one slab and lands in the other.
             parity ^= 1;
+            consumed += tokens;
+            last_tokens = tokens;
+            self.prefill_state.positions[0] = consumed;
         }
-
-        // Hand the finished sequence to its slot, landing the state in the
-        // half the next decode step will read.
+        // The chunk steps skipped the batched epilogue; sample the boundary
+        // token once, at one row, over the final chunk's last live token.
+        // The snapshot collapse it needs is the same one `adopt_row` wants —
+        // the final token's snapshots move to row 0, the handover row.
+        self.prefill_state
+            .collapse_snapshots(&self.ctx, last_tokens - 1)?;
+        k3_prefill_boundary_sample(
+            &self.ctx,
+            &self.model,
+            last_tokens - 1,
+            &self.prefill_state.blocks,
+            &mut self.scratch,
+        )?;
+        let sampled = self.sampled(1)?[0] as u32;
         self.decode_state.reset_row(&self.ctx, slot)?;
         let target_parity = self.parity;
         self.decode_state.adopt_row(
@@ -901,7 +981,7 @@ impl K3Executor {
 
         self.feed()?;
         let parity = self.parity;
-        self.run_step(false, bucket, parity, rows)?;
+        self.run_step(bucket, parity, rows)?;
         self.parity ^= 1;
         for entry in batch {
             self.decode_state.positions[entry.slot] += 1;

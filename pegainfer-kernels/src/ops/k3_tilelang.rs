@@ -41,6 +41,17 @@ use crate::tensor::DeviceContext;
 
 /// Batch buckets the generator instantiates, ascending.
 pub const K3_BATCH_BUCKETS: [usize; 10] = [1, 2, 4, 8, 16, 32, 48, 64, 96, 128];
+
+/// Prefill chunk buckets: the chunked-prefill step runs the same batched
+/// families at chunk width, whose ceiling is the MegaMoE protocol maximum
+/// (4224 rows). Compiled for every family except `kda_core` — chunks cross
+/// the KDA recurrence through FlashKDA, so the fused core never sees a
+/// chunk-sized bucket.
+pub const K3_PREFILL_BUCKETS: [usize; 5] = [256, 512, 1024, 2048, 4224];
+
+/// The largest prefill chunk any configuration can run — the MegaMoE
+/// protocol maximum (`k3_mega_max_tokens_per_rank`).
+pub const K3_MAX_CHUNK: usize = 4224;
 /// Largest bucket, i.e. the row capacity every reusable buffer should have.
 pub const K3_MAX_BATCH: usize = 128;
 
@@ -85,11 +96,25 @@ pub fn k3_batch_bucket(rows: usize) -> Result<usize> {
         .ok_or_else(|| anyhow!("K3 decode batch {rows} exceeds the largest bucket {K3_MAX_BATCH}"))
 }
 
+/// Round a prefill chunk's token count up to its compiled bucket — the decode
+/// ladder extended by [`K3_PREFILL_BUCKETS`] up to the [`K3_MAX_CHUNK`]
+/// protocol ceiling.
+pub fn k3_chunk_bucket(rows: usize) -> Result<usize> {
+    ensure!(rows > 0, "K3 chunk needs at least one row");
+    K3_BATCH_BUCKETS
+        .into_iter()
+        .chain(K3_PREFILL_BUCKETS)
+        .find(|bucket| *bucket >= rows)
+        .ok_or_else(|| {
+            anyhow!("K3 chunk of {rows} tokens exceeds the largest bucket {K3_MAX_CHUNK}")
+        })
+}
+
 fn check_bucket(b: usize) -> Result<()> {
     ensure!(
-        K3_BATCH_BUCKETS.contains(&b),
-        "K3 batch {b} is not a compiled bucket; round with k3_batch_bucket \
-         (buckets: {K3_BATCH_BUCKETS:?})"
+        K3_BATCH_BUCKETS.contains(&b) || K3_PREFILL_BUCKETS.contains(&b),
+        "K3 batch {b} is not a compiled bucket; round with k3_batch_bucket / k3_chunk_bucket \
+         (buckets: {K3_BATCH_BUCKETS:?} + {K3_PREFILL_BUCKETS:?})"
     );
     Ok(())
 }
@@ -512,6 +537,53 @@ pub fn k3_kda_core_batched_launch(
     )
 }
 
+/// `kda_core`'s tail on its own: per (row, head) the f32 rms_norm of the bf16
+/// attention landing `x` times the o_norm gamma `go [head_dim]`, landed once,
+/// times the bf16 sigmoid of the output gate `g2` — word-for-word the batched
+/// kernel's last loop. Chunked prefill computes the attention through FlashKDA
+/// and finishes its rows here.
+pub fn k3_o_norm_gate_batched_launch(
+    ctx: &DeviceContext,
+    b: usize,
+    num_heads: usize,
+    head_dim: usize,
+    x: &CudaSlice<bf16>,
+    g2: &CudaSlice<bf16>,
+    go: &CudaSlice<f32>,
+    out: &mut CudaSlice<bf16>,
+) -> Result<()> {
+    check_bucket(b)?;
+    let kp = num_heads * head_dim;
+    ensure!(
+        x.len() >= b * kp && g2.len() >= b * kp && out.len() >= b * kp && go.len() >= head_dim,
+        "K3 o_norm_gate buffers too small for b={b}, kp={kp}: x {}, g2 {}, go {}, out {}",
+        x.len(),
+        g2.len(),
+        go.len(),
+        out.len()
+    );
+    let (x_ptr, _x_guard) = x.device_ptr(&ctx.stream);
+    let (g2_ptr, _g2_guard) = g2.device_ptr(&ctx.stream);
+    let (go_ptr, _go_guard) = go.device_ptr(&ctx.stream);
+    let (out_ptr, _out_guard) = out.device_ptr_mut(&ctx.stream);
+    let rc = unsafe {
+        ffi::k3_o_norm_gate_batched(
+            x_ptr as *const c_void,
+            g2_ptr as *const c_void,
+            go_ptr as *const f32,
+            out_ptr as *mut c_void,
+            b as i32,
+            num_heads as i32,
+            head_dim as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    check(
+        rc,
+        &format!("K3 o_norm_gate_batched (B={b}, KH={num_heads}, KD={head_dim})"),
+    )
+}
+
 /// Sigmoid router plus biased top-k over already-merged f32 score rows.
 ///
 /// The weights come from the *un-biased* scores, are normalized with a
@@ -701,6 +773,20 @@ mod tests {
             assert!(check_bucket(bucket).is_ok());
         }
         assert!(check_bucket(3).is_err());
+    }
+
+    #[test]
+    fn chunk_buckets_extend_the_decode_ladder_to_the_protocol_max() {
+        assert!(K3_PREFILL_BUCKETS.windows(2).all(|w| w[0] < w[1]));
+        assert!(K3_PREFILL_BUCKETS[0] > K3_MAX_BATCH);
+        assert_eq!(*K3_PREFILL_BUCKETS.last().unwrap(), K3_MAX_CHUNK);
+        for bucket in K3_BATCH_BUCKETS.into_iter().chain(K3_PREFILL_BUCKETS) {
+            assert_eq!(k3_chunk_bucket(bucket).unwrap(), bucket);
+            assert!(check_bucket(bucket).is_ok());
+        }
+        assert_eq!(k3_chunk_bucket(K3_MAX_BATCH + 1).unwrap(), 256);
+        assert_eq!(k3_chunk_bucket(4096).unwrap(), K3_MAX_CHUNK);
+        assert!(k3_chunk_bucket(K3_MAX_CHUNK + 1).is_err());
     }
 
     #[test]

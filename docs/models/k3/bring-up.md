@@ -18,9 +18,17 @@ absorbed-MLA CUDA kernel with no compile-time context cap (the old 1.47
 MB/token expanded slot cache and its `max_ctx = 128` are gone). Kernel surface:
 eleven batched TileLang decode families + the hand-written paged-attention
 kernel + DeepGEMM FP8xFP4 AOT shims (fused MegaMoE and the masked grouped GEMM)
-behind `pegainfer-kernels`'s `k3` feature; dense projections on cuBLASLt. Next:
-CUDA graphs over the EP4 fused path, real (chunked) prefill, kv-store
-integration.
+behind `pegainfer-kernels`'s `k3` feature; dense projections on cuBLASLt.
+Prefill is **chunked at the MegaMoE protocol width**: up to 4224 consecutive
+prompt tokens per batched step (a 4096-token prompt is ONE step), with the
+KDA recurrence crossing each chunk as one **vendored FlashKDA** chunkwise
+forward per layer (MoonshotAI, MIT, `third_party/flash-kda`) and the MLA
+layers served by **FlashMLA's SM100 dense FMHA** over kv_b-expanded K/V in
+fixed workspace (vLLM's recipe; the paged latent stays the only persistent
+storage). Chunk steps skip the batched epilogue — the boundary token is
+sampled once, at one row, after the final chunk. 6x-247x TTFT over per-token
+stepping at the 4-layer snapshot (2048 tokens: 6377 → 25.8 ms). Next: CUDA
+graphs over the EP4 fused path, kv-store integration.
 
 Last touched: 2026-08
 
@@ -97,7 +105,7 @@ owns graphs and the `StepExecutor` impl.
   recurrent state advances — a seat's state is only meaningful while the seat
   is in *every* batch. The scheduler preserves this (running requests decode
   every step; `prefill` resets the seat at admission). Prefill runs on a
-  separate one-row pool and hands its state over by row copy.
+  separate pool and hands its state over by row copy (see Chunked prefill).
 - **Bring-up flags**: `PEGAINFER_K3_LAYERS` (layer truncation),
   `PEGAINFER_K3_MAX_BATCH`, `PEGAINFER_K3_CUDA_GRAPH`,
   `PEGAINFER_K3_MAX_CTX` (per-slot context ceiling, default 4096).
@@ -123,6 +131,104 @@ cross-bucket gate holds to the fixture with the same noise-floor rule.
 dominate — known to lose to a GEMV below ~8 rows/expert). Graphs buy ~4.5%;
 the step is not launch-bound. Absolute numbers move a few percent with box
 load, so compare within a session, not across.
+
+### Chunked prefill
+
+A prompt is walked in chunks of up to `chunk_tokens` consecutive tokens; each
+chunk is one batched step whose *rows are the chunk's tokens* (`executor/`:
+`prefill_inner` → `step::k3_prefill_chunk_step`). The cap defaults to the
+**MegaMoE protocol maximum (4224 rows**, clamped to `max_ctx`; the masked
+chain stays at `max_batch` — its layout reserves 128 rows per expert): the
+batched TileLang families carry five prefill-only buckets
+(`256/512/1024/2048/4224`, every family except the decode-only `kda_core`),
+the fused MegaMoE launch was already protocol-max, and the GEMMs take rows
+at runtime. Chunk steps **skip the batched epilogue** entirely — a
+chunk-wide lm_head would cost ~10 TFLOP and a 4 GB vocab buffer per step for
+rows nobody reads — and the boundary token is sampled once after the final
+chunk by `k3_prefill_boundary_sample`: collapse the last live row's
+snapshots to row 0 (the same collapse the decode handover needs anyway),
+then a `b = 1` pass of the ordinary epilogue. The vocab-wide scratch
+therefore stays sized by the decode rows; the per-layer scratch spans the
+chunk bucket (~7 GB extra at 4224 — the price of the wide step).
+What made the chunking itself nearly free:
+
+- **MLA is one dense FMHA call per layer** over FlashMLA's SM100 CUTLASS
+  forward (`third_party/FlashMLA/csrc/sm100/prefill/dense`, shimmed torch-free
+  in `csrc/k3/k3_flash_mla_prefill.cu`), following vLLM's chunked-prefill MLA
+  recipe: gather the cached latent rows into fixed workspace (the chunk's own
+  rows were just appended, so the cache holds the whole `[context | chunk]`
+  span), expand through `kv_b` (one cuBLAS GEMM; V is read as a strided view
+  into the expansion, K assembled by a small broadcast kernel), and let
+  `CausalMask<false>`'s bottom-right alignment — Q rows sit at the *end* of
+  the KV axis — give chunk token `i` exactly `context + i + 1` visible keys.
+  While the workspace covers `max_ctx` (4096 at bring-up, ~341 MB scratch),
+  vLLM's context loop and LSE merge degenerate to this single call; the
+  W-chunked loop is the extension point if `max_ctx` outgrows the workspace.
+  **The expanded K/V is per-chunk scratch, not a cache** — the retired 1.47
+  MB/token expanded slot cache stays retired. The first cut of this phase
+  reused the absorbed *decode* kernel per row (causal via per-row
+  `context_len`), which was O(L²) latent reads per chunk — that was 95% of
+  the 2048-token TTFT.
+- **The conv is batched bitwise.** Window rows are prebuilt from the landed
+  bf16 inputs themselves (`window[t][j] = x[t-3+j]`, carry from the previous
+  chunk's state), so every window value equals what sequential stepping would
+  have shifted through the slabs; one `k3_conv_silu` launch covers the chunk.
+  This needed one new AOT land config (`(KDA_DIM, KDA_DIM, 0)`) — the
+  sequential engine casts conv inputs inside the conv kernel, the chunk needs
+  them landed *before* the window build.
+- **The KDA delta rule is one chunkwise FlashKDA forward per layer**
+  (`third_party/flash-kda` — MoonshotAI's own CUTLASS/CuTe chunkwise KDA
+  kernel, MIT, vendored; see its PROVENANCE.md). Two launches replace the
+  69-layers × tokens b=1 walk the first cut of this phase shipped. The C ABI
+  shim (`csrc/k3/k3_flash_kda.cu`) pins D=128 / f32 state / one sequence per
+  call; the gate math is the fused core's own formula applied in-kernel from
+  the same pre-activation bf16 landing, beta sigmoid in-kernel, and the f32
+  recurrent slab plugs in directly ([H, V, K] both sides). What is *not* in
+  FlashKDA — the per-head o_norm × sigmoid output gate — is the new
+  `k3_o_norm_gate` TileLang family, word-for-word the fused core's tail.
+  Parity becomes a per-chunk double buffer (read one slab, land in the
+  other) instead of a per-token flip. KDA state stays one row per pool
+  (~929 MB/slot forbids chunk-wide state). Decode is untouched: it keeps the
+  bit-matched fused TileLang core.
+- **The prefill pool is asymmetric**: one row of KDA/conv state (the
+  recurrence is sequential anyway), a full bucket of attention-residual
+  snapshot rows and block-table rows (`attn_rows`). Handoff collapses the last
+  live row's snapshots to row 0, then `adopt_row` copies as before. Prefill
+  runs eagerly — the KDA walk makes the launch count depend on the token
+  count, so there is no fixed body to capture per bucket.
+
+Equivalence: the conv is bitwise against sequential stepping; FlashKDA
+computes the same delta rule but with an f32 q/k l2norm chain (the TileLang
+core mirrors the reference's bf16 chain) and chunkwise accumulation order,
+and the GEMM bucket retiles — so chunked prefill is held to the fixture's
+noise floor, and the state a slot adopts can legitimately send a greedy
+continuation off the bit-exact baseline at a ≤2-ULP coin-flip step (observed:
+one flip at a 1-ULP step). The two prefill gates therefore force-feed the
+fixture feed and hold every step to the noise-floor excusal:
+`prefill_then_decode…` (cap 1 — the degenerate single-token chunks) and
+`chunked_prefill_crosses_its_bucket_boundaries` (cap 8 vs a 13-token prompt:
+full chunk + ragged odd chunk + parity handling + padding rows). The EP
+oracle's busy peers prefill through chunks.
+
+TTFT snapshot (4-layer truncated, one GB300, `prefill_time_snapshot`),
+against the retired per-token prefill; the truncation carries ~3 KDA / 1 MLA
+layer where the full model is 69/24:
+
+| prompt | per-token | chunked (cap 128) | + FlashKDA | + FlashMLA | + 4224 cap | total |
+|--------|-----------|-------------------|------------|------------|------------|-------|
+| 64     | 132 ms    | 21.2 ms           | 18.1 ms    | 27.1 ms    | 23.7 ms    | 5.6x  |
+| 512    | 1176 ms   | 161 ms            | 114.5 ms   | 37.3 ms    | 25.8 ms    | 46x   |
+| 2048   | 6377 ms   | 1508 ms           | 1312 ms    | 61.1 ms    | 25.8 ms    | 247x  |
+
+The FlashMLA step killed the decode-shaped attention's O(L²) latent reads
+(~1.05 s of the 1.31 s at 2048); widening the cap then collapsed 2048 tokens
+from 16 chunks to one, paying the per-chunk fixed cost (per-layer FlashKDA /
+gather / kv_b GEMM / FMHA setup, plus the step's own overhead) once — 512
+and 2048 now cost the same wall clock. Chunk width changes GEMM bucket
+retiling and FlashKDA call boundaries, so different caps agree to the noise
+floor, not bitwise (verified: cap 64 vs 128 — both on the pre-existing
+ladder — diverge the same way a wide cap does; each cap is individually
+deterministic).
 
 ### MLA KV: paged latent cache + absorbed decode
 
@@ -211,9 +317,12 @@ it later:
 - **The only coupling is inside the step**, and it is a compile-time constant:
   every rank launches the same sequence at the same shapes on every step it
   takes. The scheduler calls `decode()` unconditionally — an idle rank pads the
-  step rather than skipping it — and prefill is sequential decode-shaped steps,
-  so a rank's prefill step pairs against a peer's decode step with no
-  negotiation.
+  step rather than skipping it — and a prefill chunk step issues the same
+  per-layer launch sequence as a decode step (the chunk's per-token KDA walk is
+  rank-local), so a rank's prefill step pairs against a peer's decode step with
+  no negotiation. What chunking *does* change is the step count a prompt
+  spends: `ceil(len/cap)` steps instead of one per token — a peer that finishes
+  earlier just pads, as ever.
 - **A step error is group-fatal** (log + exit). A rank that skips a launch
   leaves every peer inside a device barrier it will never reach; there is no
   state from which the group can serve a correct next token. GPU gates run one
@@ -257,16 +366,18 @@ the default and the only production path; there is no flag.
   routing weight into the activation *before* the down projection (the chain
   applies it at combine) and mid-quantizes per 32 elements rather than per
   128. Each is held to the golden fixture rather than to the other.
-- **One flat symmetric slab** (260 MiB at 224 experts) holds twelve
+- **One flat symmetric slab** holds twelve
   differently-typed regions: the FP8 activation and its packed scales, the
   routing pair, and the L1/L2 ring buffers. Its size and offsets are pure host
   arithmetic over the shapes, the candidate `BLOCK_M` set and the SM count —
   and they are kernel *template parameters*, so a rounded-up allocation is
-  wrong, not merely wasteful. At `ep_size 1` the slab is a plain device
-  allocation (260 MiB): the kernel's cross-rank barriers compile down to
-  grid-local synchronisation, so no IPC or NVSHMEM handle is involved. At
-  `ep_size 4` each rank owns one (209.8 MiB, ring 17280 tokens / SF ring
-  276480) on its own device and the world exchanges bare base pointers.
+  wrong, not merely wasteful. The slab is sized at the protocol maximum
+  (`k3_mega_max_tokens_per_rank` = 4224 rows, the chunked-prefill ceiling),
+  whatever the executor's live batch is. At `ep_size 1` the slab is a plain
+  device allocation (940 MiB, ring 48000 tokens): the kernel's cross-rank
+  barriers compile down to grid-local synchronisation, so no IPC or NVSHMEM
+  handle is involved. At `ep_size 4` each rank owns one (1633 MiB, ring
+  119424 tokens) on its own device and the world exchanges bare base pointers.
 - **The expert bank carries one layout or the other, never both** — a rank
   holds 84-189 GiB of experts. `K3ExpertBankForm` picks the layout at build
   time: the mega form interleaves the fused gate|up rows at granularity 8 and
@@ -307,8 +418,10 @@ own stream.
   the ring capacities and the experts-per-rank divisor. `1` and `4` are
   instantiated (`K3_MEGA_EP_SIZES`); anything else is refused at construction.
 - **One fixed block config for every rank and every step at EP4**, derived from
-  the protocol maximum (`num_max_tokens_per_rank = 384`) rather than the live
-  token count: BLOCK_M 192 / BLOCK_K 128. Two reasons. Nothing in the kernel
+  the protocol maximum (`num_max_tokens_per_rank = 4224`) rather than the live
+  token count: BLOCK_M 192 / BLOCK_K 128 (the same entry the old 384 maximum
+  selected, so raising the ceiling for chunked prefill left EP4 decode tiles
+  untouched — confirmed by an A/B step-time run within noise at every bucket). Two reasons. Nothing in the kernel
   forces the world to agree on a config, and heterogeneous tiling across a
   collective launch is unverified territory. And a fixed config makes a row's
   tile shape independent of how much traffic its peers are sending — which is
@@ -367,8 +480,15 @@ recorded here as the measurement, not as a configuration you can still select.
 
 ## Next
 
-Graphs over the EP4 fused path (the ranks=1 path already captures), then
-launch-ahead, real (chunked) prefill over the paged KV, kv-store `BlockPool`
-integration (content addressing / reuse for the MLA pages), and a perf pass on
-the paged attention kernel (the 3-sweep recompute reads the cache three times;
-fine at bring-up depth, worth a fused pass at 24 MLA layers x long contexts).
+Chunked prefill has landed end-to-end at the protocol width: the chunkwise
+KDA kernel (vendored FlashKDA), the dense MLA prefill attention (FlashMLA
+SM100 FMHA), and the 4224-token chunk cap with the one-row boundary sample —
+see Chunked prefill above. What remains on the prefill axis is a W-chunked
+context loop (+ LSE merge) if `max_ctx` outgrows the fixed expansion
+workspace, and trimming the wide step's f32 partial scratch if the ~7 GB
+ever bites. Then graphs over the EP4
+fused path (the ranks=1 path already captures), launch-ahead, kv-store
+`BlockPool` integration (content addressing / reuse for the MLA pages), and a
+perf pass on the paged attention kernel (the 3-sweep recompute reads the cache
+three times; fine at bring-up depth, worth a fused pass at 24 MLA layers x
+long contexts).

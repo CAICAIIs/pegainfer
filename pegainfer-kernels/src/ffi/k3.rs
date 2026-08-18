@@ -159,6 +159,10 @@ unsafe extern "C" {
     /// `num_max_tokens_per_rank` (`layout::kLCMCandidateBlockM`).
     pub fn k3_mega_token_alignment() -> i32;
 
+    /// Token capacity one rank's slab and the AOT kernels are built for
+    /// (`num_max_tokens_per_rank`). The launch accepts exactly this value.
+    pub fn k3_mega_max_tokens_per_rank() -> i32;
+
     /// Open the device pair `(self_ordinal, peer_ordinal)` for the kernel's
     /// cross-rank addressing: peer access from this device's context, plus a
     /// memory-pool access grant so this device's stream-ordered allocations are
@@ -260,6 +264,96 @@ unsafe extern "C" {
         num_sms: i32,
         activation: i32,
         cumulative_stats: *mut i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// Workspace bytes the FlashKDA forward needs for one sequence of
+    /// `t_total` tokens at `h` heads. Pure host arithmetic.
+    pub fn k3_flash_kda_workspace_bytes(t_total: i32, h: i32) -> i64;
+
+    /// beta `[T, H]` bf16 -> `[H, T]` bf16, the layout FlashKDA's 1D TMA
+    /// loads.
+    pub fn k3_flash_kda_beta_transpose(
+        beta_th: *const Half,
+        beta_ht: *mut Half,
+        t_total: i32,
+        h: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// One sequence through the vendored FlashKDA chunkwise forward
+    /// (third_party/flash-kda, MIT, MoonshotAI): q/k/v/g/out `[T, H, 128]`
+    /// bf16, g pre-activation (dt_bias/exp(A_log)/sigmoid/lower-bound applied
+    /// in-kernel), beta `[H, T]` bf16 logits, f32 recurrent state
+    /// `[H, 128, 128]` carried in and out. Requires an accelerated SM90+
+    /// build (`NOT_SUPPORTED` elsewhere).
+    pub fn k3_flash_kda_fwd(
+        q: *const Half,
+        k: *const Half,
+        v: *const Half,
+        g: *const Half,
+        beta_ht: *const Half,
+        a_log: *const f32,
+        dt_bias: *const f32,
+        state_in: *const f32,
+        state_out: *mut f32,
+        out: *mut Half,
+        workspace: *mut core::ffi::c_void,
+        t_total: i32,
+        h: i32,
+        scale: f32,
+        lower_bound: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// Chunked-prefill MLA context gather: walk one block-table row and split
+    /// `t_total` cached 576-wide latent rows into dense `[t, 512]` latent and
+    /// `[t, 64]` rope halves. Strides/offsets are in elements.
+    pub fn k3_mla_prefill_gather(
+        slab: *const Half,
+        table: *const i32,
+        page_stride: i64,
+        layer_offset: i64,
+        t_total: i32,
+        latent_out: *mut Half,
+        rope_out: *mut Half,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// Assemble per-head K rows `[t, heads, 192]` from the kv_b expansion
+    /// `[t, heads, 256]` (nope half) and the shared per-token rope `[t, 64]`
+    /// broadcast across heads.
+    pub fn k3_mla_prefill_expand_k(
+        nope_v: *const Half,
+        rope: *const Half,
+        k_out: *mut Half,
+        t_total: i32,
+        heads: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// FlashMLA SM100 dense FMHA forward (third_party/FlashMLA), one
+    /// sequence, bottom-right-aligned causal: q `[t_q, h, 192]`,
+    /// k `[t_kv, h, 192]`, v a strided `[t_kv, h, 128]` view, out
+    /// `[t_q, h, 128]`, all bf16; strides in elements. Requires an sm_100f
+    /// build (`NOT_SUPPORTED` elsewhere).
+    pub fn k3_flash_mla_prefill_fwd(
+        q: *const Half,
+        q_stride_tok: i64,
+        q_stride_head: i64,
+        k: *const Half,
+        k_stride_tok: i64,
+        k_stride_head: i64,
+        v: *const Half,
+        v_stride_tok: i64,
+        v_stride_head: i64,
+        out: *mut Half,
+        o_stride_tok: i64,
+        o_stride_head: i64,
+        t_q: i32,
+        t_kv: i32,
+        heads: i32,
+        scale: f32,
         stream: CUstream,
     ) -> CUresult;
 }
