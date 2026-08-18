@@ -94,7 +94,28 @@ pub(crate) fn start(model_path: &Path, options: &EngineLoadOptions) -> Result<En
                         }
                     }
                 }
-                if active.is_empty() && pending.is_empty() {
+                // Join a finished overlapped prefill: poll while other work
+                // exists, block on the lane when it is the only work left.
+                let lane_ready = match state.lane.as_mut() {
+                    Some(lane) if lane.inflight.is_some() => {
+                        let lane_is_only_work = active.is_empty() && pending.is_empty();
+                        if lane_is_only_work {
+                            lane.drain_or_abort();
+                        }
+                        lane_is_only_work || lane.inflight_complete()
+                    }
+                    _ => false,
+                };
+                if lane_ready {
+                    state.join_async_prefill(&mut active);
+                }
+                if active.is_empty()
+                    && pending.is_empty()
+                    && state
+                        .lane
+                        .as_ref()
+                        .is_none_or(|lane| lane.inflight.is_none())
+                {
                     if disconnected {
                         break 'engine;
                     }
@@ -112,6 +133,15 @@ pub(crate) fn start(model_path: &Path, options: &EngineLoadOptions) -> Result<En
                 // token however deep it is.
                 let mut attempts = 0;
                 while attempts < MAX_CONCURRENCY && active.len() < MAX_CONCURRENCY {
+                    // With the lane busy, arrivals wait in `pending` while
+                    // decode keeps stepping.
+                    if state
+                        .lane
+                        .as_ref()
+                        .is_some_and(|lane| lane.inflight.is_some())
+                    {
+                        break;
+                    }
                     let Some(item) = pending.pop_front() else {
                         break;
                     };
@@ -230,6 +260,114 @@ type Submitted = pegainfer_frontend::engine::SubmittedRequest;
 
 /// One in-flight request between decode steps: its KV, the token that feeds
 /// the next step, and its progress counters.
+/// Overlapped admission: with the lane on, a prompt arriving into a live
+/// decode batch prefills on its own stream while decode steps keep
+/// replaying on `ctx.stream` — the admission costs the streams a slowdown
+/// instead of a mixed step per prompt. `shared` lets the prefill grids
+/// compete for every SM; `green:NN` pins the lane to NN% of them, which is
+/// what actually protects decode ITL.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AsyncPrefillMode {
+    Off,
+    Shared,
+    Green(u32),
+}
+
+fn async_prefill_mode() -> Result<AsyncPrefillMode> {
+    match std::env::var("PEGAINFER_ASYNC_PREFILL") {
+        Ok(raw) => parse_async_prefill_mode(&raw),
+        Err(_) => Ok(AsyncPrefillMode::Off),
+    }
+}
+
+fn parse_async_prefill_mode(raw: &str) -> Result<AsyncPrefillMode> {
+    let v = raw.trim().to_ascii_lowercase();
+    match v.as_str() {
+        "" | "0" | "false" | "off" => Ok(AsyncPrefillMode::Off),
+        "shared" => Ok(AsyncPrefillMode::Shared),
+        other => match other.strip_prefix("green:").and_then(|p| p.parse().ok()) {
+            Some(pct) if (1..=99).contains(&pct) => Ok(AsyncPrefillMode::Green(pct)),
+            _ => anyhow::bail!(
+                "PEGAINFER_ASYNC_PREFILL={raw:?} not recognized (off | shared | green:NN, 1..=99)"
+            ),
+        },
+    }
+}
+
+/// One in-flight overlapped prefill, parked until the lane's completion
+/// event fires: the request, its KV, and the pass owning every device
+/// buffer the in-flight kernels still read.
+struct InflightPrefill {
+    request: GenerateRequest,
+    kv: GemmaKv,
+    pass: crate::serve::PrefillPass,
+    /// The cache entry this request resumed from, if any — its stale
+    /// ancestor at capture time.
+    resumed: Option<u64>,
+}
+
+/// The overlap lane: a dedicated prefill stream and a reusable completion
+/// event. At most one prefill is in flight; while it runs, later arrivals
+/// wait in the queue and decode keeps stepping — which is the point.
+struct AsyncPrefillLane {
+    stream: crate::green_ctx::PrefillLaneStream,
+    event: cudarc::driver::CudaEvent,
+    inflight: Option<InflightPrefill>,
+}
+
+impl AsyncPrefillLane {
+    fn new(ctx: &DeviceContext, mode: AsyncPrefillMode) -> Result<Self> {
+        let stream = match mode {
+            AsyncPrefillMode::Off => anyhow::bail!("async prefill lane built with mode Off"),
+            AsyncPrefillMode::Shared => crate::green_ctx::PrefillLaneStream::shared()?,
+            AsyncPrefillMode::Green(pct) => {
+                crate::green_ctx::PrefillLaneStream::green(ctx.device_ordinal, pct)?
+            }
+        };
+        let event = ctx
+            .ctx
+            .new_event(None)
+            .map_err(|e| anyhow::anyhow!("prefill completion event create failed: {e}"))?;
+        Ok(Self {
+            stream,
+            event,
+            inflight: None,
+        })
+    }
+
+    /// True once the in-flight prefill's event has fired. An unexpected
+    /// query error aborts: the pass's buffers may still be in use and no
+    /// safe recovery exists.
+    fn inflight_complete(&self) -> bool {
+        debug_assert!(self.inflight.is_some());
+        let query = unsafe { cudarc::driver::sys::cuEventQuery(self.event.cu_event()) };
+        match query {
+            cudarc::driver::sys::CUresult::CUDA_SUCCESS => true,
+            cudarc::driver::sys::CUresult::CUDA_ERROR_NOT_READY => false,
+            other => {
+                log::error!("FATAL: cuEventQuery(prefill) failed ({other:?}); aborting");
+                std::process::abort();
+            }
+        }
+    }
+
+    /// Block until the lane stream is drained; abort on failure rather
+    /// than let the pass's buffers be reused under in-flight kernels.
+    fn drain_or_abort(&self) {
+        let sync = unsafe { cudarc::driver::sys::cuStreamSynchronize(self.stream.stream) };
+        if sync != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            log::error!("FATAL: cuStreamSynchronize(prefill) failed ({sync:?}); aborting");
+            std::process::abort();
+        }
+    }
+}
+
+impl Drop for AsyncPrefillLane {
+    fn drop(&mut self) {
+        self.drain_or_abort();
+    }
+}
+
 struct Active {
     request: GenerateRequest,
     kv: GemmaKv,
@@ -279,6 +417,9 @@ struct EngineState {
     /// mixed into the per-call seed; a request's own `params.seed` replays
     /// via (seed, step) regardless of it.
     sample_nonce: u64,
+    /// The overlap lane; `None` unless `PEGAINFER_ASYNC_PREFILL` opted in
+    /// at startup.
+    lane: Option<AsyncPrefillLane>,
 }
 
 impl EngineState {
@@ -289,8 +430,10 @@ impl EngineState {
         base_seed: u64,
         graph_enabled: bool,
     ) -> Result<Self> {
-        // Refuse an unservable global GQA shape before the multi-GiB load.
+        // Refuse an unservable global GQA shape or a bad lane mode before
+        // the multi-GiB load.
         crate::serve::global_split_factor(&crate::config::Gemma4Config::from_file(dir)?)?;
+        let lane_mode = async_prefill_mode()?;
         let (weights, _) = Gemma4Weights::from_safetensors(dir, device)?;
         let ctx = DeviceContext::new_with_device(device)?;
         let vocab = weights.embed_tokens.rows;
@@ -332,6 +475,10 @@ impl EngineState {
             .stream
             .clone_htod(&[bf16::NEG_INFINITY])
             .map_err(|err| anyhow::anyhow!("allocating the suppression sentinel failed: {err}"))?;
+        let lane = match lane_mode {
+            AsyncPrefillMode::Off => None,
+            mode => Some(AsyncPrefillLane::new(&ctx, mode)?),
+        };
         Ok(Self {
             ctx,
             serve,
@@ -342,6 +489,7 @@ impl EngineState {
             blocked,
             base_seed,
             sample_nonce: 0,
+            lane,
         })
     }
 
@@ -457,6 +605,15 @@ impl EngineState {
             return Admitted::Done;
         }
 
+        // Overlapped admission: the prefill launches onto the lane stream
+        // and this call returns immediately — decode steps continue while it
+        // runs. A prompt arriving with nothing active stays on the sync
+        // path: there is nothing to protect, and full-SM speed wins the head
+        // of every refill burst.
+        if self.lane.is_some() && !active.is_empty() {
+            return self.launch_async_prefill(request, kv, resumed);
+        }
+
         // Mixed admission: with a live decode batch, the prompt rides its
         // weight scan — one step prefills the newcomer and advances every
         // active row.
@@ -493,9 +650,29 @@ impl EngineState {
                 cache.insert(entry, resumed);
             }
         }
-        if let Err(err) =
-            suppress_logits(&self.ctx, &self.blocked, &mut logits, &self.policy.suppress)
-        {
+        self.first_token_flow(request, kv, &mut logits)
+    }
+
+    /// Suppress, sample and emit a prefill's first token from logits row 0,
+    /// then finish the request or hand it to the decode batch — the shared
+    /// tail of a sync admission and an overlapped-prefill join.
+    fn first_token_flow(
+        &mut self,
+        request: GenerateRequest,
+        kv: GemmaKv,
+        logits: &mut HiddenStates,
+    ) -> Admitted {
+        let sink = request.token_tx.clone();
+        let prompt_tokens = request.prompt_tokens.len();
+        let fail = |message: String| {
+            let _ = sink.send(TokenEvent::Error {
+                message,
+                prompt_tokens,
+                completion_tokens: 0,
+            });
+            Admitted::Done
+        };
+        if let Err(err) = suppress_logits(&self.ctx, &self.blocked, logits, &self.policy.suppress) {
             return fail(format!("{err:#}"));
         }
 
@@ -503,7 +680,7 @@ impl EngineState {
         let call_seed = self.base_seed ^ self.sample_nonce.rotate_left(17);
         let next = match pegainfer_sample::select_batch(
             &self.ctx,
-            &logits,
+            logits,
             &[&request.params],
             &[0],
             call_seed,
@@ -530,7 +707,7 @@ impl EngineState {
         let logprob = if request.logprobs > 0 {
             match pegainfer_sample::token_logprobs_batch(
                 &self.ctx,
-                &logits,
+                logits,
                 &[LogprobRequest {
                     row: 0,
                     picked: next,
@@ -556,6 +733,108 @@ impl EngineState {
             emitted: 1,
             prompt_tokens,
         }))
+    }
+
+    /// Launch one whole-prompt prefill onto the lane stream and record the
+    /// completion event. On a launch error the lane stream is drained
+    /// before the KV reservation drops, so no returned page can still be
+    /// written by a stale kernel.
+    fn launch_async_prefill(
+        &mut self,
+        request: GenerateRequest,
+        mut kv: GemmaKv,
+        resumed: Option<u64>,
+    ) -> Admitted {
+        let lane = self.lane.as_mut().expect("gated by the caller");
+        debug_assert!(lane.inflight.is_none());
+        // A restored prefix is already in the KV: the lane prefills only the
+        // unseen suffix, exactly like the sync and mixed paths.
+        let resume = kv.local.seq_len();
+        let launched = {
+            let _guard = unsafe {
+                pegainfer_core::tensor::StreamOverrideGuard::activate(lane.stream.stream)
+            };
+            self.serve
+                .prefill_into_logits(&self.ctx, &mut kv, &request.prompt_tokens[resume..])
+        };
+        let recorded = launched.and_then(|pass| {
+            lane.stream
+                .record_event(lane.event.cu_event())
+                .map(|()| pass)
+        });
+        match recorded {
+            Ok(pass) => {
+                lane.inflight = Some(InflightPrefill {
+                    request,
+                    kv,
+                    pass,
+                    resumed,
+                });
+                Admitted::Done
+            }
+            Err(err) => {
+                log::error!("gemma4 async prefill launch failed: {err:#}");
+                lane.drain_or_abort();
+                let _ = request.token_tx.send(TokenEvent::Error {
+                    message: format!("prefill failed: {err:#}"),
+                    prompt_tokens: request.prompt_tokens.len(),
+                    completion_tokens: 0,
+                });
+                Admitted::Done
+            }
+        }
+    }
+
+    /// Join a completed overlapped prefill: run the deferred window
+    /// release, capture into the prefix cache, and take the first-token
+    /// flow the sync path uses.
+    fn join_async_prefill(&mut self, active: &mut Vec<Active>) {
+        let Some(lane) = self.lane.as_mut() else {
+            return;
+        };
+        let Some(inflight) = lane.inflight.take() else {
+            return;
+        };
+        let InflightPrefill {
+            request,
+            mut kv,
+            mut pass,
+            resumed,
+        } = inflight;
+        // The frontier after any prefill equals the prompt length; a lane
+        // pass that processed the wrong suffix cannot pass this gate.
+        if kv.local.seq_len() != request.prompt_tokens.len() {
+            log::error!(
+                "gemma4 async prefill frontier {} != prompt {}",
+                kv.local.seq_len(),
+                request.prompt_tokens.len()
+            );
+            let _ = request.token_tx.send(TokenEvent::Error {
+                message: "async prefill frontier mismatch".into(),
+                prompt_tokens: request.prompt_tokens.len(),
+                completion_tokens: 0,
+            });
+            return;
+        }
+        if let Err(err) = self.serve.release_prefill_window(&mut kv) {
+            let _ = request.token_tx.send(TokenEvent::Error {
+                message: format!("prefill window release failed: {err:#}"),
+                prompt_tokens: request.prompt_tokens.len(),
+                completion_tokens: 0,
+            });
+            return;
+        }
+        if let Some(cache) = self.prefix_cache.as_mut() {
+            if let Some(entry) =
+                self.serve
+                    .capture_checkpoint(&self.ctx, &kv, request.prompt_tokens.clone())
+            {
+                cache.insert(entry, resumed);
+            }
+        }
+        if let Admitted::Active(entry) = self.first_token_flow(request, kv, &mut pass.logits) {
+            active.push(*entry);
+        }
     }
 
     /// Retire every active request the next step cannot serve — a closed
@@ -920,5 +1199,231 @@ mod gate {
 
         let past_the_row = suppress_logits(&ctx, &blocked, &mut logits, &[vocab as u32]);
         assert!(past_the_row.is_err(), "an id past the row must be refused");
+    }
+}
+
+#[cfg(test)]
+mod lane_tests {
+    use std::path::Path;
+
+    use pegainfer_frontend::engine::EngineLoadOptions;
+    use pegainfer_frontend::engine::FinishReason;
+    use pegainfer_frontend::engine::GenerateRequest;
+    use pegainfer_frontend::engine::TokenEvent;
+    use pegainfer_frontend::engine::TokenSink;
+    use pegainfer_frontend::engine::TokenStreamReceiver;
+    use pegainfer_frontend::sampler::SamplingParams;
+
+    use super::AsyncPrefillMode;
+    use super::parse_async_prefill_mode;
+
+    fn submit(
+        handle: &pegainfer_frontend::engine::EngineHandle,
+        prompt_tokens: Vec<u32>,
+        max_tokens: usize,
+    ) -> TokenStreamReceiver {
+        let (token_tx, token_rx) = TokenSink::standalone();
+        handle
+            .submit(GenerateRequest {
+                trace_parent: None,
+                request_id: None,
+                queued_at_unix_s: None,
+                data_parallel_rank: None,
+                prompt_tokens,
+                params: SamplingParams {
+                    ignore_eos: true,
+                    ..SamplingParams::default()
+                },
+                max_tokens,
+                lora_adapter: None,
+                kv_transfer_params: None,
+                token_tx,
+                logprobs: 0,
+                echo: false,
+            })
+            .expect("submit");
+        token_rx
+    }
+
+    struct Drained {
+        tokens: usize,
+        cached: usize,
+        finish: FinishReason,
+    }
+
+    fn drain(rx: &mut TokenStreamReceiver, name: &str) -> Drained {
+        let mut tokens = 0;
+        let mut cached = 0;
+        loop {
+            match rx.blocking_recv().map(|(_, event)| event) {
+                Some(TokenEvent::Token { .. }) => tokens += 1,
+                Some(TokenEvent::Scheduled { cached_tokens, .. }) => cached = cached_tokens,
+                Some(TokenEvent::PromptTokens { .. } | TokenEvent::KvTransfer { .. }) => {}
+                Some(TokenEvent::Finished { finish_reason, .. }) => {
+                    return Drained {
+                        tokens,
+                        cached,
+                        finish: finish_reason,
+                    };
+                }
+                Some(TokenEvent::Error { message, .. }) => panic!("{name}: error: {message}"),
+                Some(TokenEvent::Rejected { message, .. }) => panic!("{name}: rejected: {message}"),
+                None => panic!("{name}: channel closed without Finished"),
+            }
+        }
+    }
+
+    fn ids(len: usize, salt: u32) -> Vec<u32> {
+        (0..len as u32)
+            .map(|i| 1000 + (i * 37 + salt) % 50000)
+            .collect()
+    }
+
+    /// The whole async lifecycle against one live engine, with every
+    /// interleaving pinned by construction: the streamer's budget outlasts
+    /// the script and its sink is dropped only at the end, so the decode
+    /// batch is never empty and every admission below takes the lane. A
+    /// long prompt rides the lane while a second arrival waits out the busy
+    /// lane; a warm prefix-cache hit launches with only its unseen suffix
+    /// (the join gate refuses a pass that processed the wrong one); a
+    /// request cancelled after `Scheduled` — past every sync-path exit, so
+    /// the drop lands while its pass is in flight — exits through the join;
+    /// an out-of-vocab prompt fails the launch itself and the lane drains;
+    /// and the engine still serves after all of it.
+    fn lane_lifecycle_script(mode: &str) {
+        let dir = std::env::var("PEGAINFER_TEST_MODEL_PATH").expect("PEGAINFER_TEST_MODEL_PATH");
+        // SAFETY: the on-box harness runs single-threaded (--test-threads=1),
+        // so no other thread reads the environment concurrently.
+        unsafe {
+            std::env::set_var("PEGAINFER_ASYNC_PREFILL", mode);
+            std::env::set_var("PEGAINFER_PREFIX_CACHE", "4");
+        }
+        let handle = super::start(Path::new(&dir), &EngineLoadOptions::default());
+        // SAFETY: as above.
+        unsafe {
+            std::env::remove_var("PEGAINFER_ASYNC_PREFILL");
+            std::env::remove_var("PEGAINFER_PREFIX_CACHE");
+        }
+        let handle = handle.expect("engine start");
+
+        // The streamer pins the decode batch non-empty for the whole
+        // script: its budget is far past the script's round count, and its
+        // sink drops only after the last assertion.
+        let mut streamer = submit(&handle, ids(40, 0), 1024);
+        let mut seen = 0;
+        while seen < 2 {
+            match streamer.blocking_recv().map(|(_, event)| event) {
+                Some(TokenEvent::Token { .. }) => seen += 1,
+                Some(TokenEvent::Error { message, .. }) => panic!("streamer: {message}"),
+                Some(_) => {}
+                None => panic!("streamer closed early"),
+            }
+        }
+
+        let long_prompt = ids(1500, 7);
+        let mut lane_rx = submit(&handle, long_prompt.clone(), 4);
+        let mut queued_rx = submit(&handle, ids(60, 3), 4);
+        let lane = drain(&mut lane_rx, "lane prefill");
+        assert_eq!((lane.tokens, lane.finish), (4, FinishReason::Length));
+        let queued = drain(&mut queued_rx, "queued behind the lane");
+        assert_eq!((queued.tokens, queued.finish), (4, FinishReason::Length));
+
+        // Warm hit: the long prompt plus a new turn resumes at the captured
+        // frontier and rides the lane with only the suffix.
+        let mut warm_prompt = long_prompt;
+        warm_prompt.extend(ids(60, 11));
+        let mut warm_rx = submit(&handle, warm_prompt, 4);
+        let warm = drain(&mut warm_rx, "warm suffix on the lane");
+        assert_eq!((warm.tokens, warm.finish), (4, FinishReason::Length));
+        assert_eq!(
+            warm.cached, 1500,
+            "the warm admission must resume at the captured frontier"
+        );
+
+        // In-flight cancellation: `Scheduled` is sent past every sync-path
+        // exit, so a sink dropped after it lands while the lane pass runs.
+        let mut cancel_rx = submit(&handle, ids(1500, 23), 8);
+        loop {
+            match cancel_rx.blocking_recv().map(|(_, event)| event) {
+                Some(TokenEvent::Scheduled { .. }) => break,
+                Some(TokenEvent::Error { message, .. }) => panic!("cancel arm: {message}"),
+                Some(_) => {}
+                None => panic!("cancel arm closed before Scheduled"),
+            }
+        }
+        drop(cancel_rx);
+
+        // Launch failure: an out-of-vocab id passes admission and fails
+        // inside the lane pass; the lane drains and reports, loudly.
+        let mut bad = ids(200, 31);
+        bad[100] = 300_000;
+        let mut bad_rx = submit(&handle, bad, 4);
+        loop {
+            match bad_rx.blocking_recv().map(|(_, event)| event) {
+                Some(TokenEvent::Error { message, .. }) => {
+                    assert!(
+                        message.contains("prefill failed"),
+                        "launch failure must name the prefill: {message}"
+                    );
+                    break;
+                }
+                Some(TokenEvent::Token { .. } | TokenEvent::Finished { .. }) => {
+                    panic!("an out-of-vocab prompt must not produce tokens")
+                }
+                Some(_) => {}
+                None => panic!("launch failure lost its error event"),
+            }
+        }
+
+        let mut after_rx = submit(&handle, ids(40, 29), 4);
+        let after = drain(&mut after_rx, "after the cancelled and failed lanes");
+        assert_eq!((after.tokens, after.finish), (4, FinishReason::Length));
+        drop(streamer);
+    }
+
+    #[test]
+    #[ignore = "requires the pinned 12B checkpoint via PEGAINFER_TEST_MODEL_PATH, a GPU, and --test-threads=1"]
+    fn the_lane_engine_lifecycle_completes() {
+        lane_lifecycle_script("shared");
+    }
+
+    /// The green twin exercises the partitioned completion path —
+    /// `cuGreenCtxRecordEvent` rather than the plain stream record.
+    #[test]
+    #[ignore = "requires the pinned 12B checkpoint via PEGAINFER_TEST_MODEL_PATH, a GPU, and --test-threads=1"]
+    fn the_green_lane_engine_lifecycle_completes() {
+        lane_lifecycle_script("green:35");
+    }
+
+    #[test]
+    fn async_prefill_mode_parses_or_refuses() {
+        for off in ["", "0", "false", "off", " OFF "] {
+            assert_eq!(
+                parse_async_prefill_mode(off).unwrap(),
+                AsyncPrefillMode::Off
+            );
+        }
+        assert_eq!(
+            parse_async_prefill_mode("shared").unwrap(),
+            AsyncPrefillMode::Shared
+        );
+        assert_eq!(
+            parse_async_prefill_mode("green:35").unwrap(),
+            AsyncPrefillMode::Green(35)
+        );
+        for bad in [
+            "1",
+            "true",
+            "on",
+            "green",
+            "green:0",
+            "green:100",
+            "green:x",
+        ] {
+            assert!(
+                parse_async_prefill_mode(bad).is_err(),
+                "{bad:?} must refuse, not silently degrade"
+            );
+        }
     }
 }
