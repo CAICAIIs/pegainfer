@@ -63,6 +63,7 @@
 //!   of returning into the scheduler's keep-serving path.
 
 mod buffers;
+mod dspark;
 pub mod ep;
 mod forward;
 mod paged_kv;
@@ -73,8 +74,11 @@ use std::sync::Arc;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::ensure;
+use cudarc::driver::CudaSlice;
 use cudarc::driver::sys::CUdevice_attribute;
+use half::bf16;
 use log::info;
+use log::warn;
 use pegainfer_core::cuda_graph::CudaGraphState;
 use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_kernels::ops::K3_BATCH_BUCKETS;
@@ -90,13 +94,22 @@ use self::buffers::K3MegaGeometry;
 use self::buffers::K3MegaScratch;
 use self::buffers::K3Scratch;
 use self::buffers::K3StatePool;
+use self::dspark::K3_DSPARK_AUX_LAYERS;
+use self::dspark::K3_DSPARK_BLOCK;
+use self::dspark::K3_DSPARK_CONTEXT_DIM;
+use self::dspark::K3DsparkModel;
+use self::dspark::K3DsparkScratch;
+use self::dspark::K3DsparkSlotState;
 use self::ep::K3EpRendezvous;
 use self::ep::K3EpRuntime;
 use self::ep::ep_fatal;
+use self::forward::K3AuxSink;
+use self::forward::K3KdaGroup;
 use self::forward::K3StepShape;
 use self::forward::k3_decode_step;
 use self::forward::k3_prefill_boundary_sample;
 use self::forward::k3_prefill_chunk_step;
+use self::forward::k3_verify_step;
 use crate::config::K3_DENSE_LAYERS;
 use crate::config::K3_LAYERS;
 use crate::config::K3MoeTopo;
@@ -275,6 +288,51 @@ impl K3ExecutorConfig {
     }
 }
 
+/// One slot's input to a speculative verify step.
+#[derive(Clone, Debug)]
+pub struct K3VerifySlot {
+    pub slot: SlotId,
+    /// The slot's most recent committed token — the span's first row.
+    pub anchor: u32,
+    /// The drafted continuation under verification. May be empty: a verify
+    /// step with no drafts is a one-token decode with deferred KDA commit.
+    pub drafts: Vec<u32>,
+}
+
+/// The rank-local DSpark draft lane: the drafter, its per-slot states, and
+/// the step-wide aux-hidden capture slab the target deposits into.
+struct K3DsparkRuntime {
+    model: K3DsparkModel,
+    scratch: K3DsparkScratch,
+    slots: Vec<K3DsparkSlotState>,
+    /// Step-wide aux capture slab `[scratch_rows, K3_DSPARK_CONTEXT_DIM]`:
+    /// prefill chunks and verify steps deposit their tap-layer hidden states
+    /// here, and the accepted rows are appended to the owning slot's pending
+    /// context after the step.
+    capture: CudaSlice<bf16>,
+    /// Tap layer indices fed to the forward pass. The checkpoint's
+    /// [`K3_DSPARK_AUX_LAYERS`] on a full build; clamped into range on a
+    /// truncated bring-up build (mechanically valid, semantically garbage —
+    /// fine for plumbing gates, never for serving).
+    taps: Vec<usize>,
+}
+
+/// One slot's speculative-decode bookkeeping between verify steps.
+#[derive(Clone, Debug, Default)]
+struct K3SpecSlot {
+    /// Tokens the last verify round committed whose KDA state advance is
+    /// deferred (the accepted span, anchor first). They replay as the next
+    /// round's commit rows. Their MLA latents are already cached and their
+    /// count is already folded into the pool's `positions`.
+    pending: Vec<u32>,
+    /// Which parity slab holds the slot's committed KDA state.
+    parity: usize,
+    /// Verify rounds this request has run (telemetry).
+    rounds: u64,
+    /// Drafts accepted across those rounds (telemetry).
+    accepted: u64,
+}
+
 pub struct K3Executor {
     gpu: K3RankGpuContext,
     ctx: DeviceContext,
@@ -291,7 +349,16 @@ pub struct K3Executor {
     groups: usize,
     num_sms: usize,
     /// Which half of the ping-pong state slabs the next decode step reads.
+    /// Verify steps never read it — their parity is per-slot
+    /// ([`K3SpecSlot::parity`]) — which is why plain decode and verify must
+    /// not mix on one executor: a decode step advances EVERY row's state at
+    /// the global parity, clobbering the per-slot committed slabs.
     parity: usize,
+    /// Per-slot speculative-decode state, meaningful only while every decode
+    /// step on this executor is a verify step.
+    spec: Vec<K3SpecSlot>,
+    /// The DSpark draft lane, when [`K3Executor::load_dspark`] armed it.
+    dspark: Option<K3DsparkRuntime>,
     cuda_graph: bool,
     /// Routed experts run through the fused MegaMoE kernel.
     mega: bool,
@@ -305,7 +372,11 @@ pub struct K3Executor {
     context_len_host: Vec<i32>,
     kv_row_host: Vec<i32>,
     sampled_host: Vec<i32>,
-    thread_bound: bool,
+    /// The thread whose device binding and thread-local cuBLAS handles are
+    /// current. Rechecked per bind: `load_dspark` runs on the launch thread,
+    /// then the executor moves to the scheduler's step thread, and each needs
+    /// its own `cublas_init` (the handle is `thread_local` in the FFI).
+    bound_thread: Option<std::thread::ThreadId>,
     /// Present exactly when `ep_size > 1`: this rank's slab handshake with its
     /// peers. It issues nothing per step.
     ep: Option<K3EpRuntime>,
@@ -582,6 +653,8 @@ impl K3Executor {
             groups,
             num_sms,
             parity: 0,
+            spec: vec![K3SpecSlot::default(); max_batch],
+            dspark: None,
             cuda_graph,
             mega,
             mega_launches_per_step: if mega && ep_size > 1 {
@@ -597,19 +670,20 @@ impl K3Executor {
             context_len_host: vec![1; scratch_rows],
             kv_row_host: vec![-1; scratch_rows],
             sampled_host: vec![0; max_batch],
-            thread_bound: false,
+            bound_thread: None,
             ep,
         })
     }
 
     fn bind_thread(&mut self) -> Result<()> {
-        if !self.thread_bound {
+        let current = std::thread::current().id();
+        if self.bound_thread != Some(current) {
             self.gpu.set_current()?;
             // The cuBLAS handle is thread-local per device.
             unsafe {
                 pegainfer_kernels::ffi::cublas_init();
             }
-            self.thread_bound = true;
+            self.bound_thread = Some(current);
         }
         Ok(())
     }
@@ -800,6 +874,86 @@ impl K3Executor {
     pub fn chunk_tokens(&self) -> usize {
         self.chunk_tokens
     }
+
+    /// Arm the DSpark draft lane: load the drafter from `path` and allocate
+    /// its per-slot states and the aux capture slab. From here on this
+    /// executor's rounds must go through [`K3Executor::decode_spec`] — plain
+    /// decode would advance every row's KDA state at the global parity and
+    /// clobber the per-slot committed slabs.
+    ///
+    /// Call once, after load, on the thread that will step the executor.
+    pub fn load_dspark(&mut self, path: &Path) -> Result<()> {
+        ensure!(
+            self.dspark.is_none(),
+            "K3 dspark draft lane is already loaded"
+        );
+        // One slot's worst verify round packs its deferred-commit replay
+        // (up to a full accepted block) plus anchor and drafts.
+        ensure!(
+            self.max_batch >= 2 * K3_DSPARK_BLOCK,
+            "K3 dspark needs a row budget of at least {} (got {}): one slot's \
+             verify round must fit a step",
+            2 * K3_DSPARK_BLOCK,
+            self.max_batch
+        );
+        self.bind_thread()?;
+        let model = K3DsparkModel::load(&self.ctx, path, self.max_ctx)
+            .with_context(|| format!("loading the K3 dspark drafter from {}", path.display()))?;
+        let num_layers = self.model.layers.len();
+        // A tap's feature is the snapshot mixture read at the TOP of layer
+        // `tap + 1`, so every tap needs a successor layer inside the walk.
+        ensure!(
+            num_layers >= 2,
+            "K3 dspark aux capture needs at least 2 layers (got {num_layers})"
+        );
+        let taps: Vec<usize> = K3_DSPARK_AUX_LAYERS
+            .iter()
+            .map(|&layer| layer.min(num_layers - 2))
+            .collect();
+        if taps.as_slice() != K3_DSPARK_AUX_LAYERS.as_slice() {
+            warn!(
+                "K3 dspark aux taps clamped to {taps:?} for a {num_layers}-layer bring-up build; \
+                 drafts will be garbage (plumbing gates only)"
+            );
+        }
+        let cache_len = model.cache_len();
+        let capture_rows = self.max_batch.max(k3_chunk_bucket(self.chunk_tokens)?);
+        // The draft arena is preallocated per slot and the pending slab
+        // dominates — at the EP default max_batch the bill is tens of GiB.
+        // Surface the number before the allocator turns it into an OOM.
+        let arena_bytes = self.max_batch * K3DsparkSlotState::device_bytes(cache_len)
+            + capture_rows * K3_DSPARK_CONTEXT_DIM * size_of::<bf16>();
+        let arena_gib = arena_bytes as f64 / (1 << 30) as f64;
+        if arena_bytes > 16 << 30 {
+            warn!(
+                "K3 dspark draft arena wants {arena_gib:.1} GiB for {} slots — \
+                 set PEGAINFER_K3_MAX_BATCH well below the EP default",
+                self.max_batch
+            );
+        }
+        let capture = self
+            .ctx
+            .stream
+            .alloc_zeros::<bf16>(capture_rows * K3_DSPARK_CONTEXT_DIM)?;
+        let scratch = K3DsparkScratch::new(&self.ctx, self.max_batch, cache_len)?;
+        let slots = (0..self.max_batch)
+            .map(|_| K3DsparkSlotState::new(&self.ctx, cache_len))
+            .collect::<Result<Vec<_>>>()?;
+        self.gpu.sync()?;
+        info!(
+            "K3 rank {} dspark draft lane armed: slots={}, cache_len={cache_len}, \
+             capture_rows={capture_rows}, arena={arena_gib:.1} GiB, taps={taps:?}",
+            self.model.rank, self.max_batch,
+        );
+        self.dspark = Some(K3DsparkRuntime {
+            model,
+            scratch,
+            slots,
+            capture,
+            taps,
+        });
+        Ok(())
+    }
 }
 
 impl StepExecutor for K3Executor {
@@ -833,6 +987,34 @@ impl StepExecutor for K3Executor {
         {
             log::warn!("K3 slot {slot} release did not clear its state: {error:#}");
         }
+        if let Some(spec) = self.spec.get_mut(slot) {
+            if spec.rounds > 0 {
+                info!(
+                    "K3 slot {slot} spec: {} rounds, {} drafts accepted, {:.2} tokens/round",
+                    spec.rounds,
+                    spec.accepted,
+                    1.0 + spec.accepted as f64 / spec.rounds as f64,
+                );
+            }
+            *spec = K3SpecSlot::default();
+        }
+        if let Some(dspark) = self.dspark.as_mut()
+            && let Some(state) = dspark.slots.get_mut(slot)
+        {
+            state.reset();
+        }
+    }
+
+    fn decode_many(&mut self, batch: &[DecodeSlot]) -> Result<Vec<Vec<u32>>> {
+        if self.dspark.is_some() {
+            self.decode_spec(batch)
+        } else {
+            Ok(self
+                .decode(batch)?
+                .into_iter()
+                .map(|token| vec![token])
+                .collect())
+        }
     }
 }
 
@@ -853,6 +1035,9 @@ impl K3Executor {
         );
         self.enter_step()?;
         self.prefill_state.reset_row(&self.ctx, 0)?;
+        if let Some(dspark) = self.dspark.as_mut() {
+            dspark.slots[slot].reset();
+        }
 
         // Walk the prompt in chunks of up to `max_batch` tokens; each chunk is
         // one batched step whose rows are the chunk's consecutive tokens.
@@ -890,15 +1075,27 @@ impl K3Executor {
             if let Some(mega) = self.scratch.mega.as_mut() {
                 mega.begin_step(launches);
             }
+            let aux = self.dspark.as_mut().map(|dspark| K3AuxSink {
+                slab: &mut dspark.capture,
+                rows: tokens,
+                taps: &dspark.taps,
+            });
             k3_prefill_chunk_step(
                 &self.ctx,
                 &self.model,
                 shape,
                 &mut self.prefill_state,
                 &mut self.scratch,
+                aux,
             )?;
             if let Some(mega) = self.scratch.mega.as_ref() {
                 mega.end_step()?;
+            }
+            // The chunk's rows are the prompt tokens whose hidden states the
+            // draft lane feeds on; hand them over before the next chunk
+            // overwrites the capture slab (stream-ordered, so this is safe).
+            if let Some(dspark) = self.dspark.as_mut() {
+                dspark.slots[slot].append_captured_rows(&self.ctx, &dspark.capture, 0, tokens)?;
             }
             // Under the chunkwise KDA kernel parity is a per-chunk double
             // buffer: every chunk reads one slab and lands in the other.
@@ -931,6 +1128,10 @@ impl K3Executor {
             slot,
             target_parity,
         )?;
+        self.spec[slot] = K3SpecSlot {
+            parity: target_parity,
+            ..K3SpecSlot::default()
+        };
         self.gpu.sync()?;
         Ok(sampled)
     }
@@ -997,5 +1198,257 @@ impl K3Executor {
             .iter()
             .map(|entry| sampled[entry.slot] as u32)
             .collect())
+    }
+
+    /// One speculative verify round over `batch`, returning each slot's
+    /// committed tokens (accepted drafts plus the model's own token —
+    /// correction or bonus), parallel to `batch`. Greedy acceptance: a draft
+    /// stands exactly when it equals the argmax at its position.
+    ///
+    /// Verify replaces plain decode wholesale once a slot uses it: a plain
+    /// decode step advances every row's KDA state at the global parity and
+    /// would clobber the per-slot committed slabs (see the `parity` field).
+    /// An empty batch is the expert-parallel padding step, as for decode.
+    pub fn verify(&mut self, batch: &[K3VerifySlot]) -> Result<Vec<Vec<u32>>> {
+        let rank = self.model.rank;
+        match self.verify_inner(batch) {
+            Err(error) if self.is_expert_parallel() => ep_fatal(rank, "verify", &error),
+            other => other,
+        }
+    }
+
+    fn verify_inner(&mut self, batch: &[K3VerifySlot]) -> Result<Vec<Vec<u32>>> {
+        if batch.is_empty() && !self.is_expert_parallel() {
+            return Ok(Vec::new());
+        }
+        self.enter_step()?;
+        // Pack the bucket: per slot, the deferred-commit replay rows then the
+        // speculative span (anchor + drafts).
+        let mut groups = Vec::with_capacity(batch.len());
+        let mut rows = 0usize;
+        for entry in batch {
+            ensure!(
+                entry.slot < self.max_batch,
+                "K3 verify slot {} is out of range",
+                entry.slot
+            );
+            let lag = self.spec[entry.slot].pending.len();
+            groups.push(K3KdaGroup {
+                row: rows,
+                commit_rows: lag,
+                spec_rows: 1 + entry.drafts.len(),
+                state_row: entry.slot,
+                parity: self.spec[entry.slot].parity,
+            });
+            rows += lag + 1 + entry.drafts.len();
+        }
+        ensure!(
+            rows <= self.max_batch,
+            "K3 verify step of {rows} rows exceeds the {} row budget",
+            self.max_batch
+        );
+        let bucket = k3_batch_bucket(rows.max(1))?;
+
+        for row in 0..bucket {
+            self.token_host[row] = 0;
+            self.context_len_host[row] = 1;
+            self.kv_row_host[row] = -1;
+        }
+        for (entry, group) in batch.iter().zip(&groups) {
+            let slot = entry.slot;
+            let anchor_position = self.decode_state.positions[slot];
+            ensure!(
+                group.commit_rows <= anchor_position,
+                "K3 slot {slot} carries {} pending tokens but only {anchor_position} positions",
+                group.commit_rows
+            );
+            ensure!(
+                anchor_position + group.spec_rows <= self.max_ctx,
+                "K3 slot {slot} verify span reaches past its {} token context",
+                self.max_ctx
+            );
+            // Replay rows re-run positions whose latents are already cached:
+            // no KV write, context up to and including their own position.
+            for (index, token) in self.spec[slot].pending.iter().enumerate() {
+                let row = group.row + index;
+                let position = anchor_position - group.commit_rows + index;
+                self.token_host[row] = *token;
+                self.context_len_host[row] = i32::try_from(position + 1)?;
+            }
+            // The speculative span appends its latents as it goes; a later
+            // round's rows overwrite whatever a rejected draft left behind.
+            let span = std::iter::once(entry.anchor).chain(entry.drafts.iter().copied());
+            for (index, token) in span.enumerate() {
+                let row = group.row + group.commit_rows + index;
+                let position = anchor_position + index;
+                self.token_host[row] = token;
+                self.context_len_host[row] = i32::try_from(position + 1)?;
+                self.decode_state
+                    .kv
+                    .ensure_mapped(&self.ctx, slot, position)?;
+                self.kv_row_host[row] = self.decode_state.kv.write_index(slot, position)?;
+            }
+            for row in group.row..group.row + group.commit_rows + group.spec_rows {
+                self.decode_state.kv.stage_verify_row(row, slot)?;
+            }
+        }
+
+        self.feed()?;
+        self.decode_state.kv.sync_verify_table(&self.ctx)?;
+        // Always eager: the per-group launch geometry varies with the batch's
+        // pending lengths, so there is no fixed body to capture.
+        let shape = self.shape(bucket, 0, rows);
+        let launches = self.mega_launches_per_step;
+        if let Some(mega) = self.scratch.mega.as_mut() {
+            mega.begin_step(launches);
+        }
+        // A padding step (`rows == 0`) captures nothing — the sink's copy
+        // kernel rejects an empty row range.
+        let aux = self
+            .dspark
+            .as_mut()
+            .filter(|_| rows > 0)
+            .map(|dspark| K3AuxSink {
+                slab: &mut dspark.capture,
+                rows,
+                taps: &dspark.taps,
+            });
+        k3_verify_step(
+            &self.ctx,
+            &self.model,
+            shape,
+            &groups,
+            &mut self.decode_state,
+            &mut self.scratch,
+            aux,
+        )?;
+        if let Some(mega) = self.scratch.mega.as_ref() {
+            mega.end_step()?;
+        }
+
+        let sampled = self.sampled(self.max_batch)?.to_vec();
+        let mut outcomes = Vec::with_capacity(batch.len());
+        for (entry, group) in batch.iter().zip(&groups) {
+            let anchor_row = group.row + group.commit_rows;
+            let accepted = entry
+                .drafts
+                .iter()
+                .enumerate()
+                .take_while(|(index, draft)| sampled[anchor_row + index] as u32 == **draft)
+                .count();
+            let committed: Vec<u32> = (0..=accepted)
+                .map(|index| sampled[anchor_row + index] as u32)
+                .collect();
+            // The anchor and the accepted drafts are now cache-valid; their
+            // KDA advance replays as the next round's commit rows.
+            self.decode_state.positions[entry.slot] += accepted + 1;
+            let spec = &mut self.spec[entry.slot];
+            spec.pending.clear();
+            spec.pending.push(entry.anchor);
+            spec.pending.extend_from_slice(&entry.drafts[..accepted]);
+            if group.commit_rows > 0 {
+                spec.parity ^= 1;
+            }
+            spec.rounds += 1;
+            spec.accepted += accepted as u64;
+            // The accepted span rows' hidden states (anchor + accepted
+            // drafts) become the draft lane's next pending context — exactly
+            // the tokens whose positions just became cache-valid.
+            if let Some(dspark) = self.dspark.as_mut() {
+                dspark.slots[entry.slot].append_captured_rows(
+                    &self.ctx,
+                    &dspark.capture,
+                    anchor_row,
+                    accepted + 1,
+                )?;
+            }
+            outcomes.push(committed);
+        }
+        Ok(outcomes)
+    }
+
+    /// One full speculative round: propose [`crate::dspark::K3_DSPARK_DRAFTS`]
+    /// drafts per slot from the DSpark lane, verify them in one packed step,
+    /// and return each slot's committed tokens (accepted drafts plus the
+    /// model's correction or bonus), parallel to `batch`.
+    pub fn decode_spec(&mut self, batch: &[DecodeSlot]) -> Result<Vec<Vec<u32>>> {
+        let rank = self.model.rank;
+        match self.decode_spec_inner(batch) {
+            Err(error) if self.is_expert_parallel() => ep_fatal(rank, "decode-spec", &error),
+            other => other,
+        }
+    }
+
+    fn decode_spec_inner(&mut self, batch: &[DecodeSlot]) -> Result<Vec<Vec<u32>>> {
+        ensure!(
+            self.dspark.is_some(),
+            "K3 decode_spec needs the dspark draft lane armed (load_dspark)"
+        );
+        if batch.is_empty() {
+            // Nothing to propose; the (possibly expert-parallel padding)
+            // verify step still runs.
+            return self.verify_inner(&[]);
+        }
+        self.enter_step()?;
+        // Propose per slot. The draft is rank-local and collective-free, so
+        // this adds no cross-rank coupling; one call per slot for now (the
+        // batched form needs disjoint `&mut` slot states).
+        let mut verify_batch = Vec::with_capacity(batch.len());
+        for entry in batch {
+            let anchor_pos = self.decode_state.positions[entry.slot];
+            let dspark = self.dspark.as_mut().expect("armed above");
+            let drafts = dspark.model.propose(
+                &self.ctx,
+                &self.model.embed,
+                &self.model.w_lm,
+                &mut [&mut dspark.slots[entry.slot]],
+                &[(entry.last_token, anchor_pos)],
+                &mut dspark.scratch,
+            )?;
+            // Admission reserves `prompt + max_tokens` context, not the
+            // draft span: near the ceiling the verify appends at
+            // `anchor_pos + 1 ..= anchor_pos + drafts` must shed drafts
+            // instead of tripping the verify guard (fatal under EP). A
+            // 0-draft verify is a legal one-token deferred-commit step.
+            let headroom = (self.max_ctx - 1).saturating_sub(anchor_pos);
+            let keep = drafts[0].len().min(headroom);
+            verify_batch.push(K3VerifySlot {
+                slot: entry.slot,
+                anchor: entry.last_token,
+                drafts: drafts[0][..keep].to_vec(),
+            });
+        }
+        // A slot's packed rows are its deferred-commit replay plus the
+        // speculative span — up to `2 * K3_DSPARK_BLOCK` — so a full batch can
+        // outgrow the row budget. Split into budget-sized verify steps; each
+        // is a real step, and free-running peers cover the extras with
+        // padding steps of their own.
+        let mut outcomes = Vec::with_capacity(verify_batch.len());
+        let mut start = 0;
+        while start < verify_batch.len() {
+            let mut rows = 0;
+            let mut end = start;
+            while end < verify_batch.len() {
+                let entry = &verify_batch[end];
+                let need = self.spec[entry.slot].pending.len() + 1 + entry.drafts.len();
+                if rows + need > self.max_batch {
+                    break;
+                }
+                rows += need;
+                end += 1;
+            }
+            ensure!(
+                end > start,
+                "K3 verify slot {} needs {} rows alone — raise the row budget above {}",
+                verify_batch[start].slot,
+                self.spec[verify_batch[start].slot].pending.len()
+                    + 1
+                    + verify_batch[start].drafts.len(),
+                self.max_batch
+            );
+            outcomes.extend(self.verify_inner(&verify_batch[start..end])?);
+            start = end;
+        }
+        Ok(outcomes)
     }
 }
