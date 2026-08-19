@@ -83,6 +83,7 @@ use pegainfer_kernels::ops::K3_MAX_BATCH;
 use pegainfer_kernels::ops::K3_MAX_CHUNK;
 use pegainfer_kernels::ops::k3_batch_bucket;
 use pegainfer_kernels::ops::k3_chunk_bucket;
+use pegainfer_kernels::ops::k3_mega_world_supported;
 use pegainfer_kernels::tensor::DeviceContext;
 
 use self::buffers::K3MegaGeometry;
@@ -132,10 +133,6 @@ const K3_DEFAULT_MAX_CTX: usize = 4096;
 /// The only SM count the fused MegaMoE kernel is AOT-instantiated for. Its
 /// grid sync spans the whole grid, so the launch geometry is baked in.
 const K3_MEGA_SMS: usize = 152;
-/// Expert-parallel widths the fused MegaMoE kernel is AOT-instantiated for.
-/// The rank count is a template parameter (it sets the ring capacities and the
-/// experts-per-rank divisor), so this is not a runtime dimension.
-const K3_MEGA_EP_SIZES: [usize; 2] = [1, 4];
 
 /// Slots per rank an expert-parallel launch takes when nothing says otherwise.
 ///
@@ -459,7 +456,6 @@ impl K3Executor {
             max_batch,
             config.max_ctx,
             num_layers,
-            blocks,
             kv_pages,
         )?;
         // The prefill chunk cap: the MegaMoE protocol maximum under the fused
@@ -491,14 +487,17 @@ impl K3Executor {
             chunk_bucket,
             config.max_ctx,
             num_layers,
-            blocks,
             slot_pages,
         )?;
         if mega {
+            // The rank count and the GLOBAL expert count are template
+            // parameters of the fused kernel (together they set the ring
+            // capacities and the experts-per-rank divisor), so the pair must
+            // be in the AOT matrix — the kernel TU owns that list.
             ensure!(
-                K3_MEGA_EP_SIZES.contains(&ep_size),
-                "K3 MegaMoE is AOT-instantiated for ep_size {K3_MEGA_EP_SIZES:?} only, not \
-                 {ep_size}"
+                k3_mega_world_supported(routed_experts, ep_size),
+                "K3 MegaMoE carries no AOT instantiation for {routed_experts} experts at \
+                 ep_size {ep_size}"
             );
             // The fused kernel's grid sync spans exactly its instantiation's SM
             // count, so a mismatched launch grid would hang rather than
@@ -536,6 +535,7 @@ impl K3Executor {
                 num_sms,
                 num_ranks: ep_size,
                 rank_idx: model.rank,
+                fleet: rendezvous.as_ref().is_some_and(|r| r.is_fleet()),
             }),
         )?;
         // Every allocation this rank will ever hand a peer has to be live and
@@ -547,7 +547,13 @@ impl K3Executor {
                     .mega
                     .as_mut()
                     .context("K3 EP rank built without its symmetric buffer")?;
-                K3EpRuntime::new(rendezvous, model.rank, mega.base(), gpu.device_ordinal())
+                K3EpRuntime::new(
+                    rendezvous,
+                    model.rank,
+                    mega.base(),
+                    gpu.device_ordinal(),
+                    mega.fabric(),
+                )
             })
             .transpose()?;
 
