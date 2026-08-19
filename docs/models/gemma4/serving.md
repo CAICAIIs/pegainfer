@@ -26,7 +26,15 @@ local  = C + (slots - 1) * W + 1 = 512 + 15 * 65 + 1 = 1488 pages
 global = slots * C + 1           = 16 * 512 + 1      = 8193 pages
 ```
 
-The shapes behind the page: the local family is 40 layers of 8 KV heads at head_dim 256, the global family is 8 layers of 1 KV head at head_dim 512, and a page carries K and V for every layer of its family. That makes a local page 5 MiB and a global page 256 KiB, so at 12B the pools are **7.27 GiB local and 2.00 GiB global**, on top of 22.18 GiB of resident weights.
+Those are the knob-off defaults. With `PEGAINFER_MIX_CHUNK_TOKENS=N` set no scan holds more than window plus segment, so the local line shrinks to
+
+```
+local = 16 * W + ceil(N / 16) + (MIX_MAX_PROMPTS - 1) + 1   (+ the cache budget)
+```
+
+— at `N=2048` that is 1172 pages instead of 1488. The global line is unchanged. Every page count and byte figure below is measured with the knob off unless it says otherwise.
+
+The shapes behind the page: the local family is 40 layers of 8 KV heads at head_dim 256, the global family is 8 layers of 1 KV head at head_dim 512, and a page carries K and V for every layer of its family. That makes a local page 5 MiB and a global page 256 KiB, so at 12B the knob-off pools are **7.27 GiB local and 2.00 GiB global**, on top of 22.18 GiB of resident weights.
 
 The asymmetry is the design: the local family only has to hold one full-context transient — the request currently prefilling, which has not released its front yet — on top of the window-capped steady footprint of everyone else. The global family never releases, so it stays linear in context for each request's whole lifetime, and that is what makes it the larger page count despite the smaller page.
 
@@ -67,7 +75,7 @@ curl -s localhost:18099/v1/completions -H 'Content-Type: application/json' \
 
 ## What it costs to hold a slot
 
-The 16 slots are a fixed constant and the pools are sized for all of them up front. Measured on a 49140 MiB card with the default per-bucket CUDA graphs, the process sits at **33034 MiB with no request in flight** and peaked at 33386 MiB under the serving checks below: 22.18 GiB of weights, 9.27 GiB of pools, and the rest CUDA context, RoPE tables, step buffers and the captured graphs. The eager baseline (`--cuda-graph=false`) measured 32926 MiB idle and peaked at 32932 MiB.
+The 16 slots are a fixed constant and the pools are sized for all of them up front. Measured with the chunk knob off on a 49140 MiB card with the default per-bucket CUDA graphs, the process sits at **33034 MiB with no request in flight** and peaked at 33386 MiB under the serving checks below: 22.18 GiB of weights, 9.27 GiB of pools, and the rest CUDA context, RoPE tables, step buffers and the captured graphs. The eager baseline (`--cuda-graph=false`) measured 32926 MiB idle and peaked at 32932 MiB.
 
 That is a hardware floor, not a target. A 32 GiB device cannot start this configuration at all. Serving a single request needs about 2.6 GiB of pool rather than 9.27, so the slot count is what sets the floor, and it is not exposed as a knob today.
 
@@ -91,9 +99,9 @@ Measured (a streaming request, then sixteen ~1900-token prompts admitted at once
 
 ## The chunked walk (opt-in)
 
-`PEGAINFER_MIX_CHUNK_TOKENS=N` (64 <= N < 8192; unset, `off` or `0` keeps whole-prompt steps; anything else refuses startup) bounds how many prompt rows a mixed admission computes per step. Gathered prompts walk shared segment steps: each round fills one N-row budget across the walkers in admission order, every active stream advances one token per round, and a mid-walk segment's sampled row is discarded — no token, no logprob, no stop — until the prompt's final segment produces its first token, emitted at that round's boundary as the walker joins the decode batch. A walker whose client disconnects mid-walk is dropped between rounds. If the decode roster drains mid-walk, the remaining tails run whole; a prompt arriving with nothing active still prefills whole as its own step — there is no stream to protect — and with the async prefill lane enabled, a live-batch admission goes to the lane and prefills whole, so the knob applies to the mixed step only. With the knob set, the gather's 512-row ceiling no longer applies: the per-round budget bounds each step instead.
+`PEGAINFER_MIX_CHUNK_TOKENS=N` (64 <= N < 8192; unset, `off` or `0` keeps whole-prompt steps; anything else refuses startup) bounds how many prompt rows a mixed admission computes per step. Gathered prompts walk shared segment steps: each round fills one N-row budget across the walkers in admission order, every active stream advances one token per round, and a mid-walk segment's sampled row is discarded — no token, no logprob, no stop — until the prompt's final segment produces its first token, emitted at that round's boundary as the walker joins the decode batch. A walker whose client disconnects mid-walk is dropped between rounds. The knob owns every scan: a drained roster's tails and a prompt arriving with nothing active walk their own segments too, paying one ~27 ms step floor per segment where a whole scan paid one — the price of holding window plus segment instead of the full prompt. The exception is the async prefill lane: a live-batch admission goes to the lane and prefills whole. With the knob set, the gather's 512-row ceiling no longer applies: the per-round budget bounds each step instead.
 
-Pages are still admitted for the whole prompt up front — chunking bounds the step, not the KV admission — so capacity behaves exactly as without it. The trade is granularity, measured at 12B: under a flood of sixteen ~3900-token prompts, `N=2048` cut a live stream's flood-phase p99 gap from 855-975 ms to 497-526 ms; at ~1900-token prompts a round can span two prompts, and the same knob raised that p99 from 432-468 ms to 519-537 ms. Off by default; set it for long-context workloads where prompts run to several segments.
+Pages reserve round by round: a walker holds its window plus the segment it is writing, never its whole prompt. The trade is granularity, measured at 12B: under a flood of sixteen ~3900-token prompts, `N=2048` cut a live stream's flood-phase p99 gap from 855-975 ms to 497-526 ms; at ~1900-token prompts a round can span two prompts, and the same knob raised that p99 from 432-468 ms to 519-537 ms. Off by default; set it for long-context workloads where prompts run to several segments.
 
 ## Measured behaviour
 
@@ -130,7 +138,7 @@ The consequence for callers: **greedy output is reproducible for a given workloa
 ## Limits today
 
 - **An admission rides the live decode batch instead of freezing it.** With streams in flight, newcomers' prompts share one eager step with the decode batch: the prompt rows sit in the row prefix as segments, every active stream advances its token in the suffix, and one sampler call covers every newcomer's first token and every active row. Measured with a streaming request underneath a flood of one-token requests: its inter-token gap stays at about 30 ms — one mixed step — whether 16, 48 or 96 requests are queued, where the frozen-prefill scheduling this replaced measured about 500 ms at the same depths. A burst of sixteen coincident ~120-token prompts folds its admission staircase — TTFT p50 and p99 both drop 20-30% — while the stream's worst gap stays bounded by the gathered step's own cost (~130 ms at the 512-row ceiling); a 16 × ~1900-token flood is untouched, since a long prompt keeps its own step. Admission work per turn stays bounded by the slot ceiling, gathered or not.
-- **Whole-prompt prefill by default.** A prompt runs whole in one step unless the opt-in chunked walk above bounds the step's prompt rows; pages are admitted for the full context up front either way.
+- **Whole-prompt prefill by default.** A prompt runs whole in one step unless the opt-in chunked walk above bounds the step's prompt rows; with the knob set a walker reserves pages round by round instead of holding its whole prompt.
 - **No cross-request prefix sharing.** Two live requests with a common prefix pay for it twice; the opt-in conversation cache above serves consecutive turns of one conversation, not concurrent requests.
 - **Single GPU.** No tensor parallelism for this line yet.
 - **KV capacity is not reported to the frontend**: the engine logs `kv_cache_size_tokens=None`, so the frontend's capacity metrics stay empty for this model line.
