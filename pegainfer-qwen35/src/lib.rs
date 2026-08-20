@@ -18,6 +18,9 @@ pub mod prefill_buffers;
 pub(crate) mod recurrent;
 pub(crate) mod recurrent_state;
 mod scheduler;
+#[cfg(test)]
+#[path = "../tests/common/model_fixture.rs"]
+mod test_fixture;
 mod tp_executor;
 mod unified_forward;
 mod weights;
@@ -61,6 +64,7 @@ pub mod runtime {
     pub use crate::executor::Qwen35Executor;
     pub use crate::executor::RequestId;
     pub use crate::scheduler::start_with_capacity;
+    pub use crate::tp_executor::DropExpectation;
     pub use crate::tp_executor::Qwen35TpExecutor;
     pub use crate::weights::Qwen35Model;
 }
@@ -128,20 +132,6 @@ impl Qwen35LaunchOptions {
             (0..self.tp_size).collect()
         })
     }
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn launch_with_options_and_policy(
-    model_path: &Path,
-    options: Qwen35LaunchOptions,
-    scheduler_policy: Qwen35SchedulerPolicy,
-) -> Result<EngineHandle> {
-    launch_with_options_policy_and_overlap(
-        model_path,
-        options,
-        scheduler_policy,
-        Qwen35DecodeOverlap::Off,
-    )
 }
 
 #[allow(clippy::needless_pass_by_value)]

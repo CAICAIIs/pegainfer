@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_qwen35::runtime::DecodePlan;
 use pegainfer_qwen35::runtime::DecodeStepItem;
+use pegainfer_qwen35::runtime::DropExpectation;
 use pegainfer_qwen35::runtime::PrefillPlan;
 use pegainfer_qwen35::runtime::PrefillStepItem;
 use pegainfer_qwen35::runtime::Qwen35Executor;
@@ -31,7 +32,6 @@ use sha2::Sha256;
 
 mod common;
 
-const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3.5-4B");
 const GOLDEN_ENV: &str = "PEGAINFER_QWEN35_HF_GOLDEN";
 const LONG_GOLDEN_ENV: &str = "PEGAINFER_QWEN35_HF_LONG_GOLDEN";
 
@@ -93,21 +93,6 @@ fn default_fixture_path(size: &str, long: bool) -> String {
 const BUCKET_STRADDLES: [usize; 2] = [5, 3];
 const SLOT_COMPACTION_BATCH: usize = 5;
 const SLOT_COMPACTION_DROP_INDEX: usize = 1;
-
-fn model_path_or_skip() -> Option<String> {
-    match std::env::var("PEGAINFER_TEST_MODEL_PATH") {
-        Ok(path) => Some(path),
-        Err(_) if Path::new(MODEL_PATH).join("config.json").exists() => {
-            Some(MODEL_PATH.to_string())
-        }
-        Err(_) => {
-            eprintln!(
-                "skipping qwen35 hf_golden_gate: {MODEL_PATH}/config.json is missing; set PEGAINFER_TEST_MODEL_PATH to run it"
-            );
-            None
-        }
-    }
-}
 
 fn sha256_file(path: impl AsRef<Path>) -> Option<String> {
     let bytes = std::fs::read(path).ok()?;
@@ -575,7 +560,8 @@ fn run_tp(g: &Golden, ex: &Qwen35TpExecutor, seqs: &[usize], batched: bool) -> (
         }
 
         for &id in &ids {
-            ex.drop_request(id).expect("TP2 drop request");
+            ex.drop_request(id, DropExpectation::MustExist)
+                .expect("TP2 drop request");
         }
     } else {
         for &seq in seqs {
@@ -604,7 +590,8 @@ fn run_tp(g: &Golden, ex: &Qwen35TpExecutor, seqs: &[usize], batched: bool) -> (
                     &top_logprobs(dr.requests[0].logprob.as_ref()),
                 );
             }
-            ex.drop_request(id).expect("TP2 drop request");
+            ex.drop_request(id, DropExpectation::MustExist)
+                .expect("TP2 drop request");
         }
     }
     (stats, fingerprint)
@@ -762,7 +749,7 @@ fn build_tp2_executor(model_path: &str) -> Qwen35TpExecutor {
 
 #[test]
 fn pega_logprobs_match_hf_golden_within_qwen35_tolerance() {
-    let Some(model_path) = model_path_or_skip() else {
+    let Some(model_path) = common::model_path_or_skip("pega_logprobs_match_hf_golden") else {
         return;
     };
     let Some(golden) = Golden::load_for(&model_path, false) else {
@@ -825,7 +812,7 @@ fn pega_logprobs_match_hf_golden_within_qwen35_tolerance() {
 
 #[test]
 fn pega_logprobs_match_hf_long_golden_within_qwen35_tolerance() {
-    let Some(model_path) = model_path_or_skip() else {
+    let Some(model_path) = common::model_path_or_skip("pega_logprobs_match_hf_long_golden") else {
         return;
     };
     let Some(golden) = Golden::load_for(&model_path, true) else {
@@ -850,7 +837,7 @@ fn pega_logprobs_match_hf_long_golden_within_qwen35_tolerance() {
 #[test]
 #[ignore = "requires two CUDA devices, NCCL, and Qwen3.5 weights"]
 fn pega_logprobs_match_hf_golden_within_qwen35_tolerance_tp2() {
-    let Some(model_path) = model_path_or_skip() else {
+    let Some(model_path) = common::model_path_or_skip("pega_logprobs_match_hf_golden_tp2") else {
         return;
     };
     let Some(golden) = Golden::load_for(&model_path, false) else {
@@ -879,7 +866,8 @@ fn pega_logprobs_match_hf_golden_within_qwen35_tolerance_tp2() {
 #[test]
 #[ignore = "requires two CUDA devices, NCCL, and Qwen3.5 weights"]
 fn pega_logprobs_match_hf_long_golden_within_qwen35_tolerance_tp2() {
-    let Some(model_path) = model_path_or_skip() else {
+    let Some(model_path) = common::model_path_or_skip("pega_logprobs_match_hf_long_golden_tp2")
+    else {
         return;
     };
     let Some(golden) = Golden::load_for(&model_path, true) else {

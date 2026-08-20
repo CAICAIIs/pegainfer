@@ -11,6 +11,7 @@ use pegainfer_frontend::engine::EngineHandle;
 use pegainfer_frontend::engine::EngineLoadOptions;
 use pegainfer_frontend::engine::FinishReason;
 use pegainfer_frontend::engine::GenerateRequest;
+use pegainfer_frontend::engine::SchedulerMetrics;
 use pegainfer_frontend::engine::TokenEvent;
 use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_frontend::engine::TokenSink;
@@ -19,8 +20,6 @@ use pegainfer_frontend::sampler::SamplingParams;
 use vllm_text::tokenizer::DynTokenizer;
 
 mod common;
-
-const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3.5-4B");
 
 const CASES: &[TestCase] = &[
     TestCase {
@@ -74,10 +73,6 @@ const CASES: &[TestCase] = &[
         max_new_tokens: 50,
     },
 ];
-
-fn get_model_path() -> String {
-    std::env::var("PEGAINFER_TEST_MODEL_PATH").unwrap_or_else(|_| DEFAULT_MODEL_PATH.to_string())
-}
 
 fn max_position_embeddings(model_path: &str) -> usize {
     let config_path = std::path::Path::new(model_path).join("config.json");
@@ -226,7 +221,7 @@ fn drain_tokens(rx: &mut TokenStreamReceiver, request_id: &str) -> usize {
 }
 
 fn wait_for_running_requests(
-    load: &mut tokio::sync::watch::Receiver<pegainfer_core::engine::LoadSnapshot>,
+    load: &mut tokio::sync::watch::Receiver<SchedulerMetrics>,
     expected: u64,
     timeout: std::time::Duration,
 ) {
@@ -671,7 +666,9 @@ fn run_full_scheduler_e2e(
 
 #[test]
 fn test_e2e_qwen35_scheduler() {
-    let model_path = get_model_path();
+    let Some(model_path) = common::model_path_or_skip("test_e2e_qwen35_scheduler") else {
+        return;
+    };
 
     info!("Loading Qwen3.5 model for scheduler test...");
     let start = Instant::now();
@@ -696,7 +693,10 @@ fn test_e2e_qwen35_scheduler() {
 #[test]
 fn test_e2e_qwen35_shared_sm_last_decoder() {
     pegainfer_core::logging::init_default();
-    let model_path = get_model_path();
+    let Some(model_path) = common::model_path_or_skip("test_e2e_qwen35_shared_sm_last_decoder")
+    else {
+        return;
+    };
     let tokenizer = common::load_tokenizer(&model_path);
     let seed_token = tokenizer
         .encode("Hello", false)
@@ -755,7 +755,9 @@ fn test_e2e_qwen35_shared_sm_last_decoder() {
         pegainfer_qwen35::Qwen35DecodeOverlap::SharedSm,
     )
     .expect("Failed to start Qwen3.5 shared-SM scheduler");
-    let mut load = handle.load_watch().expect("scheduler must expose load");
+    let mut load = handle
+        .metrics_watch()
+        .expect("scheduler must expose metrics");
 
     let mut active_rx =
         submit_repeated_token_request(&handle, "overlap-last-decoder", seed_token, 512, 128);
@@ -820,7 +822,9 @@ fn test_e2e_qwen35_shared_sm_last_decoder() {
 #[test]
 #[ignore = "requires two CUDA devices, NCCL, and Qwen3.5 weights"]
 fn test_e2e_qwen35_scheduler_tp2() {
-    let model_path = get_model_path();
+    let Some(model_path) = common::model_path_or_skip("test_e2e_qwen35_scheduler_tp2") else {
+        return;
+    };
 
     info!("Loading Qwen3.5 TP2 model for scheduler test...");
     let start = Instant::now();
