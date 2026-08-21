@@ -9,7 +9,14 @@ cycle probe and 3.13 on a 4-prompt prose probe vs the same-checkpoint
 sglang reference's 3.0 / ~2.8; the full 896-expert EP16 target commits
 4.0 on code, 2.8–2.9 on English prose, 1.3 on Chinese. Verify is *not* bitwise plain decode
 (chunkwise FlashKDA vs the fused core — near-tie argmaxes flip); the
-`spec_verify` gates certify what is exact instead.
+`spec_verify` gates certify what is exact instead. E2e on the EP16 fleet
+(SPEED-Bench, 2026-08-19): **1.74× on low-entropy c1, 1.8× SLOWER on
+high-entropy c1, −27% throughput at c4 mixed** — the verify step's
+multi-row cost, not propose overhead, is the wall. Measured on the EP16
+fleet: the 160 ms round is ~68 ms local small-batch math + **~85 ms of
+cross-tray sync stalls inside MegaMoE** (a ~2.8 ms stall every 8th
+expert layer, mechanism unidentified) — finding and hiding that stall
+outranks row packing (see the round-anatomy section).
 
 Last touched: 2026-08
 
@@ -170,20 +177,109 @@ self-similar text saturate near RadixArk's published band (3.9–5.5,
 measured on chat-template benches); Chinese is the drafter's weak
 spot, not the verify path's.
 
-**Next** (perf follow-up PR — semantics-neutral, kept out of #931 so
-the bring-up PR stays reviewable): measure end-to-end spec-on vs
-spec-off tokens/s on EP16 to size the win, then CUDA-graph the verify
-step (never existed — spec v1 is eager-only; launch geometry varies
-with per-slot pending lengths, needs bucketing by lag-profile) and
-batch the propose pass (one drafter call per slot today). These two go
-together by design: propose is 7 query rows through 5 layers —
-launch-bound, so batching only pays at concurrency — and graph capture
-constrains the same packed geometry, so batching it separately first
-would just get redone when the graph lands.
+## E2e A/B and the round anatomy (2026-08-19)
+
+Full-model EP16 (trays 04–07, `PEGAINFER_K3_MAX_BATCH=16`), vllm-bench
+over SPEED-Bench `throughput_1k` (~1k-token real prompts, seed 42, same
+prompts both legs), main @ 57ff7abe. Artifacts + driver script:
+`~/bench-results/k3-spec-e2e-20260819/`.
+
+| Workload             | spec-on TPOT | spec-off TPOT | verdict |
+|----------------------|--------------|---------------|---------|
+| c1 low_entropy (code)| 44.1 ms      | 76.6 ms       | **1.74× faster** |
+| c1 high_entropy      | 140.3 ms     | 77.0 ms       | **1.82× slower** |
+| c4 mixed (median)    | 51.4 ms      | 78.0 ms       | median hides the tail |
+| c4 mixed (mean)      | 102.6 ms     | 78.9 ms       | 1.3× slower |
+| c4 mixed steady tok/s| 35.7         | 49.1          | **−27% throughput** |
+
+Spec currently wins only on low-entropy single-stream traffic. Plain
+TPOT is category-independent (~77 ms), so the whole spread is
+`round_time / committed_per_round`.
+
+**Round anatomy** (nsys on pruned EP4, tray08 — per-rank layout is
+isomorphic to full EP16; trace `~/k3-prof/specround.nsys-rep`): round
+p50 64.6 ms = verify step 61.4 ms + propose ~3 ms (draft fwd 1.9,
+Markov 0.09, readback+feed 1.1). Inside the median verify step (5039
+kernels): small cuBLAS GEMMs 22.3 ms, MLA attention 15.0 ms (23 calls ×
+0.62 ms), MegaMoE only 9.6 ms, per-row `k3_*_b1` elementwise 7.5 ms,
+FlashKDA 2.8 ms, launch gaps 5.5 ms. Two corrections to the old plan
+fall out of this:
+
+* **The verify step is not launch-bound** — gaps are 9% of the step. A
+  verify CUDA graph buys ≤ ~5 ms; the real cost is small-batch math
+  (per-group GEMMs re-reading weights, per-row elementwise). Packing
+  those across rows is the lever, and it also shrinks what a graph
+  would capture.
+* **Propose is ~5% of the round at c1** — batching/graphing it cannot
+  move single-stream latency. It *does* matter at concurrency, where
+  per-slot propose calls and their per-call pipeline drains stack.
+
+**EP16 round anatomy, measured** (nsys on the full-model fleet, rank 0
+tray04, 103 clean c1 verify rounds; trace `~/k3-prof/ep16round.nsys-rep`):
+round p50 **160 ms** = local compute ~68 ms + **fabric wait ~85 ms** +
+propose ~3 ms + idle ~4 ms. The local-compute half matches the pruned
+EP4 step almost exactly (cuBLAS 24.7 ms, MLA 20.4 ms, elementwise/other
+11.8 ms, FlashKDA 3.0 ms, MegaMoE pure compute ~8 ms at 0.089 ms/launch
+— same per-launch p50 as pruned), confirming the per-rank isomorphism.
+The other half is wait **inside** the MegaMoE kernel (busy 92.8 ms vs
+~8 ms of compute): per-launch durations are bimodal (p50 0.089 ms, p95
+2.9 ms), and the slow launches recur with an exact **period of 8 expert
+layers** (positions 5,13,21,…,85 at ~2.8 ms each; 26 of 92 launches
+> 0.5 ms, the rest at compute speed) — NOT concentrated at step start
+(position 0 is cheap), so this is a recurring cross-rank
+synchronization stall, not one-time rank-arrival skew. The mechanism is
+not pinned down yet: the executor-ready `blocks=8` is the layer-geometry
+block count (`model/plan.rs`, unrelated to the fabric), and the mega
+slab holds token *rings* (`mega_ring_tokens` in
+`k3_mega_moe_sm100_common.cuh`) whose capacity is a template parameter
+— ring backpressure or a periodic barrier phase are the suspects to
+read out of the kernel. Whatever it is, it is absent on single-tray EP4
+(same kernel at 0.089–0.104 ms/launch flat), so it is cross-tray in
+origin, and it is a latency/pipelining problem before it is a bandwidth
+problem.
+
+Context for both halves: a b≤14-row step on 16×GB300 (8 TB/s HBM each)
+is ~0.2–0.5 ms of pure weight-bandwidth at the roofline. The 160 ms
+round — and the 77 ms plain step — are two orders of magnitude off,
+because the eager EP path runs one request's rows through
+latency-bound small GEMMs plus a shallow fabric pipeline. Spec-decode
+ratios measured on this baseline (the table above) will shift as the
+baseline improves.
+
+**Landed from this round**: batched propose
+(`feat/k3-batched-propose`) — `decode_spec` now makes one drafter call
+per round over every active slot (sorted `split_at_mut` hands out the
+disjoint `&mut` slot states; drafts un-permute back to batch order for
+the verify split loop). One Markov readback/pipeline drain per round
+instead of one per slot. Semantics-neutral, certified at the right
+granularity: **c1 sequential serve A/B vs main is byte-identical**
+(active=1 hits identical GEMM shapes); at c8 outputs fork in the known
+near-tie noise class — batching the dense draft rows retiles GEMMs, a
+one-draft acceptance shift repacks the verify step, and this
+architecture flips near-tie argmaxes on any geometry change (same class
+#931 certified) — while per-slot acceptance stays in-band (dev 3.59 vs
+main 3.45 mean tokens/round over 8 slots, no collapse → no anchor/state
+cross-wiring). `dspark_reference_cross_check` and the 6 `spec_verify`
+gates are green on the branch build.
+
+**Next, in value order** (re-ranked by the EP16 measurement): (1)
+identify and hide the period-8 mega stall — read the mega kernel's
+cross-rank sync structure (token-ring capacity vs barrier phases),
+find what fires every 8th expert layer, then deepen or overlap it; the
+~85 ms of stalls is the single biggest line item; (2) pack the verify
+step's
+per-row/per-group math across rows — attacks the ~57 ms of small-batch
+cuBLAS/MLA/elementwise in the local half, and is the same work the
+plain decode step needs to approach roofline; (3) propose CUDA graph
+only after (2) fixes the packed geometry it would capture (~3 ms at
+c1, matters only at concurrency).
 
 **Not planned** (decided 2026-08-19): adaptive block length via the
 confidence head. The checkpoint ships a confidence head we don't load;
 using it to truncate low-confidence draft blocks would cut wasted
 verify rows where acceptance is weak (e.g. Chinese at 1.33/round).
-Recorded as an idea only — revisit if low-acceptance traffic shows up
-in real serving profiles.
+Recorded as an idea only — **the revisit condition has now fired**:
+the e2e A/B above shows exactly this failure (high-entropy c1 1.8×
+slower; every wasted draft row is a fabric-taxed verify row). Worth a
+fresh look, but it changes serve behavior, so it stays a decision, not
+a default.
