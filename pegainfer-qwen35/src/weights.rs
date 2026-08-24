@@ -27,64 +27,13 @@ use safetensors::SafeTensors;
 use super::config::Config35;
 use super::config::LayerType;
 use super::config::TensorParallelConfig;
-
-/// Full attention layer weights (8 layers in Qwen3.5-4B).
-pub(super) struct FullAttentionLayer {
-    /// Q projection including gate: [num_heads * head_dim * 2, hidden_size]
-    pub(super) q_proj: DeviceMatrix,
-    /// K projection: [num_kv_heads * head_dim, hidden_size]
-    pub(super) k_proj: DeviceMatrix,
-    /// V projection: [num_kv_heads * head_dim, hidden_size]
-    pub(super) v_proj: DeviceMatrix,
-    /// Output projection: [hidden_size, num_heads * head_dim]
-    pub(super) o_proj: DeviceMatrix,
-    /// QK norm weights: [head_dim] (broadcast to all heads)
-    pub(super) q_norm: DeviceVec,
-    pub(super) k_norm: DeviceVec,
-}
-
-/// Linear attention layer weights (24 layers in Qwen3.5-4B).
-pub(super) struct LinearAttentionLayer {
-    /// Fused QKV projection: [q_dim + k_dim + v_dim, hidden_size]
-    pub(super) in_proj_qkv: DeviceMatrix,
-    /// Z projection (for output gating): [z_dim, hidden_size]
-    pub(super) in_proj_z: DeviceMatrix,
-    /// Beta projection: [num_value_heads, hidden_size]
-    pub(super) in_proj_b: DeviceMatrix,
-    /// Alpha projection: [num_value_heads, hidden_size]
-    pub(super) in_proj_a: DeviceMatrix,
-    /// Depthwise conv1d weight: [qkv_dim * conv_kernel_dim] (flattened from [qkv_dim, 1, 4])
-    pub(super) conv1d_weight: DeviceVec,
-    /// dt_bias: [num_value_heads] bf16
-    pub(super) dt_bias: DeviceVec,
-    /// A_log: [num_value_heads] f32
-    pub(super) a_log: CudaSlice<f32>,
-    /// RMSNorm weight for output normalization: [value_head_dim] f32
-    pub(super) norm_weight: CudaSlice<f32>,
-    /// Output projection: [hidden_size, z_dim]
-    pub(super) out_proj: DeviceMatrix,
-}
-
-/// Attention layer — either full or linear.
-pub(super) enum LayerKind {
-    FullAttention(FullAttentionLayer),
-    LinearAttention(LinearAttentionLayer),
-}
-
-/// MLP layer weights (shared between both layer types).
-#[allow(clippy::struct_field_names)]
-pub(super) struct MLP35 {
-    pub(super) gate_up_proj: DeviceMatrix,
-    pub(super) down_proj: DeviceMatrix,
-}
-
-/// Transformer block for Qwen3.5.
-pub(super) struct TransformerBlock35 {
-    pub(super) input_layernorm: DeviceVec,
-    pub(super) attn: LayerKind,
-    pub(super) post_attention_layernorm: DeviceVec,
-    pub(super) mlp: MLP35,
-}
+pub(crate) mod layers;
+pub(crate) use layers::FullAttentionLayer;
+pub(crate) use layers::LayerKind;
+pub(crate) use layers::LinearAttentionLayer;
+pub(crate) use layers::MLP35;
+pub(crate) use layers::TransformerBlock35;
+use layers::*;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ModelRuntimeConfig {
@@ -767,74 +716,6 @@ fn tune_if_nonempty(
         return Ok(());
     }
     crate::ops::gemm_lt_tune(ctx, samples, rows, n)
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct GatedQShardRange {
-    row_offset: usize,
-    rows: usize,
-}
-
-fn full_attention_gated_q_shard_range(
-    config: &Config35,
-    tensor_parallel: TensorParallelConfig,
-) -> GatedQShardRange {
-    // HF/PegaInfer kernels interpret q_proj rows as per-head [q, gate] chunks.
-    // Keep each local head's q rows adjacent to its gate rows.
-    let local_heads = config.local_num_attention_heads(tensor_parallel);
-    let head_start = tensor_parallel.rank * local_heads;
-    GatedQShardRange {
-        row_offset: head_start * config.head_dim * 2,
-        rows: local_heads * config.head_dim * 2,
-    }
-}
-
-fn load_full_attention_gated_q_proj(
-    ctx: &DeviceContext,
-    shards: &[SafeTensors],
-    weight_map: &HashMap<String, usize>,
-    name: &str,
-    config: &Config35,
-    tensor_parallel: TensorParallelConfig,
-) -> Result<DeviceMatrix> {
-    if !tensor_parallel.is_sharded() {
-        return load_tensor_2d(ctx, shards, weight_map, name);
-    }
-
-    let range = full_attention_gated_q_shard_range(config, tensor_parallel);
-    load_tensor_2d_row_shard(ctx, shards, weight_map, name, range.row_offset, range.rows)
-}
-
-fn load_tensor_2d_row_shard_if_needed(
-    ctx: &DeviceContext,
-    shards: &[SafeTensors],
-    weight_map: &HashMap<String, usize>,
-    name: &str,
-    tensor_parallel: TensorParallelConfig,
-    row_offset: usize,
-    rows: usize,
-) -> Result<DeviceMatrix> {
-    if tensor_parallel.is_sharded() {
-        load_tensor_2d_row_shard(ctx, shards, weight_map, name, row_offset, rows)
-    } else {
-        load_tensor_2d(ctx, shards, weight_map, name)
-    }
-}
-
-fn load_tensor_2d_col_shard_if_needed(
-    ctx: &DeviceContext,
-    shards: &[SafeTensors],
-    weight_map: &HashMap<String, usize>,
-    name: &str,
-    tensor_parallel: TensorParallelConfig,
-    col_offset: usize,
-    cols: usize,
-) -> Result<DeviceMatrix> {
-    if tensor_parallel.is_sharded() {
-        load_tensor_2d_col_shard(ctx, shards, weight_map, name, col_offset, cols)
-    } else {
-        load_tensor_2d(ctx, shards, weight_map, name)
-    }
 }
 
 #[cfg(test)]
