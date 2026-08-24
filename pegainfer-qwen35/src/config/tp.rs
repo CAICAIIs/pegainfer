@@ -31,7 +31,7 @@ impl TensorParallelConfig {
         }
         if self.is_sharded() && enable_cuda_graph {
             return Err(anyhow::anyhow!(
-                "Qwen3.5 tensor parallelism is eager-only in Phase 1; disable CUDA Graph for tp world_size={}",
+                "Qwen3.5 tensor parallelism is eager-only; disable CUDA Graph for tp world_size={}",
                 self.world_size
             ));
         }

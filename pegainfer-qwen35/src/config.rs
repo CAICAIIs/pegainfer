@@ -154,7 +154,7 @@ mod tp_tests {
     }
 
     #[test]
-    fn rejects_tensor_parallel_cuda_graph_phase1() {
+    fn rejects_tensor_parallel_cuda_graph() {
         let config = test_config();
         let tp = TensorParallelConfig {
             rank: 0,
@@ -162,11 +162,11 @@ mod tp_tests {
         };
 
         let err = tp.validate_for(&config, true).unwrap_err().to_string();
-        assert!(err.contains("eager-only in Phase 1"));
+        assert!(err.contains("eager-only"));
     }
 
     #[test]
-    fn phase1_does_not_require_linear_attention_divisibility() {
+    fn tp_does_not_require_linear_attention_divisibility() {
         let mut config = test_config();
         config.linear_num_key_heads = 17;
         config.linear_num_value_heads = 31;
