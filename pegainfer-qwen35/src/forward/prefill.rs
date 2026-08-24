@@ -214,7 +214,6 @@ impl Qwen35Model {
     }
 
     /// Process one layer during prefill. Returns updated hidden_batch.
-    #[allow(clippy::too_many_arguments)]
     fn prefill_layer(
         &self,
         _layer_idx: usize,
@@ -283,7 +282,6 @@ impl Qwen35Model {
         ops::add_batch(&self.ctx, &hidden_plus_attn, &mlp_out)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn prefill_full_attention(
         &self,
         attn: &FullAttentionLayer,

@@ -13,7 +13,6 @@ use crate::ffi;
 use crate::prefill_buffers::GdrChunkwiseScratch35;
 
 #[cfg(test)]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn gated_delta_rule_decode_vec_into(
     ctx: &DeviceContext,
     qkv: &DeviceVec,
@@ -54,7 +53,6 @@ pub(crate) fn gated_delta_rule_decode_vec_into(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn gated_delta_rule_decode_batch_into(
     ctx: &DeviceContext,
     qkv: &HiddenStates,
@@ -144,7 +142,6 @@ pub(crate) fn conv1d_decode_batch_into(
 }
 
 /// Causal depthwise conv1d prefill over a HiddenStates batch.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn conv1d_prefill_batch_into(
     ctx: &DeviceContext,
     x_seq: &HiddenStates,
@@ -178,7 +175,6 @@ pub(crate) fn conv1d_prefill_batch_into(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn gated_delta_rule_prefill_chunk_prepare_into(
     ctx: &DeviceContext,
     qkv: &HiddenStates,
@@ -297,7 +293,6 @@ fn gated_delta_rule_prefill_chunk_solve_into(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn gated_delta_rule_prefill_chunk_recompute_into(
     ctx: &DeviceContext,
     k: &HiddenStates,
@@ -335,7 +330,6 @@ fn gated_delta_rule_prefill_chunk_recompute_into(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn gated_delta_rule_prefill_chunk_state_stage_into(
     ctx: &DeviceContext,
     k: &HiddenStates,
@@ -381,7 +375,6 @@ fn gated_delta_rule_prefill_chunk_state_stage_into(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn gated_delta_rule_prefill_chunk_o_stage_into(
     ctx: &DeviceContext,
     q: &HiddenStates,
@@ -429,7 +422,6 @@ fn gated_delta_rule_prefill_chunk_o_stage_into(
 ///
 /// The chunk-wise path is an explicit multi-stage operator with pre-allocated
 /// scratch instead of one opaque kernel launch.
-#[allow(clippy::too_many_arguments)]
 pub fn gated_delta_rule_prefill_chunkwise_into(
     ctx: &DeviceContext,
     qkv: &HiddenStates,
