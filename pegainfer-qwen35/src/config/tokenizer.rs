@@ -2,11 +2,8 @@ use std::collections::HashSet;
 use std::fs;
 
 use anyhow::Result;
-use anyhow::bail;
-use anyhow::ensure;
 use log::warn;
 use serde::Deserialize;
-use serde_json::Value;
 
 #[allow(dead_code)]
 // The tokenizer_config schema is bool-heavy by design.
