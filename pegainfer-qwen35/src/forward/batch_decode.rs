@@ -383,7 +383,12 @@ impl Qwen35Model {
 
         let kv_buffer = kv_states[0].buffer();
         let layout = *kv_states[0].layout();
-        let bucket_idx = BATCH_BUCKETS.iter().position(|&b| b == padded_bs).unwrap();
+        let bucket_idx = BATCH_BUCKETS
+            .iter()
+            .position(|&b| b == padded_bs)
+            .ok_or_else(|| {
+                anyhow::anyhow!("padded batch size {padded_bs} is not a Qwen3.5 decode bucket")
+            })?;
 
         // Take graphs out of graph_state to avoid split-borrow in the closure.
         let mut graphs = std::mem::take(&mut graph_state.graphs);

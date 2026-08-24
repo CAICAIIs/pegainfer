@@ -43,6 +43,12 @@ impl AsyncPrefillOutput {
             }
             self.completed = true;
         }
+        // `self` is consumed here and the scheduler calls `into_logits` exactly
+        // once per prefill; `logits` is still populated at this point, so the
+        // `take` can only be `None` if a second `into_logits` runs (a caller bug).
+        // The method returns `HiddenStates` (not `Result`), and a missing value is
+        // a contract violation rather than a runtime failure, so an `expect` is
+        // intentional here.
         self.logits
             .take()
             .expect("async prefill logits must be consumed exactly once")
@@ -365,6 +371,9 @@ impl SingleGpuBackend {
 
             ctx.stream
                 .memcpy_dtod(&src_part.state, &mut dst_part.state)
+                // `compact_slot` returns `()` and a slot state copy must succeed
+                // for the paged-KV layout to stay consistent; a CUDA copy failure
+                // here is a fatal invariant breach, so `expect` is deliberate.
                 .expect("compact slot state copy failed");
             ctx.stream
                 .memcpy_dtod(&src_part.conv_state.data, &mut dst_part.conv_state.data)

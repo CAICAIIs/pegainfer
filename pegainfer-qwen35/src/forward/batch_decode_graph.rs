@@ -24,6 +24,7 @@ pub(crate) fn bucket_for(bs: usize) -> usize {
             return b;
         }
     }
+    // `BATCH_BUCKETS` is a non-empty const, so `last()` is always `Some`.
     panic!(
         "batch size {bs} exceeds largest bucket {}",
         BATCH_BUCKETS.last().unwrap()

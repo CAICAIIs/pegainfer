@@ -53,6 +53,11 @@ impl CliQwen35SchedulerPolicy {
 }
 
 fn cli(ctx: &LaunchContext<'_>) -> Qwen35Cli {
+    // `augment_cli` registered every Qwen3.5 flag and `validate` already ran
+    // against the same `ctx.matches`, so the merged command always parses back
+    // into `Qwen35Cli`. `from_arg_matches` fails only on schema/CLI drift, which
+    // is a hard programming error; the call site can return `CliError`, but
+    // widening `cli` to `Result` would ripple into `validate`/`launch`.
     Qwen35Cli::from_arg_matches(ctx.matches).expect("Qwen35Cli parses from the merged command")
 }
 

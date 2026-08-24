@@ -253,6 +253,9 @@ impl PrefillStepArtifacts {
                 token: tokens[idx],
                 logprob: logprobs[idx].clone(),
             },
+            // TP prefill artifacts were validated up front (every row carries a
+            // final-prefill artifact), so the `Some` here is an invariant. The
+            // method returns `PrefillArtifact` directly, so `expect` is used.
             Self::Tp(artifacts) => artifacts[idx]
                 .clone()
                 .expect("validated TP final-prefill row must contain an artifact"),
@@ -550,6 +553,10 @@ fn scheduler_loop(
                 &mut backend,
                 &mut active,
                 &mut prefilling,
+                // This branch only runs when a prefill was in flight (the flag
+                // that set `inflight_prefill` is still held here), so the
+                // `take()` is provably `Some`. `scheduler_loop` returns `()`, so
+                // `expect` is deliberate rather than a `?`.
                 inflight_prefill
                     .take()
                     .expect("ready async prefill must still be present"),
@@ -682,6 +689,9 @@ fn scheduler_loop(
                     &mut prefilling,
                     inflight_prefill
                         .take()
+                        // This branch only blocks when a prefill is in flight, so
+                        // `inflight_prefill` is provably `Some`. `scheduler_loop`
+                        // returns `()`, hence `expect` rather than `?`.
                         .expect("async prefill must be present before blocking wait"),
                 );
                 ("overlap_wait", result)

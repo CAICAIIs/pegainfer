@@ -176,6 +176,11 @@ pub(super) fn unified_step_sched(
         process_decode_logits(backend, active, decode_seed)?;
     }
 
+    // A scheduled prefill chunk must have produced logits (the chunk was chosen
+    // by `choose_prefill_budget` and just ran), so `Some` is an invariant. The
+    // enclosing `unified_step_sched` returns `FatalSchedulerError` (not anyhow),
+    // and a missing value is a scheduler-state violation rather than a runtime
+    // failure, so `expect` is deliberate here.
     let prefill_logits = output
         .prefill_logits
         .as_ref()
@@ -691,6 +696,10 @@ impl PrefillPromoteBackend for SingleGpuBackend {
         let PrefillBackendState::Single { kv, rec } = state else {
             panic!("single-GPU promotion received TP prefill state");
         };
+        // Admission already reserved a graph slot for this request and the
+        // recurrent-state copy into it is required for the paged-KV slot to be
+        // usable. `promote_prefill_state` returns `ActiveBackendState` (not a
+        // `Result`), so a slot/copy failure here is a hard invariant breach.
         let slot_idx = slot_for_new_request(active_len, self.max_batch())
             .expect("admission must reserve a graph slot");
         self.copy_recurrent_to_slot(&rec, slot_idx)
@@ -722,6 +731,7 @@ impl PrefillPromoteBackend for SchedulerBackend {
     ) -> ActiveBackendState {
         match (self, state) {
             (SchedulerBackend::Single(single), PrefillBackendState::Single { kv, rec }) => {
+                // Same admission/copy invariant as the SingleGpuBackend impl above.
                 let slot_idx = slot_for_new_request(active_len, single.max_batch())
                     .expect("admission must reserve a graph slot");
                 single

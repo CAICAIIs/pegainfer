@@ -76,7 +76,10 @@ pub(crate) fn tokenizer_effective_vocab(model_path: &str) -> Result<usize> {
     }
 
     let width = ids.len();
-    let max_id = *ids.iter().max().expect("vocab checked non-empty") as usize;
+    let max_id =
+        *ids.iter()
+            .max()
+            .ok_or_else(|| anyhow::anyhow!("tokenizer vocab must be non-empty"))? as usize;
     anyhow::ensure!(
         max_id + 1 == width,
         "tokenizer id space is not dense (max id {max_id}, {width} distinct ids); \

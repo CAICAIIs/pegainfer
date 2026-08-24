@@ -84,7 +84,8 @@ impl Qwen35Model {
             hidden_batch = Some(self.prefill_chunk_forward(chunk, kv_state, recurrent)?);
         }
         // `seq_len > 0` guarantees at least one chunk produced hidden states.
-        let hidden_batch = hidden_batch.expect("prefill produced no chunk despite seq_len > 0");
+        let hidden_batch = hidden_batch
+            .ok_or_else(|| anyhow::anyhow!("prefill produced no chunk despite seq_len > 0"))?;
 
         // Last-token logic runs once, on the final chunk's output.
         ops::extract_vec(&self.ctx, &hidden_batch, hidden_batch.seq_len - 1)
