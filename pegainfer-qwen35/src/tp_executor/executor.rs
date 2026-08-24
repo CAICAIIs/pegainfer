@@ -6,7 +6,6 @@ use super::*;
 
 /// TP executor. Rank 0 is the primary worker and returns scheduler-visible
 /// artifacts; every rank runs the same ordered state-mutating commands.
-
 pub struct Qwen35TpExecutor {
     pub(super) workers: Vec<TpWorker>,
     pub(super) poison: Arc<TpRuntimePoison>,

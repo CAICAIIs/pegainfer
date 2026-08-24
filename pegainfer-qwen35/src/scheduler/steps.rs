@@ -258,7 +258,6 @@ pub(super) fn decode_step_with_seed(
 }
 
 /// Process decode logits from unified step: sample, extract logprobs, dispatch.
-
 pub(super) fn process_decode_logits(
     backend: &mut SingleGpuBackend,
     active: &mut Vec<ActiveRequest35>,
@@ -287,7 +286,6 @@ pub(super) fn process_decode_logits(
 ///
 /// `tokens` and `logprobs` are indexed by original position in `active`.
 /// Retirements collected first, then compacted in reverse order.
-
 pub(super) fn dispatch_decode_tokens(
     backend: &mut impl DecodeDispatchBackend,
     active: &mut Vec<ActiveRequest35>,
@@ -464,7 +462,6 @@ impl DecodeDispatchBackend for SchedulerBackend {
 /// After swap_remove, the element that was at `active.len()-1` (before remove)
 /// now sits at `idx`. Its graph slot must be copied into the vacated slot so
 /// that slots 0..active.len() remain dense.
-
 pub(super) fn compact_single_slot(
     backend: &mut SingleGpuBackend,
     active: &mut Vec<ActiveRequest35>,

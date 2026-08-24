@@ -284,15 +284,6 @@ impl FatalSchedulerError {
 
 pub const DEFAULT_MAX_PREFILL_TOKENS: usize = 1024;
 
-/// Env-gated per-step ITL diagnostics (issue #470). When `PEGAINFER_ITL_DEBUG`
-/// is set, the scheduler emits one `ITL_STEP` line per executed step, tagging
-/// the plan kind, the *actual* prefill-chunk token count associated with the
-/// action, the active decode width, and the CPU wall-time. This lets the
-/// mixed-load bench separate serial Unified stalls from overlap launch,
-/// decode, completion, and wait actions instead of relying on the coarse
-/// `[submit, last-token]` injection window. Off by default: no cost on the
-/// normal bench path.
-
 // ── Entry point ─────────────────────────────────────────────────────────
 
 pub fn start_with_capacity(

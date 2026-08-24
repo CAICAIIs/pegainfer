@@ -2,6 +2,9 @@
 // `pegainfer-kernels/qwen35`, which need Python + Triton at build time.
 // Without the feature this compiles to an empty crate so plain workspace
 // builds stay Python-free.
+// Submodule  globs are the established module-tree pattern in this
+// crate (and the repo); re-export the parent scope into each concern file.
+#![allow(clippy::wildcard_imports)]
 #![cfg(feature = "qwen35")]
 
 pub(crate) mod config;
