@@ -178,7 +178,7 @@ mod tp_tests {
 /// Schema kept identical to the pinned vLLM frontend; unread fields exist for
 /// payload type-checking.
 mod tests {
-    
+    use super::Config35;
 
     #[test]
     fn guard_accepts_48_value_heads() {
