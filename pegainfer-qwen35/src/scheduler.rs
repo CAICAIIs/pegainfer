@@ -351,7 +351,7 @@ pub(crate) fn start_with_capacity_and_policy(
                 let _ = startup_tx.send(Err(err));
             }
         })
-        .expect("failed to spawn Qwen3.5 scheduler thread");
+        .map_err(|err| anyhow::anyhow!("failed to spawn Qwen3.5 scheduler thread: {err}"))?;
 
     let Ok(startup) = startup_rx.recv() else {
         let panic_note = match join_handle.join() {
@@ -415,7 +415,7 @@ pub(crate) fn start_tp_with_capacity(
                 load_tx,
             );
         })
-        .expect("failed to spawn Qwen3.5 TP scheduler thread");
+        .map_err(|err| anyhow::anyhow!("failed to spawn Qwen3.5 TP scheduler thread: {err}"))?;
 
     Ok(
         SchedulerHandle::new_with_join_handle(submit_tx, join_handle)
