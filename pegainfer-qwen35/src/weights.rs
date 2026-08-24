@@ -182,7 +182,7 @@ impl Qwen35Model {
         Self::from_safetensors_with_runtime_and_capacity(
             model_path,
             runtime,
-            super::batch_decode_graph::MAX_BATCH,
+            crate::forward::batch_decode_graph::MAX_BATCH,
         )
     }
 
@@ -192,16 +192,16 @@ impl Qwen35Model {
         max_batch: usize,
     ) -> Result<Self> {
         anyhow::ensure!(
-            (1..=super::batch_decode_graph::MAX_BATCH).contains(&max_batch),
+            (1..=crate::forward::batch_decode_graph::MAX_BATCH).contains(&max_batch),
             "decode batch capacity must be in 1..={}, got {max_batch}",
-            super::batch_decode_graph::MAX_BATCH,
+            crate::forward::batch_decode_graph::MAX_BATCH,
         );
         // Requested scheduler admission cap; physical decode capacity is the
         // next CUDA-graph bucket >= this (e.g. `--max-batch 5` allocates bucket
         // 8 but admits at most 5, see #470). Everything below sizes to the
         // physical bucket; only `decode_admission_batch` keeps the request.
         let decode_admission_batch = max_batch;
-        let max_batch = super::batch_decode_graph::bucket_for(max_batch);
+        let max_batch = crate::forward::batch_decode_graph::bucket_for(max_batch);
         info!("Loading Qwen3.5 model from: {}", model_path);
         debug!("Initializing GPU device {}", runtime.device_ordinal);
         let ctx = DeviceContext::new_with_device(runtime.device_ordinal)?;
@@ -501,7 +501,7 @@ impl Qwen35Model {
             .map_err(|e| anyhow::anyhow!("cuMemGetInfo failed: {e}"))?;
         // Reserve space for prefill scratch (GDR chunkwise + per-layer transients)
         // before allocating KV pool, so prefill doesn't OOM.
-        let max_prefill_len = super::prefill::SCRATCH_ESTIMATE_SEQ;
+        let max_prefill_len = crate::forward::prefill::SCRATCH_ESTIMATE_SEQ;
         let scratch_reserve =
             super::prefill_buffers::GdrChunkwiseScratch35::estimate_bytes(&config, max_prefill_len);
         let recurrent_reserve =
@@ -690,7 +690,7 @@ impl Qwen35Model {
             .collect();
         let lm_head_samples = [(self.output_projection(), 0)];
 
-        for &n in super::batch_decode_graph::BATCH_BUCKETS
+        for &n in crate::forward::batch_decode_graph::BATCH_BUCKETS
             .iter()
             .filter(|&&bucket| {
                 // Keep in sync with MAX_SHARED_SM_DECODE_BATCH: buckets above
@@ -716,20 +716,20 @@ impl Qwen35Model {
     /// Create the CUDA Graph batch decode state at the loaded capacity.
     pub(crate) fn create_batch_decode_graph_state(
         &self,
-    ) -> anyhow::Result<super::batch_decode_graph::BatchDecodeGraphState> {
+    ) -> anyhow::Result<crate::forward::batch_decode_graph::BatchDecodeGraphState> {
         self.create_batch_decode_graph_state_with_capacity(self.reserved_decode_slots)
     }
 
     pub(crate) fn create_batch_decode_graph_state_with_capacity(
         &self,
         max_batch: usize,
-    ) -> anyhow::Result<super::batch_decode_graph::BatchDecodeGraphState> {
+    ) -> anyhow::Result<crate::forward::batch_decode_graph::BatchDecodeGraphState> {
         anyhow::ensure!(
             max_batch <= self.reserved_decode_slots,
             "requested graph capacity {max_batch} exceeds loaded capacity {}",
             self.reserved_decode_slots
         );
-        super::batch_decode_graph::BatchDecodeGraphState::with_capacity(
+        crate::forward::batch_decode_graph::BatchDecodeGraphState::with_capacity(
             &self.ctx,
             &self.config,
             self.tensor_parallel,

@@ -12,8 +12,8 @@ use pegainfer_core::tensor::HiddenStates;
 use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_frontend::sampler::SamplingParams;
 
-use crate::batch_decode_graph::BatchDecodeGraphState;
 use crate::decode_buffers::BatchDecodeBuffers35;
+use crate::forward::batch_decode_graph::BatchDecodeGraphState;
 use crate::logprobs::snapshot_requested_logprobs;
 use crate::recurrent_state::RecurrentState;
 use crate::weights::Qwen35Model;

@@ -23,4 +23,4 @@ pub(crate) use recurrent::conv1d_prefill_batch_into;
 pub(crate) use recurrent::gated_delta_rule_decode_batch_into;
 pub use recurrent::gated_delta_rule_prefill_chunkwise_into;
 
-use crate::recurrent;
+use crate::forward::recurrent;

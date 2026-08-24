@@ -4,25 +4,21 @@
 // builds stay Python-free.
 #![cfg(feature = "qwen35")]
 
-mod batch_decode;
-pub(crate) mod batch_decode_graph;
 pub(crate) mod config;
 mod decode_buffers;
 mod executor;
 mod ffi;
+mod forward;
 mod logprobs;
 pub mod model_line;
 mod ops;
-mod prefill;
 pub mod prefill_buffers;
-pub(crate) mod recurrent;
 pub(crate) mod recurrent_state;
 mod scheduler;
 #[cfg(test)]
 #[path = "../tests/common/model_fixture.rs"]
 mod test_fixture;
 mod tp_executor;
-mod unified_forward;
 mod weights;
 
 use std::path::Path;
@@ -36,7 +32,7 @@ use pegainfer_frontend::engine::EpBackend;
 pub use scheduler::DEFAULT_MAX_PREFILL_TOKENS;
 
 /// Maximum supported Qwen3.5 decode scheduler slots.
-const MAX_DECODE_BATCH: usize = batch_decode_graph::MAX_BATCH;
+const MAX_DECODE_BATCH: usize = forward::batch_decode_graph::MAX_BATCH;
 
 /// Current safe Qwen3.5 Shared-SM overlap admission cap.
 ///

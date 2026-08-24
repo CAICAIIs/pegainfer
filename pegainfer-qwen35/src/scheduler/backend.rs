@@ -79,7 +79,7 @@ impl SingleGpuBackend {
         decode_overlap: Qwen35DecodeOverlap,
     ) -> Result<Self> {
         anyhow::ensure!(max_batch > 0, "Qwen3.5 max_batch must be > 0");
-        let graph_capacity = crate::batch_decode_graph::bucket_for(max_batch);
+        let graph_capacity = crate::forward::batch_decode_graph::bucket_for(max_batch);
         let graph_state = model.create_batch_decode_graph_state_with_capacity(graph_capacity)?;
         let prefill_stream = match decode_overlap {
             Qwen35DecodeOverlap::Off => None,
@@ -208,7 +208,7 @@ impl SingleGpuBackend {
         &mut self,
         chunk: &mut ScheduledChunk,
         active: &mut [ActiveRequest35],
-    ) -> Result<crate::unified_forward::UnifiedStepOutput> {
+    ) -> Result<crate::forward::unified_forward::UnifiedStepOutput> {
         let window_refs: Vec<&[u32]> = chunk.windows.iter().map(Vec::as_slice).collect();
         let ScheduledChunkBackendState::Single { kvs, recs } = &mut chunk.backend_state else {
             anyhow::bail!("single-GPU unified step received TP chunk state");

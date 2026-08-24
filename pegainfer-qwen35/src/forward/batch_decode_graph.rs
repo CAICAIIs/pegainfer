@@ -5,11 +5,11 @@ use pegainfer_core::cuda_graph::CudaGraphState;
 use pegainfer_core::kv_pool::KvPool;
 use pegainfer_core::tensor::DeviceContext;
 
-use super::config::Config35;
-use super::config::TensorParallelConfig;
-use super::decode_buffers::BatchDecodeBuffers35;
-use super::recurrent_state::LinearStatePointerTables;
-use super::recurrent_state::RecurrentState;
+use crate::config::Config35;
+use crate::config::TensorParallelConfig;
+use crate::decode_buffers::BatchDecodeBuffers35;
+use crate::recurrent_state::LinearStatePointerTables;
+use crate::recurrent_state::RecurrentState;
 
 /// Bucket sizes for CUDA Graph capture. Actual batch is padded to nearest bucket.
 pub(crate) const BATCH_BUCKETS: &[usize] = &[1, 2, 4, 8, 16, 32, 64];

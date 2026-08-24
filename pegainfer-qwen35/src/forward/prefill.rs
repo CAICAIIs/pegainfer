@@ -24,16 +24,16 @@ use pegainfer_core::kv_pool::KvState;
 use pegainfer_core::tensor::DeviceVec;
 use pegainfer_core::tensor::HiddenStates;
 
-use super::prefill_buffers::GdrChunkwiseScratch35;
-use super::recurrent_state::RecurrentState;
-use super::weights::FullAttentionLayer;
-use super::weights::LayerKind;
-use super::weights::LinearAttentionLayer;
-use super::weights::Qwen35Model;
-use super::weights::TransformerBlock35;
 use crate::ffi;
 use crate::ops;
 use crate::ops::PrefillPagedPlan;
+use crate::prefill_buffers::GdrChunkwiseScratch35;
+use crate::recurrent_state::RecurrentState;
+use crate::weights::FullAttentionLayer;
+use crate::weights::LayerKind;
+use crate::weights::LinearAttentionLayer;
+use crate::weights::Qwen35Model;
+use crate::weights::TransformerBlock35;
 
 fn checked_prefill_end_pos(
     base_pos: usize,

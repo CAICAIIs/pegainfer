@@ -18,9 +18,9 @@ use pegainfer_core::tensor::HiddenStates;
 use pegainfer_frontend::engine::panic_message;
 use pegainfer_kernels::tensor::StreamOverrideGuard;
 
-use super::batch_decode_graph::BatchDecodeGraphState;
-use super::recurrent_state::RecurrentState;
-use super::weights::Qwen35Model;
+use crate::forward::batch_decode_graph::BatchDecodeGraphState;
+use crate::recurrent_state::RecurrentState;
+use crate::weights::Qwen35Model;
 
 pub(crate) struct UnifiedStepOutput {
     pub(crate) prefill_logits: Option<HiddenStates>,
