@@ -39,7 +39,7 @@ use crate::recurrent_state::RecurrentState;
 use crate::weights::ModelRuntimeConfig;
 use crate::weights::Qwen35Model;
 pub(super) mod worker;
-pub(super) use worker::*;
+use worker::*;
 
 const TP_NCCL_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const TP_RUNTIME_STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
