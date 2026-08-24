@@ -8,329 +8,43 @@ use log::warn;
 use serde::Deserialize;
 use serde_json::Value;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct TensorParallelConfig {
-    pub(crate) rank: usize,
-    pub(crate) world_size: usize,
-}
+mod model;
+mod tokenizer;
+mod tp;
 
-impl Default for TensorParallelConfig {
-    fn default() -> Self {
-        Self {
-            rank: 0,
-            world_size: 1,
-        }
+pub(crate) use model::*;
+pub(crate) use tokenizer::*;
+pub(crate) use tp::*;
+
+/// Identity check that `json` is a Qwen3.5 config; size and shape validation belong to the config loader.
+pub(crate) fn probe_config_json(json: &Value) -> Result<()> {
+    let model_type = json.get("model_type").and_then(Value::as_str).unwrap_or("");
+    if model_type != "qwen3_5" {
+        bail!("not a Qwen3.5 config: model_type={model_type}");
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LayerType {
-    FullAttention,
-    LinearAttention,
-}
-
-#[derive(Debug, Deserialize)]
-struct RopeParameters {
-    rope_theta: f64,
-    partial_rotary_factor: f64,
-}
-
-#[derive(Debug, Deserialize)]
-struct TextConfig {
-    hidden_size: usize,
-    intermediate_size: usize,
-    num_hidden_layers: usize,
-    num_attention_heads: usize,
-    num_key_value_heads: usize,
-    head_dim: usize,
-    vocab_size: usize,
-    rms_norm_eps: f64,
-    layer_types: Vec<String>,
-    linear_conv_kernel_dim: usize,
-    linear_key_head_dim: usize,
-    linear_num_key_heads: usize,
-    linear_num_value_heads: usize,
-    linear_value_head_dim: usize,
-    rope_parameters: RopeParameters,
-    max_position_embeddings: Option<usize>,
-    tie_word_embeddings: Option<bool>,
-    eos_token_id: u32,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawConfig {
-    text_config: TextConfig,
-    max_position_embeddings: Option<usize>,
-    tie_word_embeddings: Option<bool>,
-}
-
-/// Qwen3.5 model configuration (text-only).
-#[derive(Debug)]
-pub(crate) struct Config35 {
-    // Common
-    pub(crate) hidden_size: usize,
-    pub(crate) intermediate_size: usize,
-    pub(crate) num_hidden_layers: usize,
-    pub(crate) vocab_size: usize,
-    pub(crate) rms_norm_eps: f32,
-    pub(crate) eos_token_id: u32,
-
-    // Full attention params
-    pub(crate) num_attention_heads: usize,
-    pub(crate) num_key_value_heads: usize,
-    pub(crate) head_dim: usize,
-
-    // Linear attention params
-    pub(crate) linear_num_key_heads: usize,
-    pub(crate) linear_key_head_dim: usize,
-    pub(crate) linear_num_value_heads: usize,
-    pub(crate) linear_value_head_dim: usize,
-    pub(crate) linear_conv_kernel_dim: usize,
-
-    // RoPE
-    pub(crate) rope_theta: f32,
-    pub(crate) rotary_dim: usize,
-    pub(crate) max_position_embeddings: usize,
-
-    // Layer layout
-    pub(crate) layer_types: Vec<LayerType>,
-
-    /// `false` requires a top-level `lm_head.weight`; `true` reuses `embed_tokens`.
-    pub(crate) tie_word_embeddings: bool,
-
-    /// Token-selection width: `vocab_size` bounded to the frontend-decodable vocab.
-    pub(crate) selection_vocab: usize,
-}
-
-/// Head dims baked into the kernels; head counts are runtime parameters.
-pub(crate) const GDN_AOT_KEY_HEAD_DIM: usize = 128;
-pub(crate) const GDN_AOT_VALUE_HEAD_DIM: usize = 128;
-pub(crate) const LINEAR_CONV_MAX_KERNEL_DIM: usize = 4;
-const FULL_ATTN_HEAD_DIM: usize = 256;
-
-impl Config35 {
-    pub(crate) fn from_file(model_path: &str) -> Result<Self> {
-        let config_path = format!("{}/config.json", model_path);
-        let content = fs::read_to_string(&config_path)?;
-        let raw: RawConfig = serde_json::from_str(&content)?;
-        let root_max_position_embeddings = raw.max_position_embeddings;
-        let root_tie_word_embeddings = raw.tie_word_embeddings;
-        let t = raw.text_config;
-
-        let tie_word_embeddings = t
-            .tie_word_embeddings
-            .or(root_tie_word_embeddings)
-            .ok_or_else(|| anyhow::anyhow!("Qwen3.5 config missing tie_word_embeddings"))?;
-
-        let layer_types: Vec<LayerType> = t
-            .layer_types
-            .iter()
-            .map(|s| match s.as_str() {
-                "full_attention" => Ok(LayerType::FullAttention),
-                "linear_attention" => Ok(LayerType::LinearAttention),
-                other => Err(anyhow::anyhow!("Unknown layer type: {}", other)),
-            })
-            .collect::<Result<_>>()?;
-
-        anyhow::ensure!(
-            layer_types.len() == t.num_hidden_layers,
-            "layer_types length {} != num_hidden_layers {}",
-            layer_types.len(),
-            t.num_hidden_layers
-        );
-
-        let rotary_dim = (t.head_dim as f64 * t.rope_parameters.partial_rotary_factor) as usize;
-        anyhow::ensure!(rotary_dim > 0, "Qwen3.5 rotary_dim must be positive");
-        let max_position_embeddings = t
-            .max_position_embeddings
-            .or(root_max_position_embeddings)
-            .ok_or_else(|| anyhow::anyhow!("Qwen3.5 config missing max_position_embeddings"))?;
-        anyhow::ensure!(
-            max_position_embeddings > 0,
-            "Qwen3.5 max_position_embeddings must be positive"
-        );
-
-        anyhow::ensure!(
-            t.linear_key_head_dim == GDN_AOT_KEY_HEAD_DIM
-                && t.linear_value_head_dim == GDN_AOT_VALUE_HEAD_DIM,
-            "Qwen3.5 GDN Triton-AOT kernels are baked for key/value head dim {}/{}; \
-             config has {}/{} (dims are baked into the AOT signatures in pegainfer-kernels/build.rs).",
-            GDN_AOT_KEY_HEAD_DIM,
-            GDN_AOT_VALUE_HEAD_DIM,
-            t.linear_key_head_dim,
-            t.linear_value_head_dim,
-        );
-        anyhow::ensure!(
-            t.head_dim == FULL_ATTN_HEAD_DIM,
-            "Qwen3.5 full-attention kernels are baked for head_dim {}; config has {}.",
-            FULL_ATTN_HEAD_DIM,
-            t.head_dim,
-        );
-        anyhow::ensure!(
-            (1..=LINEAR_CONV_MAX_KERNEL_DIM).contains(&t.linear_conv_kernel_dim),
-            "Qwen3.5 linear conv decode kernels support kernel_dim in 1..={}; config has {}.",
-            LINEAR_CONV_MAX_KERNEL_DIM,
-            t.linear_conv_kernel_dim,
-        );
-        anyhow::ensure!(
-            t.linear_num_key_heads > 0
-                && t.linear_num_value_heads
-                    .is_multiple_of(t.linear_num_key_heads),
-            "Qwen3.5 GDN kernels require linear_num_value_heads ({}) divisible by \
-             linear_num_key_heads ({})",
-            t.linear_num_value_heads,
-            t.linear_num_key_heads,
-        );
-        anyhow::ensure!(
-            t.num_key_value_heads > 0
-                && t.num_attention_heads.is_multiple_of(t.num_key_value_heads),
-            "Qwen3.5 num_attention_heads ({}) must be a positive multiple of \
-             num_key_value_heads ({})",
-            t.num_attention_heads,
-            t.num_key_value_heads,
-        );
-
-        let config = Self {
-            hidden_size: t.hidden_size,
-            intermediate_size: t.intermediate_size,
-            num_hidden_layers: t.num_hidden_layers,
-            vocab_size: t.vocab_size,
-            rms_norm_eps: t.rms_norm_eps as f32,
-            eos_token_id: t.eos_token_id,
-            num_attention_heads: t.num_attention_heads,
-            num_key_value_heads: t.num_key_value_heads,
-            head_dim: t.head_dim,
-            linear_num_key_heads: t.linear_num_key_heads,
-            linear_key_head_dim: t.linear_key_head_dim,
-            linear_num_value_heads: t.linear_num_value_heads,
-            linear_value_head_dim: t.linear_value_head_dim,
-            linear_conv_kernel_dim: t.linear_conv_kernel_dim,
-            rope_theta: t.rope_parameters.rope_theta as f32,
-            rotary_dim,
-            max_position_embeddings,
-            layer_types,
-            tie_word_embeddings,
-            selection_vocab: t.vocab_size,
-        };
-        Ok(config)
-    }
-
-    /// Number of full attention layers in the model.
-    pub(crate) fn num_full_attention_layers(&self) -> usize {
-        self.layer_types
-            .iter()
-            .filter(|&&t| t == LayerType::FullAttention)
-            .count()
-    }
-
-    /// Q dimension for full attention (without gate).
-    pub(crate) fn full_attn_q_dim(&self) -> usize {
-        self.num_attention_heads * self.head_dim
-    }
-
-    /// KV dimension for full attention.
-    pub(crate) fn full_attn_kv_dim(&self) -> usize {
-        self.num_key_value_heads * self.head_dim
-    }
-
-    pub(crate) fn decode_group_is_compiled(&self) -> bool {
-        // Uncompiled GQA groups use the batched hybrid eager fallback.
-        pegainfer_core::ops::SUPPORTED_GQA_GROUP_SIZES
-            .contains(&(self.num_attention_heads / self.num_key_value_heads))
-    }
-
-    /// QKV projection output dimension for linear attention.
-    pub(crate) fn linear_attn_qkv_dim(&self) -> usize {
-        let q_dim = self.linear_num_key_heads * self.linear_key_head_dim;
-        let k_dim = q_dim;
-        let v_dim = self.linear_num_value_heads * self.linear_value_head_dim;
-        q_dim + k_dim + v_dim
-    }
-
-    /// Z projection output dimension for linear attention.
-    pub(crate) fn linear_attn_z_dim(&self) -> usize {
-        self.linear_num_value_heads * self.linear_value_head_dim
-    }
-
-    pub(crate) fn local_num_attention_heads(&self, tp: TensorParallelConfig) -> usize {
-        self.num_attention_heads / tp.world_size
-    }
-
-    pub(crate) fn local_num_key_value_heads(&self, tp: TensorParallelConfig) -> usize {
-        self.num_key_value_heads / tp.world_size
-    }
-
-    pub(crate) fn local_intermediate_size(&self, tp: TensorParallelConfig) -> usize {
-        self.intermediate_size / tp.world_size
-    }
-
-    pub(crate) fn local_full_attn_q_dim(&self, tp: TensorParallelConfig) -> usize {
-        self.local_num_attention_heads(tp) * self.head_dim
-    }
-
-    pub(crate) fn local_full_attn_kv_dim(&self, tp: TensorParallelConfig) -> usize {
-        self.local_num_key_value_heads(tp) * self.head_dim
-    }
-
-    /// Local gated full-attention q projection output dimension.
-    pub(crate) fn local_full_attn_gated_q_dim(&self, tp: TensorParallelConfig) -> usize {
-        self.local_full_attn_q_dim(tp) * 2
-    }
-}
-
-impl TensorParallelConfig {
-    pub(crate) fn validate_for(self, config: &Config35, enable_cuda_graph: bool) -> Result<()> {
-        if self.world_size == 0 {
-            return Err(anyhow::anyhow!("tensor_parallel.world_size must be >= 1"));
-        }
-        if self.rank >= self.world_size {
-            return Err(anyhow::anyhow!(
-                "tensor_parallel.rank {} must be < world_size {}",
-                self.rank,
-                self.world_size
-            ));
-        }
-        if self.is_sharded() && enable_cuda_graph {
-            return Err(anyhow::anyhow!(
-                "Qwen3.5 tensor parallelism is eager-only; disable CUDA Graph for tp world_size={}",
-                self.world_size
-            ));
-        }
-        if !config.num_attention_heads.is_multiple_of(self.world_size) {
-            return Err(anyhow::anyhow!(
-                "num_attention_heads={} not divisible by tp world_size={}",
-                config.num_attention_heads,
-                self.world_size
-            ));
-        }
-        if !config.num_key_value_heads.is_multiple_of(self.world_size) {
-            return Err(anyhow::anyhow!(
-                "num_key_value_heads={} not divisible by tp world_size={}",
-                config.num_key_value_heads,
-                self.world_size
-            ));
-        }
-        if !config.intermediate_size.is_multiple_of(self.world_size) {
-            return Err(anyhow::anyhow!(
-                "intermediate_size={} not divisible by tp world_size={}",
-                config.intermediate_size,
-                self.world_size
-            ));
-        }
-        Ok(())
-    }
-
-    pub(crate) fn shard_range(self, total: usize) -> (usize, usize) {
-        let shard_len = total / self.world_size;
-        (self.rank * shard_len, shard_len)
-    }
-
-    pub(crate) fn is_sharded(self) -> bool {
-        self.world_size > 1
-    }
+    let architectures: Vec<&str> = json
+        .get("architectures")
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    ensure!(
+        architectures.contains(&"Qwen3_5ForConditionalGeneration"),
+        "Qwen3.5 architectures must contain Qwen3_5ForConditionalGeneration"
+    );
+    let text_model_type = json
+        .get("text_config")
+        .and_then(|tc| tc.get("model_type"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    ensure!(
+        text_model_type == "qwen3_5_text",
+        "Qwen3.5 text_config.model_type must be qwen3_5_text, got {text_model_type}"
+    );
+    Ok(())
 }
 
 #[cfg(test)]
+
 mod tp_tests {
     use super::*;
 
@@ -440,7 +154,7 @@ mod tp_tests {
     }
 
     #[test]
-    fn rejects_tensor_parallel_cuda_graph() {
+    fn rejects_tensor_parallel_cuda_graph_phase1() {
         let config = test_config();
         let tp = TensorParallelConfig {
             rank: 0,
@@ -448,11 +162,11 @@ mod tp_tests {
         };
 
         let err = tp.validate_for(&config, true).unwrap_err().to_string();
-        assert!(err.contains("eager-only"));
+        assert!(err.contains("eager-only in Phase 1"));
     }
 
     #[test]
-    fn tp_does_not_require_linear_attention_divisibility() {
+    fn phase1_does_not_require_linear_attention_divisibility() {
         let mut config = test_config();
         config.linear_num_key_heads = 17;
         config.linear_num_value_heads = 31;
@@ -467,114 +181,7 @@ mod tp_tests {
 
 /// Schema kept identical to the pinned vLLM frontend; unread fields exist for
 /// payload type-checking.
-#[allow(dead_code)]
-// The tokenizer_config schema is bool-heavy by design.
-#[allow(clippy::struct_excessive_bools)]
-#[derive(Deserialize)]
-struct AddedTokenConfig {
-    #[serde(default)]
-    id: Option<u32>,
-    content: String,
-    #[serde(default)]
-    single_word: bool,
-    #[serde(default)]
-    lstrip: bool,
-    #[serde(default)]
-    rstrip: bool,
-    #[serde(default)]
-    normalized: bool,
-    #[serde(default)]
-    special: bool,
-}
 
-#[derive(Deserialize)]
-struct TokenizerJsonIds {
-    model: TokenizerModelIds,
-    #[serde(default)]
-    added_tokens: Vec<AddedTokenConfig>,
-}
-
-#[derive(Deserialize)]
-struct TokenizerModelIds {
-    vocab: std::collections::HashMap<String, u32>,
-}
-
-#[derive(Deserialize)]
-struct TokenizerConfigIds {
-    #[serde(default)]
-    added_tokens_decoder: std::collections::HashMap<String, AddedTokenConfig>,
-}
-
-/// Width of the frontend-decodable id space, mirroring the pinned frontend's
-/// merge: `tokenizer.json` vocab and added_tokens (fatal on parse failure -
-/// the frontend cannot serve without it) plus `tokenizer_config.json`
-/// added_tokens_decoder (whole-file typed parse; failure drops all decoder
-/// tokens with a warning, unparsable keys are skipped per entry). The ids
-/// must form a dense prefix - a row-range selection bound cannot mask holes -
-/// so a sparse id space fails the load instead of silently truncating the
-/// output space.
-pub(crate) fn tokenizer_effective_vocab(model_path: &str) -> Result<usize> {
-    let path = format!("{}/tokenizer.json", model_path);
-    let content =
-        fs::read_to_string(&path).map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
-    let tj: TokenizerJsonIds =
-        serde_json::from_str(&content).map_err(|e| anyhow::anyhow!("cannot parse {path}: {e}"))?;
-    anyhow::ensure!(!tj.model.vocab.is_empty(), "{path} model.vocab is empty");
-    let mut ids: HashSet<u32> = tj.model.vocab.into_values().collect();
-    ids.extend(tj.added_tokens.iter().filter_map(|t| t.id));
-
-    let config_path = format!("{}/tokenizer_config.json", model_path);
-    if let Ok(text) = fs::read_to_string(&config_path) {
-        match serde_json::from_str::<TokenizerConfigIds>(&text) {
-            Ok(cfg) => ids.extend(
-                cfg.added_tokens_decoder
-                    .keys()
-                    .filter_map(|k| k.parse::<u32>().ok()),
-            ),
-            Err(e) => warn!(
-                "cannot parse {config_path}: {e}; skipping its added tokens like the frontend does"
-            ),
-        }
-    }
-
-    let width = ids.len();
-    let max_id = *ids.iter().max().expect("vocab checked non-empty") as usize;
-    anyhow::ensure!(
-        max_id + 1 == width,
-        "tokenizer id space is not dense (max id {max_id}, {width} distinct ids); \
-         a row-range selection bound cannot mask holes"
-    );
-    Ok(width)
-}
-
-/// Identity check that `json` is a Qwen3.5 config; size and shape validation belong to the config loader.
-pub(crate) fn probe_config_json(json: &Value) -> Result<()> {
-    let model_type = json.get("model_type").and_then(Value::as_str).unwrap_or("");
-    if model_type != "qwen3_5" {
-        bail!("not a Qwen3.5 config: model_type={model_type}");
-    }
-    let architectures: Vec<&str> = json
-        .get("architectures")
-        .and_then(Value::as_array)
-        .map(|arr| arr.iter().filter_map(Value::as_str).collect())
-        .unwrap_or_default();
-    ensure!(
-        architectures.contains(&"Qwen3_5ForConditionalGeneration"),
-        "Qwen3.5 architectures must contain Qwen3_5ForConditionalGeneration"
-    );
-    let text_model_type = json
-        .get("text_config")
-        .and_then(|tc| tc.get("model_type"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    ensure!(
-        text_model_type == "qwen3_5_text",
-        "Qwen3.5 text_config.model_type must be qwen3_5_text, got {text_model_type}"
-    );
-    Ok(())
-}
-
-#[cfg(test)]
 mod tests {
     use super::Config35;
 
