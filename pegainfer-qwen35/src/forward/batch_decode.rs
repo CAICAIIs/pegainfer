@@ -599,7 +599,11 @@ impl Qwen35Model {
             &bufs.normed,
             &mut bufs.logits,
         )?;
-        debug_assert_eq!(bufs.logits.seq_len, padded_bs);
+        anyhow::ensure!(
+            bufs.logits.seq_len == padded_bs,
+            "decode logits rows {} must equal padded batch {padded_bs}",
+            bufs.logits.seq_len
+        );
 
         Ok(())
     }
@@ -677,7 +681,11 @@ impl Qwen35Model {
             &bufs.normed,
             &mut bufs.logits,
         )?;
-        debug_assert_eq!(bufs.logits.seq_len, bs);
+        anyhow::ensure!(
+            bufs.logits.seq_len == bs,
+            "decode logits rows {} must equal batch {bs}",
+            bufs.logits.seq_len
+        );
         Ok(())
     }
 

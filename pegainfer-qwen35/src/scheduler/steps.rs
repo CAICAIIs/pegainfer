@@ -55,7 +55,11 @@ pub(super) fn launch_overlap_step(
     inflight_prefill: &mut Option<InflightPrefill>,
     rng: &mut StdRng,
 ) -> std::result::Result<(), FatalSchedulerError> {
-    debug_assert!(inflight_prefill.is_none());
+    if inflight_prefill.is_some() {
+        return Err(FatalSchedulerError::new(
+            "cannot launch async prefill while one is already in flight",
+        ));
+    }
     let mut chunk = ScheduledChunk::from(scheduled);
     let decode_seed = rand::RngExt::random(rng);
     let prefill_seed = rand::RngExt::random(rng);

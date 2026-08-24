@@ -160,7 +160,10 @@ impl BatchDecodeBuffers35 {
         padded_bs: usize,
     ) -> Result<()> {
         let real_bs = kv_states.len();
-        debug_assert!(padded_bs >= real_bs);
+        anyhow::ensure!(
+            padded_bs >= real_bs,
+            "padded batch {padded_bs} must be >= real batch {real_bs}"
+        );
 
         let mut all_page_indices = Vec::new();
         let mut indptr = vec![0i32];

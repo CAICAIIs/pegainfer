@@ -50,8 +50,8 @@ impl Qwen35Model {
         for i in 0..n {
             let last_hidden =
                 self.prefill_last_hidden(prompts[i], &mut kv_states[i], recurrent_states[i])?;
-            debug_assert_eq!(
-                last_hidden.len, self.config.hidden_size,
+            anyhow::ensure!(
+                last_hidden.len == self.config.hidden_size,
                 "Qwen3.5 prefill last hidden row must match request {i}"
             );
             last_hiddens.push(last_hidden);

@@ -126,7 +126,11 @@ impl Qwen35Model {
             &normed,
             &mut logits,
         )?;
-        debug_assert_eq!(logits.seq_len, n);
+        anyhow::ensure!(
+            logits.seq_len == n,
+            "LM-head logits rows {} must equal batch {n}",
+            logits.seq_len
+        );
         Ok(logits)
     }
 
@@ -143,7 +147,7 @@ impl Qwen35Model {
         recurrent: &mut RecurrentState,
     ) -> Result<HiddenStates> {
         let seq_len = token_ids.len();
-        debug_assert!(
+        anyhow::ensure!(
             seq_len > 0 && seq_len <= PREFILL_CHUNK_LEN,
             "prefill chunk length {seq_len} out of range 1..={PREFILL_CHUNK_LEN}"
         );

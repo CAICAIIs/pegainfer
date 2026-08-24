@@ -261,9 +261,8 @@ impl SingleGpuBackend {
         logits: &HiddenStates,
         sample_seed: u64,
     ) -> Result<(Vec<u32>, Vec<Option<TokenLogprob>>)> {
-        debug_assert_eq!(
-            logits.seq_len,
-            pending.len(),
+        anyhow::ensure!(
+            logits.seq_len == pending.len(),
             "Qwen3.5 prefill logits rows must preserve pending request order"
         );
         let requested_logprobs: Vec<usize> = pending.iter().map(|r| r.logprobs).collect();
@@ -351,6 +350,12 @@ impl SingleGpuBackend {
                 panic!("single-GPU slot compaction received TP active state")
             }
         };
+        // `src_slot` is the graph slot of the active request at `moved_to` and
+        // `compaction.moved_from` is where the slot state lives; the compaction
+        // planner guarantees they match. This is a dev-time consistency check
+        // (the slot copy below is what actually keeps the layout correct), and
+        // `compact_slot` returns `()` so there is no error channel to surface a
+        // violation through.
         debug_assert_eq!(src_slot, compaction.moved_from);
 
         let ctx = self.model.device_ctx();

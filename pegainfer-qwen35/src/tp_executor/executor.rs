@@ -617,7 +617,7 @@ pub(super) fn dispatch_mutating_commands(
     }
     drop(resp_tx);
     let resolved = start.execute();
-    debug_assert!(resolved, "fresh TP command gate resolved more than once");
+    anyhow::ensure!(resolved, "fresh TP command gate resolved more than once");
     Ok(resp_rx)
 }
 
