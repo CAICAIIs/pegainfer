@@ -24,6 +24,7 @@ use pegainfer_core::weight_loader::load_tensor_2d_row_shard;
 use pegainfer_core::weight_loader::mmap_shards;
 use safetensors::SafeTensors;
 
+use super::Error;
 use super::config::Config35;
 use super::config::LayerType;
 use super::config::TensorParallelConfig;
@@ -93,7 +94,7 @@ impl Qwen35Model {
     pub fn from_safetensors_with_options(
         model_path: &str,
         enable_cuda_graph: bool,
-    ) -> Result<Self> {
+    ) -> Result<Self, Error> {
         Self::from_safetensors_with_runtime(
             model_path,
             ModelRuntimeConfig {
@@ -101,6 +102,7 @@ impl Qwen35Model {
                 ..Default::default()
             },
         )
+        .map_err(Error::from)
     }
 }
 

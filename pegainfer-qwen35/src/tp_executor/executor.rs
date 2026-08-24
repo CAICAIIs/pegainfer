@@ -103,7 +103,7 @@ impl Qwen35TpExecutor {
         enable_cuda_graph: bool,
         device_ordinals: &[usize],
         max_batch: usize,
-    ) -> Result<Self> {
+    ) -> Result<Self, Error> {
         Self::from_runtime_with_limits(
             model_path,
             enable_cuda_graph,
@@ -111,6 +111,7 @@ impl Qwen35TpExecutor {
             max_batch,
             PREFILL_CHUNK_LEN,
         )
+        .map_err(Error::from)
     }
 
     pub(crate) fn from_runtime_with_limits(
@@ -304,7 +305,11 @@ impl Qwen35TpExecutor {
         )
     }
 
-    pub fn execute_prefill(&self, plan: PrefillPlan<'_>) -> Result<PrefillResult> {
+    pub fn execute_prefill(&self, plan: PrefillPlan<'_>) -> Result<PrefillResult, Error> {
+        self.execute_prefill_impl(plan).map_err(Error::from)
+    }
+
+    fn execute_prefill_impl(&self, plan: PrefillPlan<'_>) -> Result<PrefillResult> {
         anyhow::ensure!(
             !plan.requests.is_empty(),
             "Qwen3.5 TP prefill plan requires at least one request"
@@ -354,7 +359,11 @@ impl Qwen35TpExecutor {
         )
     }
 
-    pub fn execute_decode(&self, plan: DecodePlan<'_>) -> Result<DecodeResult> {
+    pub fn execute_decode(&self, plan: DecodePlan<'_>) -> Result<DecodeResult, Error> {
+        self.execute_decode_impl(plan).map_err(Error::from)
+    }
+
+    fn execute_decode_impl(&self, plan: DecodePlan<'_>) -> Result<DecodeResult> {
         anyhow::ensure!(
             !plan.requests.is_empty(),
             "Qwen3.5 TP decode plan requires at least one request"
@@ -433,7 +442,11 @@ impl Qwen35TpExecutor {
         anyhow::anyhow!(reason)
     }
 
-    pub fn drop_request(&self, request_id: RequestId, expectation: DropExpectation) -> Result<()> {
+    pub fn drop_request(
+        &self,
+        request_id: RequestId,
+        expectation: DropExpectation,
+    ) -> Result<(), Error> {
         self.poison.ensure_healthy()?;
         let resp_rx =
             self.dispatch_mutating("drop request", |start, resp| TpWorkerCommand::DropRequest {
@@ -448,6 +461,7 @@ impl Qwen35TpExecutor {
             "drop request",
             &self.poison,
         )
+        .map_err(Error::from)
     }
 
     #[cfg(test)]

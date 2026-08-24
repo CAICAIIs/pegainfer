@@ -64,6 +64,7 @@ use self::plan::slot_for_new_request;
 use self::steps::*;
 use self::telemetry::*;
 use self::tp::*;
+use crate::Error;
 use crate::Qwen35DecodeOverlap;
 use crate::Qwen35SchedulerPolicy;
 use crate::executor::DecodeRequestResult;
@@ -291,7 +292,7 @@ pub fn start_with_capacity(
     seed: u64,
     max_batch: usize,
     max_prefill_tokens: usize,
-) -> Result<SchedulerHandle> {
+) -> Result<SchedulerHandle, Error> {
     start_with_capacity_and_policy(
         model,
         seed,
@@ -300,6 +301,7 @@ pub fn start_with_capacity(
         Qwen35SchedulerPolicy::Off,
         Qwen35DecodeOverlap::Off,
     )
+    .map_err(Error::from)
 }
 
 pub(crate) fn start_with_capacity_and_policy(

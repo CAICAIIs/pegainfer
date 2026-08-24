@@ -1,4 +1,3 @@
-
 use anyhow::Result;
 use anyhow::bail;
 use anyhow::ensure;
@@ -177,6 +176,7 @@ mod tp_tests {
 
 /// Schema kept identical to the pinned vLLM frontend; unread fields exist for
 /// payload type-checking.
+#[cfg(test)]
 mod tests {
     use super::Config35;
 

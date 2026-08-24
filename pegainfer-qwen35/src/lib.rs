@@ -9,6 +9,7 @@
 
 pub(crate) mod config;
 mod decode_buffers;
+mod error;
 mod executor;
 mod ffi;
 mod forward;
@@ -29,6 +30,7 @@ use std::path::Path;
 use anyhow::Result;
 use anyhow::anyhow;
 pub(crate) use config::probe_config_json;
+pub use error::Error;
 use pegainfer_frontend::engine::EngineHandle;
 use pegainfer_frontend::engine::EngineLoadOptions;
 use pegainfer_frontend::engine::EpBackend;
@@ -100,7 +102,7 @@ pub fn start_engine(
     options: EngineLoadOptions,
     max_batch: usize,
     max_prefill_tokens: usize,
-) -> Result<EngineHandle> {
+) -> Result<EngineHandle, Error> {
     start_engine_with_capacity_and_policy(
         model_path,
         options,
@@ -139,7 +141,7 @@ pub fn launch_with_options_policy_and_overlap(
     options: Qwen35LaunchOptions,
     scheduler_policy: Qwen35SchedulerPolicy,
     decode_overlap: Qwen35DecodeOverlap,
-) -> Result<EngineHandle> {
+) -> Result<EngineHandle, Error> {
     let device_ordinals = options.device_ordinals()?;
     start_engine_with_capacity_policy_and_overlap(
         model_path,
@@ -162,7 +164,7 @@ pub fn start_engine_with_capacity(
     options: EngineLoadOptions,
     max_batch: usize,
     max_prefill_tokens: usize,
-) -> Result<EngineHandle> {
+) -> Result<EngineHandle, Error> {
     start_engine_with_capacity_and_policy(
         model_path,
         options,
@@ -178,7 +180,7 @@ pub(crate) fn start_engine_with_capacity_and_policy(
     max_batch: usize,
     max_prefill_tokens: usize,
     scheduler_policy: Qwen35SchedulerPolicy,
-) -> Result<EngineHandle> {
+) -> Result<EngineHandle, Error> {
     start_engine_with_capacity_policy_and_overlap(
         model_path,
         options,
@@ -190,6 +192,27 @@ pub(crate) fn start_engine_with_capacity_and_policy(
 }
 
 pub fn start_engine_with_capacity_policy_and_overlap(
+    model_path: &Path,
+    options: EngineLoadOptions,
+    max_batch: usize,
+    max_prefill_tokens: usize,
+    scheduler_policy: Qwen35SchedulerPolicy,
+    decode_overlap: Qwen35DecodeOverlap,
+) -> Result<EngineHandle, Error> {
+    start_engine_with_capacity_policy_and_overlap_impl(
+        model_path,
+        options,
+        max_batch,
+        max_prefill_tokens,
+        scheduler_policy,
+        decode_overlap,
+    )
+    .map_err(Error::from)
+}
+
+/// Internal `anyhow`-carrying engine startup; folds [`anyhow::Error`] into
+/// [`Error`] at the public boundary.
+fn start_engine_with_capacity_policy_and_overlap_impl(
     model_path: &Path,
     options: EngineLoadOptions,
     max_batch: usize,

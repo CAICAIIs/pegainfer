@@ -20,6 +20,7 @@ use anyhow::Result;
 use pegainfer_core::kv_pool::KvState;
 use pegainfer_frontend::sampler::SamplingParams;
 
+use crate::Error;
 use crate::config::TensorParallelConfig;
 use crate::decode_buffers::BatchDecodeBuffers35;
 use crate::executor::DecodePlan;

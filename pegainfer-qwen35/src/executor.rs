@@ -12,6 +12,7 @@ use pegainfer_core::tensor::HiddenStates;
 use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_frontend::sampler::SamplingParams;
 
+use crate::Error;
 use crate::decode_buffers::BatchDecodeBuffers35;
 use crate::forward::batch_decode_graph::BatchDecodeGraphState;
 use crate::logprobs::snapshot_requested_logprobs;
@@ -112,7 +113,11 @@ pub struct Qwen35Executor {
 }
 
 impl Qwen35Executor {
-    pub fn from_runtime(model_path: &str, device_ordinal: usize, max_batch: usize) -> Result<Self> {
+    pub fn from_runtime(
+        model_path: &str,
+        device_ordinal: usize,
+        max_batch: usize,
+    ) -> Result<Self, Error> {
         let model = Qwen35Model::from_safetensors(model_path, device_ordinal, max_batch)?;
         model.tune_decode_gemm_algos()?;
         let graph_state = model.create_batch_decode_graph_state()?;
@@ -123,7 +128,11 @@ impl Qwen35Executor {
         })
     }
 
-    pub fn execute_prefill(&mut self, plan: PrefillPlan<'_>) -> Result<PrefillResult> {
+    pub fn execute_prefill(&mut self, plan: PrefillPlan<'_>) -> Result<PrefillResult, Error> {
+        self.execute_prefill_impl(plan).map_err(Error::from)
+    }
+
+    fn execute_prefill_impl(&mut self, plan: PrefillPlan<'_>) -> Result<PrefillResult> {
         anyhow::ensure!(
             !plan.requests.is_empty(),
             "Qwen3.5 prefill plan requires at least one request"
@@ -207,7 +216,11 @@ impl Qwen35Executor {
         Ok(PrefillResult { requests: results })
     }
 
-    pub fn execute_decode(&mut self, plan: DecodePlan<'_>) -> Result<DecodeResult> {
+    pub fn execute_decode(&mut self, plan: DecodePlan<'_>) -> Result<DecodeResult, Error> {
+        self.execute_decode_impl(plan).map_err(Error::from)
+    }
+
+    fn execute_decode_impl(&mut self, plan: DecodePlan<'_>) -> Result<DecodeResult> {
         anyhow::ensure!(
             !plan.requests.is_empty(),
             "Qwen3.5 decode plan requires at least one request"
@@ -258,7 +271,7 @@ impl Qwen35Executor {
         Ok(DecodeResult { requests: results })
     }
 
-    pub fn drop_request(&mut self, request_id: RequestId) -> Result<()> {
+    pub fn drop_request(&mut self, request_id: RequestId) -> Result<(), Error> {
         let Some(idx) = self
             .active
             .iter()
@@ -266,7 +279,7 @@ impl Qwen35Executor {
         else {
             return Ok(());
         };
-        self.compact_slot(idx)
+        self.compact_slot(idx).map_err(Error::from)
     }
 
     fn compact_slot(&mut self, idx: usize) -> Result<()> {

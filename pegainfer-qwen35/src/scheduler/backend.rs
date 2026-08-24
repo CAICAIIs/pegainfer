@@ -502,7 +502,9 @@ impl TpSchedulerBackend {
         request_id: RequestId,
         expectation: DropExpectation,
     ) -> Result<()> {
-        self.executor.drop_request(request_id, expectation)
+        self.executor
+            .drop_request(request_id, expectation)
+            .map_err(anyhow::Error::from)
     }
 }
 

@@ -163,6 +163,7 @@ impl ModelLine for Qwen35Line {
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?,
         )
         .map(LaunchedEngine::Handle)
+        .map_err(anyhow::Error::from)
     }
 }
 
