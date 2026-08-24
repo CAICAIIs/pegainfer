@@ -887,25 +887,6 @@ fn scheduler_loop(
     }
 }
 
-// ── Batch prefill ───────────────────────────────────────────────────────
-
-// ── Unified step (prefill chunk + decode in one forward pass) ──────────────
-
-// ── Decode step (pure decode, CUDA Graph enabled) ──────────────────────
-
-/// Process decode logits from unified step: sample, extract logprobs, dispatch.
-
-/// Dispatch sampled decode tokens: send events, check EOS/limits, retire finished.
-///
-/// `tokens` and `logprobs` are indexed by original position in `active`.
-/// Retirements collected first, then compacted in reverse order.
-
-/// Remove single-GPU request at `idx` via swap_remove and compact graph slots.
-///
-/// After swap_remove, the element that was at `active.len()-1` (before remove)
-/// now sits at `idx`. Its graph slot must be copied into the vacated slot so
-/// that slots 0..active.len() remain dense.
-
 // ── Chunked-prefill helpers ────────────────────────────────────────────────
 
 /// Step's scheduled prefill set
