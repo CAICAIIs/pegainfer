@@ -128,7 +128,7 @@ impl Qwen35TpExecutor {
         );
         anyhow::ensure!(
             !enable_cuda_graph,
-            "Qwen3.5 TP Phase 1 supports eager execution only; disable CUDA Graph"
+            "Qwen3.5 TP supports eager execution only; disable CUDA Graph"
         );
         anyhow::ensure!(
             max_prefill_tokens > 0,

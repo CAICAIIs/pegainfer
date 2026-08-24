@@ -116,7 +116,7 @@ pub struct Qwen35LaunchOptions {
     device_ordinal: usize,
     /// Tensor-parallel world size; `> 1` uses devices `0..tp_size`.
     tp_size: usize,
-    /// TP Phase 1 supports eager-only multi-GPU execution.
+    /// TP supports eager-only multi-GPU execution. (CUDA Graph is not supported on the TP path.)
     cuda_graph: bool,
     max_batch: usize,
     max_prefill_tokens: usize,
@@ -230,7 +230,7 @@ pub fn start_engine_with_capacity_policy_and_overlap(
         }
         if enable_cuda_graph {
             return Err(anyhow!(
-                "Qwen3.5 TP Phase 1 supports eager execution only; disable CUDA Graph"
+                "Qwen3.5 TP supports eager execution only; disable CUDA Graph"
             ));
         }
         let model_path = model_path

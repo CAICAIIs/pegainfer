@@ -1,7 +1,7 @@
 //! Tensor-parallel worker runtime for Qwen3.5.
 //!
-//! Phase 2A adds one canonical eager unified command while retaining the
-//! replicated linear-attention state layout from Phase 1.
+//! Adds one canonical eager unified command while retaining the replicated
+//! linear-attention state layout across TP ranks.
 
 use std::collections::HashSet;
 use std::panic::AssertUnwindSafe;
