@@ -118,7 +118,7 @@ capped how many gaps could be stalled (~0.7%, under the p99 knee).
 
 **Corrected post-chunking evidence** (RTX 4090, `--max-batch 8 --bg-concurrency 4`,
 cold only, with starvation negative control) lives in
-[`docs/models/qwen35/mixed-load-itl-470.md`](../models/qwen35/mixed-load-itl-470.md):
+[`docs/models/qwen35/mixed-load-itl.md`](../models/qwen35/mixed-load-itl.md):
 with a free slot, Qwen3.5 shows the same severity/frequency structure as Qwen3;
 chunking bounds per-step max but can raise headline p99 at low QPS. The tables
 below are retained as the historical 5070 Ti artifact sweep — do **not** cite them

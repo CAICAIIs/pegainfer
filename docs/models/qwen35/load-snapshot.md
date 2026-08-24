@@ -57,7 +57,7 @@ The live gate uses `scripts/bench_http_serving.py` to create overlapping HTTP tr
 - Derived KV capacity and availability through `SchedulerBackend`, so the same publication logic serves single-GPU and TP.
 - Validated the single-GPU path with the existing scheduler E2E and live HTTP pressure: running and KV usage rose during generation, waiting reached three at `--max-batch 1`, and every gauge returned to zero after drain and recovery.
 - Updated the shared Prometheus documentation for Qwen3.5's one-logical-engine contract.
-- P2A step 2 moved publication after drain and cancellation pruning. Focused CPU tests cover closed pending and resident work, and a real TP1 `max_batch=1` gate proves a cancelled resident disappears from the post-prune load, frees capacity for same-tick admission, and leaves running, waiting, and KV usage at zero after recovery.
+- The cancellation-pruning scheduler change (part of the TP unified-step work in `tp.md`) moved publication after drain and cancellation pruning. Focused CPU tests cover closed pending and resident work, and a real TP1 `max_batch=1` gate proves a cancelled resident disappears from the post-prune load, frees capacity for same-tick admission, and leaves running, waiting, and KV usage at zero after recovery.
 
 ## Validation Boundary
 

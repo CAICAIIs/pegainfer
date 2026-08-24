@@ -15,7 +15,7 @@
 - **Read**:
   - `docs/index.md` - routes Qwen3.5 scheduler, accuracy, mixed-load, and profiling evidence.
   - `docs/models/qwen35/adaptive-scheduler-policy.md` - `off` stays the default; `auto` is a separate opt-in policy and cannot be combined with overlap yet.
-  - `docs/models/qwen35/mixed-load-itl-470.md` - valid mixed load needs spare admission capacity and an observed prefill/decode intersection.
+  - `docs/models/qwen35/mixed-load-itl.md` - valid mixed load needs spare admission capacity and an observed prefill/decode intersection.
   - `docs/models/qwen35/accuracy.md` - `hf_golden_gate` is the numerical oracle; generated-text hashes are sanity evidence.
   - `docs/playbooks/bench-vs-vllm.md` and `docs/playbooks/profiling-guide.md` - bind A/B numbers and profiler claims to a fixed environment and raw artifacts.
 - **Relevant history**:
