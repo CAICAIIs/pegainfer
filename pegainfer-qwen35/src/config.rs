@@ -39,7 +39,6 @@ pub(crate) fn probe_config_json(json: &Value) -> Result<()> {
 }
 
 #[cfg(test)]
-
 mod tp_tests {
     use super::*;
 

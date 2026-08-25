@@ -967,15 +967,5 @@ impl From<Vec<PrefillingRequest35>> for ScheduledChunk {
     }
 }
 
-/// Pull this step's prefill set off the FRONT of `prefilling`, capping the
-/// step's total forwarded prompt tokens at `prefill_budget`.
-
-/// Report a forward/sampling failure to every request in the failed chunk.
-
-/// For each request in the just-prefilled chunk: if its prompt is now exhausted,
-/// sample its first token, emit events, and move it into the decode batch;
-/// otherwise re-queue it (with an advanced cursor) at the FRONT of `prefilling`.
-/// `artifacts` are indexed by request order in `chunk`.
-
 #[cfg(test)]
 mod tests;
