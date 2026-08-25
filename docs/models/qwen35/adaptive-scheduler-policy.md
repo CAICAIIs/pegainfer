@@ -44,7 +44,7 @@
 
 - Threaded the policy through Qwen3.5 launch, `pegainfer` server CLI, and `bench_serving`:
   - `--qwen35-scheduler-policy auto|off` defaults to `off`.
-  - Tensor-parallel Qwen3.5 rejects `auto` because TP Phase 1 does not run unified prefill+decode.
+  - Tensor-parallel Qwen3.5 rejects `auto` because the adaptive decode-priority policy is single-GPU only; TP uses the fixed `off` scheduler policy.
   - Qwen3.5 `--max-batch` now accepts `1..=MAX_DECODE_BATCH`; non-bucket requests such as `5` allocate the next graph bucket internally but admit only the requested slots.
 - Added mixed-load report visibility for `max_batch` / `max_prefill_tokens` and warnings when `bg_concurrency >= max_batch`; `max_batch=4,bg=4` remains a starvation negative control, while retained mixed evidence used `max_batch=5,bg=4`.
 

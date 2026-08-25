@@ -2,22 +2,22 @@
 
 > **TL;DR:** Qwen3.5-4B has the main correctness, admission, chunked-prefill,
 > sampling, and step-tail gates needed for the dense single-GPU roadmap. The
-> retained RTX 5090 #469 serving sweep is now the current HTTP performance
-> boundary: zero failed benchmark requests, but vLLM is faster across the
-> retained envelope. Next work should attribute the HTTP/frontend/scheduler gap
-> before changing kernels, then keep mixed-load and HTTP lifecycle evidence
-> separate.
+> retained RTX 5090 serving-vs-vLLM sweep (#469) is now the current HTTP
+> performance boundary: zero failed benchmark requests, but vLLM is faster
+> across the retained envelope. Next work should attribute the
+> HTTP/frontend/scheduler gap before changing kernels, then keep mixed-load and
+> HTTP lifecycle evidence separate. Milestone: Stable dense single-GPU serving.
 >
-> **Last touched:** 2026-07
+> **Last touched:** 2026-08
 
 Tracking issue: `[Model] Qwen3.5 dense roadmap v2: Stable single-GPU serving`
-(#654). It supersedes #249. Sibling maturity bar:
+(#654). It supersedes the earlier parent roadmap (#249). Sibling maturity bar:
 `docs/models/qwen3/roadmap.md` and `docs/models/qwen3/serving-perf-5090.md`.
 
 ## Maturity Target
 
-The product boundary here is dense BF16 Qwen3.5 4B/9B/27B on one GPU. 4B is
-the serving-performance anchor. Larger sizes inherit correctness gates, not 4B
+The product boundary here is dense BF16 Qwen3.5 4B/9B/27B on one GPU. 4B is the
+serving-performance anchor. Larger sizes inherit correctness gates, not 4B
 performance or production-readiness claims.
 
 Qwen3.5 needs a Qwen3-like serving story with hybrid-state constraints called
@@ -36,18 +36,18 @@ out:
 
 | Area | State | Evidence |
 | --- | --- | --- |
-| Accuracy | Done: 4B/9B/27B short and long HF bf16 logits gates | `docs/models/qwen35/accuracy.md`, #186, #250, #654 |
-| Admission / long context | Done: full-lifetime KV accounting and explicit context/KV rejection | `docs/models/qwen35/kv-admission.md`, #254, #290, #654 |
-| Prefill | Done: direct paged writes, bounded scheduler chunking, and resumed `base_pos > 0` coverage | #252, #305, #313, #314, #333, #375, #654 |
-| Sampling / step tail | Done: mixed batched sampling and batched final norm/lm_head/token selection | #284, #353, #654 |
-| Serving-vs-vLLM evidence | Retained #469 RTX 5090 sweep exists. PegaInfer completed every cell with zero failures, but vLLM 0.25.1 is faster across the retained HTTP envelope. | `docs/benchmarks/qwen35-4b-serving-vllm-rtx5090-2026-07.md`, #469 |
+| Accuracy | Done: 4B/9B/27B short and long HF bf16 logits gates | `docs/models/qwen35/accuracy.md`; supporting issues #186 (PegaInfer-owned rand/hash corpus, deferred), #250 (GSM8K 8-shot recovery), #654 (this roadmap) |
+| Admission / long context | Done: full-lifetime KV accounting and explicit context/KV rejection | `docs/models/qwen35/kv-admission.md`; supporting issues #254 (full-lifetime admission), #290 (context rejection) |
+| Prefill | Done: direct paged writes, bounded scheduler chunking, and resumed `base_pos > 0` coverage | Supporting issues #252, #305, #313, #314, #333, #375 (prefill chunking / page writes); #654 |
+| Sampling / step tail | Done: mixed batched sampling and batched final norm/lm_head/token selection | Supporting issues #284 (mixed greedy/non-greedy batched sampling), #353 (batched step tail), #654 |
+| Serving-vs-vLLM evidence | Retained RTX 5090 sweep exists (#469). PegaInfer completed every cell with zero failures, but vLLM 0.25.1 is faster across the retained HTTP envelope. | `docs/benchmarks/qwen35-4b-serving-vllm-rtx5090-2026-07.md`, #469 |
 | Serving overhead | Open: direct c16 TPOT is close to vLLM HTTP c16, while PegaInfer HTTP c16 is slower. Start with HTTP/frontend/scheduler/event attribution. | #469, #654 |
-| Mixed-load evidence | Open: prove injected prefill overlaps active decode and keep starvation setups as negative controls | #470 |
-| HTTP lifecycle | Open: retain cancel, disconnect, overload, rejection, recovery, health, and memory-return evidence | #471 |
+| Mixed-load evidence | Open: prove injected prefill overlaps active decode and keep starvation setups as negative controls | #470 (mixed-load ITL gate) |
+| HTTP lifecycle | Open: retain cancel, disconnect, overload, rejection, recovery, health, and memory-return evidence | #471 (HTTP lifecycle gate) |
 | Fault isolation | Open risk: batch-level execution errors can still fail multiple active requests | #654 |
-| Prefix reuse | Open: bounded joint KV/recurrent/conv snapshot design and implementation | #257 |
-| DFlash | In flight and opt-in: correctness-first work must stay default-off until gates pass | #434, PR #626, #654 |
-| Tensor parallel | Phase 1 complete: eager dense TP2 worker/scheduler execution; Phase 2 still needs mixed-step execution and sharded linear-attention/GDR state. | `docs/models/qwen35/tp-implementation.md`, #446 |
+| Prefix reuse | Open: bounded joint KV/recurrent/conv snapshot design and implementation | #257 (joint-state prefix reuse) |
+| DFlash | In flight and opt-in: correctness-first work must stay default-off until gates pass | `#434` (DFlash support), PR `#626` (DFlash PR), `#654` |
+| Tensor parallel | Landed: eager dense TP2 plus unified prefill/decode on the replicated-GDR path — TP2 short/long HF gates, scheduler e2e, and a multi-turn serving gate pass, and CUDA Graph under TP fails closed. Still open: shard the linear-attention/GDR state surface, then a matched dense-TP TP2 vs sharded-GDR TP2 A/B before any speedup claim. | `docs/models/qwen35/tp.md`, #446 |
 
 ## Active Contract
 
