@@ -839,7 +839,9 @@ mod tests {
     use super::*;
 
     fn test_config() -> Config35 {
-        let raw: super::config::RawConfig = serde_json::from_str(
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
             r#"{
   "max_position_embeddings": 262144,
   "tie_word_embeddings": true,
@@ -863,8 +865,8 @@ mod tests {
   }
 }"#,
         )
-        .expect("fixture parses");
-        Config35::try_from(raw).expect("fixture validates")
+        .unwrap();
+        Config35::from_file(dir.path().to_str().unwrap()).expect("fixture validates")
     }
 
     fn test_geometry(rank: usize, world_size: usize) -> LocalGeometry {
