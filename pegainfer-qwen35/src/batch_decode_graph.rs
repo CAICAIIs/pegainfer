@@ -6,7 +6,7 @@ use pegainfer_core::kv_pool::KvPool;
 use pegainfer_core::tensor::DeviceContext;
 
 use super::config::Config35;
-use super::config::TensorParallelConfig;
+use super::config::LocalGeometry;
 use super::decode_buffers::BatchDecodeBuffers35;
 use super::recurrent_state::LinearStatePointerTables;
 use super::recurrent_state::RecurrentState;
@@ -61,7 +61,7 @@ impl BatchDecodeGraphState {
     pub(crate) fn with_capacity(
         ctx: &DeviceContext,
         config: &Config35,
-        tensor_parallel: TensorParallelConfig,
+        geometry: LocalGeometry,
         kv_pool: &KvPool,
         max_batch: usize,
     ) -> Result<Self> {
@@ -71,7 +71,7 @@ impl BatchDecodeGraphState {
         let buffers = BatchDecodeBuffers35::new(
             ctx,
             config,
-            tensor_parallel,
+            geometry,
             max_batch,
             max_total_pages,
             padding_page_id,

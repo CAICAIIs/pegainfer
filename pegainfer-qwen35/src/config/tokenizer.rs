@@ -1,3 +1,10 @@
+//! Frontend tokenizer schema and decodable-vocab width for Qwen3.5.
+//!
+//! The pinned frontend serves from the join of `tokenizer.json` (vocab +
+//! `added_tokens`) and `tokenizer_config.json` (`added_tokens_decoder`). We
+//! mirror that merge to compute the widest decodable token id, then bound the
+//! output selection to a dense prefix of that id space.
+
 use std::collections::HashSet;
 use std::fs;
 
@@ -5,11 +12,19 @@ use anyhow::Result;
 use log::warn;
 use serde::Deserialize;
 
-#[allow(dead_code)]
-// The tokenizer_config schema is bool-heavy by design.
+/// One `added_tokens_decoder` entry in `tokenizer_config.json`.
+///
+/// A frontend compatibility contract, owned explicitly rather than hidden behind
+/// `allow(dead_code)`: the frontend's decoder schema is bool-heavy, and we parse
+/// it with typed fields so that a malformed entry (e.g. `"special": "not-a-bool"`)
+/// makes the whole-file typed parse fail, which drops all decoder tokens exactly
+/// like the frontend does. Only `id` and `content` are consumed by
+/// [`tokenizer_effective_vocab`]; the remaining `#[serde(default)]` bool fields
+/// exist to make the type-check fail-closed on an unparseable entry.
+// The bool-heavy shape is the point of the compatibility contract.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Deserialize)]
-struct AddedTokenConfig {
+struct FrontendAddedToken {
     #[serde(default)]
     id: Option<u32>,
     content: String,
@@ -29,7 +44,7 @@ struct AddedTokenConfig {
 struct TokenizerJsonIds {
     model: TokenizerModelIds,
     #[serde(default)]
-    added_tokens: Vec<AddedTokenConfig>,
+    added_tokens: Vec<FrontendAddedToken>,
 }
 
 #[derive(Deserialize)]
@@ -40,7 +55,7 @@ struct TokenizerModelIds {
 #[derive(Deserialize)]
 struct TokenizerConfigIds {
     #[serde(default)]
-    added_tokens_decoder: std::collections::HashMap<String, AddedTokenConfig>,
+    added_tokens_decoder: std::collections::HashMap<String, FrontendAddedToken>,
 }
 
 /// Width of the frontend-decodable id space, mirroring the pinned frontend's
