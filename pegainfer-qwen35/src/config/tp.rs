@@ -144,10 +144,6 @@ impl LocalGeometry {
         })
     }
 
-    pub(crate) fn tp(&self) -> TensorParallelConfig {
-        self.tp
-    }
-
     pub(crate) fn rank(&self) -> usize {
         self.tp.rank()
     }

@@ -14,15 +14,15 @@ use serde::Deserialize;
 
 /// One `added_tokens_decoder` entry in `tokenizer_config.json`.
 ///
-/// A frontend compatibility contract, owned explicitly rather than hidden behind
-/// `allow(dead_code)`: the frontend's decoder schema is bool-heavy, and we parse
-/// it with typed fields so that a malformed entry (e.g. `"special": "not-a-bool"`)
-/// makes the whole-file typed parse fail, which drops all decoder tokens exactly
-/// like the frontend does. Only `id` and `content` are consumed by
-/// [`tokenizer_effective_vocab`]; the remaining `#[serde(default)]` bool fields
-/// exist to make the type-check fail-closed on an unparseable entry.
-// The bool-heavy shape is the point of the compatibility contract.
+/// An explicitly-owned frontend compatibility contract. The frontend's decoder
+/// schema is bool-heavy, and we parse it with these typed fields purely to make
+/// the whole-file typed parse fail-closed on a malformed entry (e.g. a `special`
+/// that is not a bool): then every decoder token is dropped, mirroring the
+/// frontend. None of the fields are read by [`tokenizer_effective_vocab`] —
+/// the contract's entire job is the fail-closed type-check, so this schema is
+/// intentionally dead in the code path and its fields exist to shape the parse.
 #[allow(clippy::struct_excessive_bools)]
+#[allow(dead_code)]
 #[derive(Deserialize)]
 struct FrontendAddedToken {
     #[serde(default)]
