@@ -848,7 +848,7 @@ mod tests {
   "text_config": {
     "hidden_size": 2560,
     "intermediate_size": 9216,
-    "num_hidden_layers": 32,
+    "num_hidden_layers": 1,
     "num_attention_heads": 16,
     "num_key_value_heads": 4,
     "head_dim": 256,
