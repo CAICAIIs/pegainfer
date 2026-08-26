@@ -839,7 +839,7 @@ mod tests {
     use super::*;
 
     fn test_config() -> Config35 {
-        let raw: super::config::model::RawConfig = serde_json::from_str(
+        let raw: super::config::RawConfig = serde_json::from_str(
             r#"{
   "max_position_embeddings": 262144,
   "tie_word_embeddings": true,
