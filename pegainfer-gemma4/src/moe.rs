@@ -1,0 +1,318 @@
+//! The routed-expert half of a Gemma 4 MoE layer.
+//!
+//! The experts stay packed as NVFP4 on the card and the GEMM reads them that
+//! way: widening a layer's experts into bf16 would cost four times the
+//! checkpoint in traffic every step, which is what the Marlin kernel exists to
+//! avoid. What the loader rewrites once — the weight order, the block-scale
+//! encoding — is described in `weights::StackedProjection`.
+//!
+//! Routing is planned on the device. Grouping the picks into the kernel's
+//! fixed-width blocks is a scan the host could do, but it would have to read
+//! the picks back first, and a stream synchronize per layer costs more than
+//! the scan is worth.
+
+use anyhow::Result;
+use anyhow::ensure;
+use cudarc::driver::CudaSlice;
+use pegainfer_core::ops;
+use pegainfer_core::tensor::DeviceContext;
+use pegainfer_core::tensor::HiddenStates;
+use pegainfer_kernels::ops::MarlinDispatch;
+use pegainfer_kernels::ops::MoeAlignScratch;
+use pegainfer_kernels::ops::gemma4_marlin_nvfp4_moe;
+use pegainfer_kernels::ops::gemma4_moe_router_topk_into;
+use pegainfer_kernels::ops::gemma4_moe_sum_topk_into;
+use pegainfer_kernels::ops::marlin_moe_align_block_size;
+
+use crate::layer::LayerGeometry;
+use crate::weights::Gemma4Moe;
+
+/// The kernel's row block. Every expert's picks are padded up to it, so a
+/// narrower block wastes less on a thin step and a wider one launches fewer
+/// blocks; sixteen is the narrowest the kernel compiles a full table for.
+const BLOCK: usize = 16;
+
+/// Marlin's lock array is one int per 64-wide output tile per row block.
+const TILE_N: usize = 64;
+
+/// Buffers one [`moe_into`] call needs, sized for the widest step the server
+/// admits.
+pub(crate) struct MoeScratch {
+    max_rows: usize,
+    router_in: HiddenStates,
+    logits: HiddenStates,
+    index: CudaSlice<i32>,
+    weight: CudaSlice<f32>,
+    sorted_token_ids: CudaSlice<i32>,
+    expert_ids: CudaSlice<i32>,
+    padded_total: CudaSlice<i32>,
+    locks: CudaSlice<i32>,
+    c_tmp: CudaSlice<f32>,
+    moe_in: HiddenStates,
+    routed_gate: HiddenStates,
+    routed_up: HiddenStates,
+    routed_act: HiddenStates,
+    routed_down: HiddenStates,
+    expert_out: HiddenStates,
+    dense_normed: HiddenStates,
+    expert_normed: HiddenStates,
+    expert_offsets: CudaSlice<u32>,
+    expert_cursor: CudaSlice<u32>,
+}
+
+impl MoeScratch {
+    pub(crate) fn new(ctx: &DeviceContext, geom: &LayerGeometry, max_rows: usize) -> Result<Self> {
+        let moe = geom
+            .moe
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Gemma 4: no MoE scratch without a routed config"))?;
+        let hidden = |rows| HiddenStates::zeros(ctx, geom.hidden_size, rows);
+        let narrow = |rows| HiddenStates::zeros(ctx, moe.intermediate_size, rows);
+        let slots = max_rows * moe.top_k;
+        // Every expert can leave one block part filled, so the padded total
+        // runs past the slot count by that much in the worst case.
+        let max_blocks = slots.div_ceil(BLOCK) + moe.num_experts;
+        let max_padded = max_blocks * BLOCK;
+        Ok(Self {
+            max_rows,
+            router_in: hidden(max_rows)?,
+            logits: HiddenStates::zeros(ctx, moe.num_experts, max_rows)?,
+            index: ctx.stream.alloc_zeros::<i32>(slots)?,
+            weight: ctx.stream.alloc_zeros::<f32>(slots)?,
+            sorted_token_ids: ctx.stream.alloc_zeros::<i32>(max_padded)?,
+            expert_ids: ctx.stream.alloc_zeros::<i32>(max_blocks)?,
+            padded_total: ctx.stream.alloc_zeros::<i32>(1)?,
+            locks: ctx
+                .stream
+                .alloc_zeros::<i32>(geom.hidden_size / TILE_N * max_blocks)?,
+            c_tmp: ctx
+                .stream
+                .alloc_zeros::<f32>(geom.hidden_size * max_padded)?,
+            moe_in: hidden(max_rows)?,
+            routed_gate: narrow(slots)?,
+            routed_up: narrow(slots)?,
+            routed_act: narrow(slots)?,
+            routed_down: hidden(slots)?,
+            expert_out: hidden(max_rows)?,
+            dense_normed: hidden(max_rows)?,
+            expert_normed: hidden(max_rows)?,
+            expert_offsets: ctx.stream.alloc_zeros::<u32>(moe.num_experts + 1)?,
+            expert_cursor: ctx.stream.alloc_zeros::<u32>(moe.num_experts)?,
+        })
+    }
+
+    fn set_rows(&mut self, rows: usize, top_k: usize) -> Result<()> {
+        ensure!(
+            rows <= self.max_rows,
+            "MoE scratch holds {} rows, not {rows}",
+            self.max_rows
+        );
+        for buf in [
+            &mut self.router_in,
+            &mut self.logits,
+            &mut self.moe_in,
+            &mut self.expert_out,
+            &mut self.dense_normed,
+            &mut self.expert_normed,
+        ] {
+            buf.seq_len = rows;
+        }
+        for buf in [
+            &mut self.routed_gate,
+            &mut self.routed_up,
+            &mut self.routed_act,
+            &mut self.routed_down,
+        ] {
+            buf.seq_len = rows * top_k;
+        }
+        Ok(())
+    }
+}
+
+/// The routed branch of the feed forward block: `out` receives the sum of the
+/// dense output and the expert output, each through its own norm, which the
+/// caller still has to put through the shared post-feedforward norm.
+///
+/// `residual` is the block input — both the router and the experts read it,
+/// not the dense branch's output.
+pub(crate) fn moe_into(
+    ctx: &DeviceContext,
+    moe: &Gemma4Moe,
+    geom: &LayerGeometry,
+    residual: &HiddenStates,
+    dense: &HiddenStates,
+    scratch: &mut MoeScratch,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    let config = geom
+        .moe
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Gemma 4: a routed layer needs a routed config"))?;
+    let rows = residual.seq_len;
+    scratch.set_rows(rows, config.top_k)?;
+    // The GEMM reads the projection's extent from the weights that were
+    // loaded, not from the config that described them, so a checkpoint whose
+    // experts disagree with its own config stops here rather than reading
+    // past a buffer.
+    let width = moe.gate.rows;
+    let depth = moe.gate.values;
+    ensure!(
+        width == config.intermediate_size
+            && depth == geom.hidden_size
+            && moe.up.rows == width
+            && moe.up.values == depth
+            && moe.down.rows == depth
+            && moe.down.values == width,
+        "Gemma 4: the routed experts are {width} x {depth}, but the config says {} x {}",
+        config.intermediate_size,
+        geom.hidden_size
+    );
+
+    // The router's own norm carries no scale of its own, so the parameter
+    // multiply and the `hidden ** -0.5` that follow it are separate steps.
+    ops::rms_norm_batch_into(
+        ctx,
+        residual,
+        &moe.router_scale,
+        geom.rms_norm_eps,
+        &mut scratch.router_in,
+    );
+    ops::scale_bf16_in_place(
+        ctx,
+        &mut scratch.router_in,
+        (geom.hidden_size as f32).powf(-0.5),
+    )?;
+    ops::gemm_rows_into_checked(
+        ctx,
+        &moe.router_proj,
+        0,
+        config.num_experts,
+        &scratch.router_in,
+        &mut scratch.logits,
+    )?;
+    gemma4_moe_router_topk_into(
+        ctx,
+        &scratch.logits,
+        &moe.router_per_expert_scale,
+        config.top_k,
+        &mut scratch.index,
+        &mut scratch.weight,
+    )?;
+
+    let slots = rows * config.top_k;
+    marlin_moe_align_block_size(
+        ctx,
+        &scratch.index,
+        rows,
+        config.top_k,
+        config.num_experts,
+        BLOCK,
+        &mut MoeAlignScratch {
+            sorted_token_ids: &mut scratch.sorted_token_ids,
+            expert_ids: &mut scratch.expert_ids,
+            num_tokens_post_padded: &mut scratch.padded_total,
+            expert_offsets: &mut scratch.expert_offsets,
+            expert_cursor: &mut scratch.expert_cursor,
+        },
+    )?;
+
+    ops::rms_norm_batch_into(
+        ctx,
+        residual,
+        &moe.pre_feedforward_layernorm_2,
+        geom.rms_norm_eps,
+        &mut scratch.moe_in,
+    );
+
+    let gather = MarlinDispatch {
+        sorted_token_ids: &scratch.sorted_token_ids,
+        expert_ids: &scratch.expert_ids,
+        num_tokens_post_padded: &scratch.padded_total,
+        topk_weights: &scratch.weight,
+        block_size: BLOCK,
+        top_k: config.top_k,
+        mul_topk_weights: false,
+    };
+    gemma4_marlin_nvfp4_moe(
+        ctx,
+        &scratch.moe_in,
+        &moe.gate.qweight,
+        &moe.gate.scales,
+        &moe.gate.global_scales,
+        &mut scratch.locks,
+        &mut scratch.c_tmp,
+        &gather,
+        rows,
+        width,
+        depth,
+        &mut scratch.routed_gate,
+    )?;
+    gemma4_marlin_nvfp4_moe(
+        ctx,
+        &scratch.moe_in,
+        &moe.up.qweight,
+        &moe.up.scales,
+        &moe.up.global_scales,
+        &mut scratch.locks,
+        &mut scratch.c_tmp,
+        &gather,
+        rows,
+        width,
+        depth,
+        &mut scratch.routed_up,
+    )?;
+    ops::gelu_tanh_mul_batch_into(
+        ctx,
+        &scratch.routed_gate,
+        &scratch.routed_up,
+        &mut scratch.routed_act,
+    )?;
+
+    // The rows are already one per pick, so the second projection reads them
+    // straight through and is the one that applies the router's weights.
+    let combine = MarlinDispatch {
+        top_k: 1,
+        mul_topk_weights: true,
+        ..gather
+    };
+    gemma4_marlin_nvfp4_moe(
+        ctx,
+        &scratch.routed_act,
+        &moe.down.qweight,
+        &moe.down.scales,
+        &moe.down.global_scales,
+        &mut scratch.locks,
+        &mut scratch.c_tmp,
+        &combine,
+        slots,
+        depth,
+        width,
+        &mut scratch.routed_down,
+    )?;
+    gemma4_moe_sum_topk_into(
+        ctx,
+        &scratch.routed_down,
+        config.top_k,
+        &mut scratch.expert_out,
+    )?;
+
+    ops::rms_norm_batch_into(
+        ctx,
+        dense,
+        &moe.post_feedforward_layernorm_1,
+        geom.rms_norm_eps,
+        &mut scratch.dense_normed,
+    );
+    ops::rms_norm_batch_into(
+        ctx,
+        &scratch.expert_out,
+        &moe.post_feedforward_layernorm_2,
+        geom.rms_norm_eps,
+        &mut scratch.expert_normed,
+    );
+    ops::add_batch_into(ctx, &scratch.dense_normed, &scratch.expert_normed, out)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests;
