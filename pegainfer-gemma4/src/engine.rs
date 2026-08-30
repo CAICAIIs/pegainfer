@@ -8,6 +8,7 @@ use std::path::Path;
 
 use anyhow::Context as AnyhowContext;
 use anyhow::Result;
+use pegainfer_core::cuda_graph::CudaGraphState;
 use pegainfer_core::ops;
 use pegainfer_core::tensor::DeviceContext;
 use pegainfer_core::tensor::HiddenStates;
@@ -697,6 +698,9 @@ struct Active {
     next: u32,
     emitted: usize,
     prompt_tokens: usize,
+    /// The row has finished while a speculative step over its slot is still
+    /// in flight and retires when that step drains.
+    stopping: bool,
 }
 
 impl Active {
@@ -708,6 +712,52 @@ impl Active {
             ignore_eos: self.request.params.ignore_eos,
         }
     }
+
+    fn settle_staged(&mut self, policy: &GenerationPolicy, token: u32) {
+        if self.stopping {
+            return;
+        }
+        if policy.stops(token, self.request.params.ignore_eos) {
+            let _ = self.request.token_tx.send(TokenEvent::Finished {
+                finish_reason: FinishReason::Stop,
+                prompt_tokens: self.prompt_tokens,
+                completion_tokens: self.emitted,
+            });
+            self.stopping = true;
+            return;
+        }
+        self.emitted += 1;
+        if self
+            .request
+            .token_tx
+            .send(TokenEvent::Token {
+                id: token,
+                logprob: None,
+            })
+            .is_err()
+        {
+            self.stopping = true;
+            return;
+        }
+        if self.emitted >= self.request.max_tokens {
+            let _ = self.request.token_tx.send(TokenEvent::Finished {
+                finish_reason: FinishReason::Length,
+                prompt_tokens: self.prompt_tokens,
+                completion_tokens: self.emitted,
+            });
+            self.stopping = true;
+            return;
+        }
+        self.next = token;
+    }
+}
+
+const DECODE_PIPELINE_DEPTH: usize = 2;
+
+/// One staged decode step whose readback has not yet been collected.
+struct PendingDecode {
+    rows: usize,
+    slot: usize,
 }
 
 enum Admitted {
@@ -751,6 +801,10 @@ struct EngineState {
     /// mixed into the per-call seed; a request's own `params.seed` replays
     /// via (seed, step) regardless of it.
     sample_nonce: u64,
+    /// Present only while the active row order is frozen.
+    pipeline: Option<PendingDecode>,
+    /// Captured suppression, argmax and id-copy chain per decode bucket.
+    sampler_graphs: Vec<CudaGraphState>,
     /// The overlap lane; `None` unless `PEGAINFER_ASYNC_PREFILL` opted in
     /// at startup.
     lane: Option<AsyncPrefillLane>,
@@ -905,10 +959,30 @@ impl EngineState {
                 ))
             })?;
         let prefix_cache = cache_cap.map(|k| PrefixCache::new(k, sliding_window));
-        let scratch = SampleScratch::new(&ctx, vocab, arena_rows)?;
+        let mut scratch = SampleScratch::new(&ctx, vocab, arena_rows)?;
         let mut arena = serve.alloc_step_arena(&ctx, arena_rows, graph_enabled)?;
         serve.precapture_decode_graphs(&ctx, &mut arena)?;
         let suppress_ids = ops::SuppressIds::upload(&ctx, &policy.suppress, vocab)?;
+        let mut sampler_graphs = Vec::new();
+        if graph_enabled {
+            let (logits, ids) = arena.logits_and_ids();
+            // The warm pass lands lazy module loads outside capture.
+            logits.seq_len = arena_rows;
+            ops::suppress_logits_bf16_in_place(&ctx, logits, &suppress_ids)?;
+            pegainfer_sample::greedy_argmax_ids(&ctx, logits, arena_rows, ids, &mut scratch)?;
+            let mut bucket = 1usize;
+            while bucket <= arena_rows {
+                logits.seq_len = bucket;
+                let mut graph = CudaGraphState::new();
+                graph.capture_only(&ctx, || {
+                    ops::suppress_logits_bf16_in_place(&ctx, logits, &suppress_ids)?;
+                    pegainfer_sample::greedy_argmax_ids(&ctx, logits, bucket, ids, &mut scratch)
+                })?;
+                sampler_graphs.push(graph);
+                bucket *= 2;
+            }
+            ctx.sync()?;
+        }
         let lane = lane_mode
             .map(|mode| AsyncPrefillLane::new(&ctx, mode))
             .transpose()?;
@@ -922,6 +996,8 @@ impl EngineState {
             suppress_ids,
             base_seed,
             sample_nonce: 0,
+            pipeline: None,
+            sampler_graphs,
             lane,
             mix_chunk,
             max_context,
@@ -935,6 +1011,9 @@ impl EngineState {
     /// costs the streams a bounded number of prefills per token however
     /// deep the queue is.
     fn admit_from_queue(&mut self, pending: &mut VecDeque<Submitted>, active: &mut Vec<Active>) {
+        if pending.is_empty() {
+            return;
+        }
         let mut attempts = 0;
         while attempts < self.slots && active.len() < self.slots {
             // With the lane busy, arrivals wait in `pending` while decode
@@ -1055,6 +1134,8 @@ impl EngineState {
         // weight scan — one step prefills every gathered newcomer and
         // advances every active row.
         if !active.is_empty() {
+            self.arena.invalidate_decode_fingerprint();
+            self.drain_pipeline(active);
             self.ready_decode_rows(active);
             if !active.is_empty() {
                 // Gather more admissible prompts into the same step. A
@@ -1175,6 +1256,11 @@ impl EngineState {
             });
             Admitted::Done
         };
+        // A solo admission starts a new roster: the fingerprint the retired
+        // one left would otherwise pass a new request whose frontier and
+        // page structure happen to line up, and its first step would keep
+        // the old page tables. Nothing is in flight, so no drain is needed.
+        self.arena.invalidate_decode_fingerprint();
         // Under the chunk knob a solo prompt walks its own segments too:
         // residency stays window plus segment whatever the prompt length.
         let stepped = if let Some(chunk) = self.mix_chunk {
@@ -1302,6 +1388,14 @@ impl EngineState {
     /// release, capture into the prefix cache, and take the first-token
     /// flow the sync path uses.
     fn join_async_prefill(&mut self, active: &mut Vec<Active>) {
+        if self
+            .lane
+            .as_ref()
+            .is_some_and(|lane| lane.inflight.is_some())
+        {
+            self.arena.invalidate_decode_fingerprint();
+            self.drain_pipeline(active);
+        }
         let Some(lane) = self.lane.as_mut() else {
             return;
         };
@@ -1675,6 +1769,120 @@ impl EngineState {
         }
     }
 
+    fn pipeline_eligible(&self, active: &[Active]) -> bool {
+        !active.is_empty()
+            && active.len() <= self.scratch.max_rows()
+            && active.iter().all(|entry| {
+                !entry.stopping
+                    && entry.request.logprobs == 0
+                    && entry.request.max_tokens.saturating_sub(entry.emitted)
+                        >= DECODE_PIPELINE_DEPTH
+                    && pegainfer_sample::effectively_greedy(
+                        &entry.request.params,
+                        self.scratch.vocab(),
+                    )
+            })
+    }
+
+    /// Reserve the next token without retiring or reordering a row.
+    fn ready_rows_pinned(&self, active: &mut [Active]) -> bool {
+        active.iter_mut().all(|entry| {
+            !entry.request.token_tx.is_closed()
+                && admit_tokens(
+                    &self.serve.local_pool,
+                    &self.serve.global_pool,
+                    &mut entry.kv,
+                    1,
+                )
+                .is_ok()
+        })
+    }
+
+    fn fence_or_abort(&self) {
+        let sync = unsafe { cudarc::driver::sys::cuStreamSynchronize(self.ctx.stream.cu_stream()) };
+        if sync != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            log::error!("FATAL: cuStreamSynchronize(decode) failed ({sync:?}); aborting");
+            std::process::abort();
+        }
+    }
+
+    /// Queue one decode and stage its greedy picks into the next embedding's
+    /// id buffer and one pinned readback slot.
+    fn launch_staged(
+        &mut self,
+        active: &mut [Active],
+        resident: bool,
+        slot: usize,
+    ) -> Result<usize> {
+        let rows = active.len();
+        let tokens = (!resident).then(|| active.iter().map(|entry| entry.next).collect::<Vec<_>>());
+        {
+            let mut kvs: Vec<&mut GemmaKv> = active.iter_mut().map(|entry| &mut entry.kv).collect();
+            if let Some(tokens) = tokens.as_deref() {
+                self.serve
+                    .decode_batch_step(&self.ctx, &mut self.arena, &mut kvs, tokens)?;
+            } else {
+                self.serve
+                    .decode_batch_step_resident(&self.ctx, &mut self.arena, &mut kvs)?;
+            }
+        }
+        let graph_slot = crate::serve::decode_bucket_slot(rows);
+        if let Some(graph) = self.sampler_graphs.get_mut(graph_slot) {
+            graph
+                .launch_captured(&self.ctx)
+                .context("launch sampler graph")?;
+            self.sample_nonce = self.sample_nonce.wrapping_add(1);
+            pegainfer_sample::greedy_stage_readback(&self.ctx, slot, &mut self.scratch)
+                .context("stage greedy readback")?;
+        } else {
+            let (logits, ids) = self.arena.logits_and_ids();
+            ops::suppress_logits_bf16_in_place(&self.ctx, logits, &self.suppress_ids)
+                .context("suppression")?;
+            self.sample_nonce = self.sample_nonce.wrapping_add(1);
+            pegainfer_sample::greedy_stage_resident(
+                &self.ctx,
+                logits,
+                rows,
+                ids,
+                slot,
+                &mut self.scratch,
+            )
+            .context("stage greedy picks")?;
+        }
+        Ok(rows)
+    }
+
+    /// Deliver a staged step without changing the row order. Finished rows
+    /// stay pinned until the speculative successor drains.
+    fn collect_pending(&mut self, active: &mut [Active], pending: &PendingDecode) -> Result<()> {
+        anyhow::ensure!(
+            pending.rows == active.len(),
+            "pipeline collected {} rows against a batch of {}",
+            pending.rows,
+            active.len()
+        );
+        let picked = pegainfer_sample::greedy_collect_resident(
+            pending.rows,
+            pending.slot,
+            &mut self.scratch,
+        )?;
+        for (entry, token) in active.iter_mut().zip(picked) {
+            entry.settle_staged(&self.policy, token);
+        }
+        Ok(())
+    }
+
+    fn drain_pipeline(&mut self, active: &mut Vec<Active>) {
+        let Some(pending) = self.pipeline.take() else {
+            return;
+        };
+        if let Err(err) = self.collect_pending(active, &pending) {
+            self.fence_or_abort();
+            return fail_active_batch(active, "pipelined decode drain", &err);
+        }
+        active.retain(|entry| !entry.stopping);
+    }
+
     /// The mixed-admission tail of [`Self::admit_and_prefill`]: every
     /// gathered prompt and the live decode batch share one step, then one
     /// sampler call covers the newcomers' first tokens (logits rows `0..k`)
@@ -1776,16 +1984,7 @@ impl EngineState {
         Admitted::Done
     }
 
-    /// One batched decode step: every active request advances a token,
-    /// sharing each layer's weight pass. A cancelled request and a request
-    /// the pools cannot grow for retire before the batch is built; a finished
-    /// one retires after its token lands.
-    fn decode_round(&mut self, active: &mut Vec<Active>) {
-        self.ready_decode_rows(active);
-        if active.is_empty() {
-            return;
-        }
-
+    fn decode_round_collect(&mut self, active: &mut Vec<Active>) {
         let tokens: Vec<u32> = active.iter().map(|entry| entry.next).collect();
         let logits = {
             let mut kvs: Vec<&mut GemmaKv> = active.iter_mut().map(|entry| &mut entry.kv).collect();
@@ -1794,7 +1993,10 @@ impl EngineState {
                 .decode_batch_step(&self.ctx, &mut self.arena, &mut kvs, &tokens)
             {
                 Ok(logits) => logits,
-                Err(err) => return fail_active_batch(active, "batched decode", &err),
+                Err(err) => {
+                    self.fence_or_abort();
+                    return fail_active_batch(active, "batched decode", &err);
+                }
             }
         };
         let sampled = {
@@ -1812,8 +2014,63 @@ impl EngineState {
         };
         match sampled {
             Ok(mut sampled) => emit_decode_rows(active, &mut sampled, 0),
-            Err(err) => fail_active_batch(active, "batched decode", &err),
+            Err(err) => {
+                self.fence_or_abort();
+                fail_active_batch(active, "batched decode", &err);
+            }
         }
+    }
+
+    /// One batched decode step. Eligible greedy batches keep one speculative
+    /// successor in flight and drain before any row-order change.
+    fn decode_round(&mut self, active: &mut Vec<Active>) {
+        if let Some(pending) = self.pipeline.take() {
+            if self.pipeline_eligible(active) && self.ready_rows_pinned(active) {
+                let next_slot = (pending.slot + 1) % DECODE_PIPELINE_DEPTH;
+                match self.launch_staged(active, true, next_slot) {
+                    Ok(rows) => {
+                        if let Err(err) = self.collect_pending(active, &pending) {
+                            self.fence_or_abort();
+                            fail_active_batch(active, "pipelined decode collect", &err);
+                            return;
+                        }
+                        self.pipeline = Some(PendingDecode {
+                            rows,
+                            slot: next_slot,
+                        });
+                    }
+                    Err(err) => {
+                        if let Err(collect_err) = self.collect_pending(active, &pending) {
+                            log::error!("collect during launch failure failed: {collect_err:#}");
+                        }
+                        self.fence_or_abort();
+                        fail_active_batch(active, "pipelined decode launch", &err);
+                    }
+                }
+                return;
+            }
+            self.pipeline = Some(pending);
+            self.drain_pipeline(active);
+            if active.is_empty() {
+                return;
+            }
+        }
+
+        self.ready_decode_rows(active);
+        if active.is_empty() {
+            return;
+        }
+        if self.pipeline_eligible(active) {
+            match self.launch_staged(active, false, 0) {
+                Ok(rows) => self.pipeline = Some(PendingDecode { rows, slot: 0 }),
+                Err(err) => {
+                    self.fence_or_abort();
+                    fail_active_batch(active, "batched decode", &err);
+                }
+            }
+            return;
+        }
+        self.decode_round_collect(active);
     }
 }
 
@@ -1903,6 +2160,7 @@ fn settle_first_token(
         next,
         emitted: 1,
         prompt_tokens,
+        stopping: false,
     })
 }
 
@@ -2087,14 +2345,19 @@ mod lane_tests {
         tokens: usize,
         cached: usize,
         finish: FinishReason,
+        ids: Vec<u32>,
     }
 
     fn drain(rx: &mut TokenStreamReceiver, name: &str) -> Drained {
         let mut tokens = 0;
         let mut cached = 0;
+        let mut ids = Vec::new();
         loop {
             match rx.blocking_recv().map(|(_, event)| event) {
-                Some(TokenEvent::Token { .. }) => tokens += 1,
+                Some(TokenEvent::Token { id, .. }) => {
+                    tokens += 1;
+                    ids.push(id);
+                }
                 Some(TokenEvent::Scheduled { cached_tokens, .. }) => cached = cached_tokens,
                 Some(TokenEvent::PromptTokens { .. } | TokenEvent::KvTransfer { .. }) => {}
                 Some(TokenEvent::Finished { finish_reason, .. }) => {
@@ -2102,6 +2365,7 @@ mod lane_tests {
                         tokens,
                         cached,
                         finish: finish_reason,
+                        ids,
                     };
                 }
                 Some(TokenEvent::Error { message, .. }) => panic!("{name}: error: {message}"),
@@ -2496,6 +2760,147 @@ mod lane_tests {
         assert_eq!(drain(&mut rx_a, "incumbent a").tokens, 4);
         assert_eq!(drain(&mut rx_b, "incumbent b").tokens, 40);
         assert_eq!(drain(&mut rx_c, "queued third").tokens, 6);
+    }
+
+    /// The production loop runs an intake pass before every decode round.
+    /// With both slots held and a request queued, that pass can admit
+    /// nothing, so it must leave the staged successor and the step
+    /// fingerprint alone; the third request joins only once a slot frees.
+    #[test]
+    #[ignore = "requires the pinned 12B checkpoint, a GPU, and --test-threads=1"]
+    fn the_full_roster_keeps_its_pipeline_under_a_queue() {
+        let dir = crate::testkit::model_path();
+        let policy = super::generation_policy(&dir).expect("policy");
+        let _env = scoped_engine_env(&[("PEGAINFER_DECODE_SLOTS", "2")]);
+        let mut state =
+            super::EngineState::load(&dir, 0, policy, 0x5EED, true).expect("engine state");
+        let prompts = walk_prompts();
+        let (req_a, mut rx_a) = walk_request(prompts[0].clone(), 24);
+        let (req_b, mut rx_b) = walk_request(prompts[1].clone(), 40);
+        let (req_c, mut rx_c) = walk_request(prompts[2].clone(), 6);
+
+        let mut pending = std::collections::VecDeque::new();
+        let mut active: Vec<super::Active> = Vec::new();
+        pending.push_back((req_a, pegainfer_frontend::engine::KvPrefix::none()));
+        pending.push_back((req_b, pegainfer_frontend::engine::KvPrefix::none()));
+        state.admit_from_queue(&mut pending, &mut active);
+        assert_eq!(active.len(), 2, "both slots are held by live requests");
+        pending.push_back((req_c, pegainfer_frontend::engine::KvPrefix::none()));
+
+        state.decode_round(&mut active);
+        state.decode_round(&mut active);
+        assert!(
+            state.pipeline.is_some(),
+            "a greedy batch stages a successor"
+        );
+        assert!(
+            state.arena.has_decode_fingerprint(),
+            "a regular step leaves its fingerprint"
+        );
+        for round in 0..4 {
+            state.admit_from_queue(&mut pending, &mut active);
+            assert_eq!(
+                pending.len(),
+                1,
+                "round {round}: full slots keep the third queued"
+            );
+            assert!(
+                state.pipeline.is_some(),
+                "round {round}: an intake that admits nothing keeps the pipeline"
+            );
+            assert!(
+                state.arena.has_decode_fingerprint(),
+                "round {round}: and the fingerprint"
+            );
+            state.decode_round(&mut active);
+        }
+
+        while active.len() == 2 {
+            state.admit_from_queue(&mut pending, &mut active);
+            state.decode_round(&mut active);
+        }
+        state.admit_from_queue(&mut pending, &mut active);
+        assert_eq!(active.len(), 2, "the freed slot admits the third request");
+        assert!(pending.is_empty(), "the queue drained");
+        while !active.is_empty() {
+            state.admit_from_queue(&mut pending, &mut active);
+            state.decode_round(&mut active);
+        }
+        assert_eq!(drain(&mut rx_a, "incumbent a").tokens, 24);
+        assert_eq!(drain(&mut rx_b, "incumbent b").tokens, 40);
+        assert_eq!(drain(&mut rx_c, "queued third").tokens, 6);
+    }
+
+    /// A roster that empties leaves its last fingerprint in the arena. The
+    /// solo admission that refills the idle engine must drop it: a new
+    /// request whose frontier sits one token past the retired one's, with
+    /// the same page structure, would otherwise take the regular-step skip
+    /// on its first decode and keep the retired roster's page tables.
+    #[test]
+    #[ignore = "requires the pinned 12B checkpoint, a GPU, and --test-threads=1"]
+    fn an_idle_refill_drops_the_retired_fingerprint() {
+        let dir = crate::testkit::model_path();
+        let policy = super::generation_policy(&dir).expect("policy");
+        let _env = scoped_engine_env(&[("PEGAINFER_DECODE_SLOTS", "2")]);
+        let prompts = walk_prompts();
+        let first_len = 64usize;
+        let budget = 8usize;
+        let first: Vec<u32> = prompts[0].iter().cycle().copied().take(first_len).collect();
+        // The retired request's last step ran at kv_len = first_len + budget - 1;
+        // this prompt's first decode step runs at exactly one more.
+        let second: Vec<u32> = prompts[1]
+            .iter()
+            .cycle()
+            .copied()
+            .take(first_len + budget - 1)
+            .collect();
+
+        let run_second_alone = |state: &mut super::EngineState| -> Drained {
+            let (req, mut rx) = walk_request(second.clone(), budget);
+            let mut pending = std::collections::VecDeque::new();
+            let mut active: Vec<super::Active> = Vec::new();
+            pending.push_back((req, pegainfer_frontend::engine::KvPrefix::none()));
+            state.admit_from_queue(&mut pending, &mut active);
+            assert_eq!(active.len(), 1, "the prompt is admitted");
+            assert!(
+                !state.arena.has_decode_fingerprint(),
+                "a solo admission starts with no fingerprint"
+            );
+            while !active.is_empty() {
+                state.admit_from_queue(&mut pending, &mut active);
+                state.decode_round(&mut active);
+            }
+            drain(&mut rx, "second")
+        };
+
+        let mut state =
+            super::EngineState::load(&dir, 0, policy, 0x5EED, true).expect("engine state");
+        let (req_a, mut rx_a) = walk_request(first, budget);
+        let mut pending = std::collections::VecDeque::new();
+        let mut active: Vec<super::Active> = Vec::new();
+        pending.push_back((req_a, pegainfer_frontend::engine::KvPrefix::none()));
+        state.admit_from_queue(&mut pending, &mut active);
+        while !active.is_empty() {
+            state.admit_from_queue(&mut pending, &mut active);
+            state.decode_round(&mut active);
+        }
+        assert_eq!(drain(&mut rx_a, "first").tokens, budget);
+        assert!(
+            state.arena.has_decode_fingerprint(),
+            "the retired roster leaves its fingerprint behind"
+        );
+        let refilled = run_second_alone(&mut state);
+
+        drop(state);
+        let fresh_policy = super::generation_policy(&dir).expect("policy");
+        let mut fresh = super::EngineState::load(&dir, 0, fresh_policy, 0x5EED, true)
+            .expect("fresh engine state");
+        let alone = run_second_alone(&mut fresh);
+        assert_eq!(refilled.tokens, budget);
+        assert_eq!(
+            refilled.ids, alone.ids,
+            "the refill answers exactly as a fresh engine does"
+        );
     }
 
     /// The chunked pool provisions one shared segment transient, so no
