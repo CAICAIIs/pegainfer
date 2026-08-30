@@ -24,6 +24,56 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    pub fn rms_norm_batched_dual_cuda(
+        x: *const Half,
+        weight_a: *const Half,
+        weight_b: *const Half,
+        out_a: *mut Half,
+        out_b: *mut Half,
+        hidden_dim: i32,
+        seq_len: i32,
+        eps: f32,
+        scale_a: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn dual_rms_norm_add_batched_cuda(
+        a: *const Half,
+        weight_a: *const Half,
+        b: *const Half,
+        weight_b: *const Half,
+        out: *mut Half,
+        hidden_dim: i32,
+        seq_len: i32,
+        eps: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn rms_norm_add_rms_norm_round_batched_cuda(
+        x: *const Half,
+        weight_post: *const Half,
+        res_in: *const Half,
+        weight_pre: *const Half,
+        residual_out: *mut Half,
+        out: *mut Half,
+        hidden_dim: i32,
+        seq_len: i32,
+        eps: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn rms_norm_add_scale_batched_cuda(
+        x: *const Half,
+        weight: *const Half,
+        residual: *const Half,
+        out: *mut Half,
+        hidden_dim: i32,
+        seq_len: i32,
+        eps: f32,
+        scale: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn add_cuda(
         a: *const Half,
         b: *const Half,

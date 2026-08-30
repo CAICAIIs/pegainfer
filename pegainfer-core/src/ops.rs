@@ -32,6 +32,7 @@ pub use pegainfer_kernels::ops::bf16_hidden_to_f32_into;
 pub use pegainfer_kernels::ops::copy_hidden_rows_into;
 pub use pegainfer_kernels::ops::copy_hidden_token_range_into;
 pub use pegainfer_kernels::ops::dflash_qk_norm_rope_into;
+pub use pegainfer_kernels::ops::dual_rms_norm_add_batch_into;
 pub use pegainfer_kernels::ops::eagle3_rope_into;
 #[cfg(not(feature = "kernel-call-trace"))]
 pub use pegainfer_kernels::ops::embedding_batch;
@@ -78,6 +79,9 @@ pub use pegainfer_kernels::ops::qk_norm_rope_prefill_hd256_plain_into;
 pub use pegainfer_kernels::ops::qkv_norm_rope_paged_decode_hd256_plain_into;
 pub use pegainfer_kernels::ops::qkv_norm_rope_paged_prefill_hd256_plain_into;
 pub use pegainfer_kernels::ops::rms_norm;
+pub use pegainfer_kernels::ops::rms_norm_add_rms_norm_round_batch_into;
+pub use pegainfer_kernels::ops::rms_norm_add_scale_batch_into;
+pub use pegainfer_kernels::ops::rms_norm_batch_dual_into;
 #[cfg(not(feature = "kernel-call-trace"))]
 pub use pegainfer_kernels::ops::rms_norm_batch_into;
 pub use pegainfer_kernels::ops::rms_norm_batch_offset_into;

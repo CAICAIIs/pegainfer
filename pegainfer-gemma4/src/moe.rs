@@ -109,8 +109,6 @@ pub(crate) struct MoeScratch {
     routed_act: HiddenStates,
     routed_down: HiddenStates,
     expert_out: HiddenStates,
-    dense_normed: HiddenStates,
-    expert_normed: HiddenStates,
     expert_offsets: CudaSlice<u32>,
     expert_cursor: CudaSlice<u32>,
 }
@@ -141,8 +139,6 @@ impl MoeScratch {
             routed_act: narrow(sizes.slots)?,
             routed_down: hidden(sizes.slots)?,
             expert_out: hidden(max_rows)?,
-            dense_normed: hidden(max_rows)?,
-            expert_normed: hidden(max_rows)?,
             expert_offsets: ctx.stream.alloc_zeros::<u32>(moe.num_experts + 1)?,
             expert_cursor: ctx.stream.alloc_zeros::<u32>(1)?,
         })
@@ -159,8 +155,6 @@ impl MoeScratch {
             &mut self.logits,
             &mut self.moe_in,
             &mut self.expert_out,
-            &mut self.dense_normed,
-            &mut self.expert_normed,
         ] {
             buf.seq_len = rows;
         }
@@ -215,19 +209,17 @@ pub(crate) fn moe_into(
         geom.hidden_size
     );
 
-    // The router's own norm carries no scale of its own, so the parameter
-    // multiply and the `hidden ** -0.5` that follow it are separate steps.
-    ops::rms_norm_batch_into(
+    // Both residual norms share one reduction. The router branch still
+    // rounds before its `hidden ** -0.5` scalar multiply.
+    ops::rms_norm_batch_dual_into(
         ctx,
         residual,
         &moe.router_scale,
+        &moe.pre_feedforward_layernorm_2,
         geom.rms_norm_eps,
-        &mut scratch.router_in,
-    );
-    ops::scale_bf16_in_place(
-        ctx,
-        &mut scratch.router_in,
         (geom.hidden_size as f32).powf(-0.5),
+        &mut scratch.router_in,
+        &mut scratch.moe_in,
     )?;
     ops::gemm_rows_into_checked(
         ctx,
@@ -263,14 +255,6 @@ pub(crate) fn moe_into(
             expert_cursor: &mut scratch.expert_cursor,
         },
     )?;
-
-    ops::rms_norm_batch_into(
-        ctx,
-        residual,
-        &moe.pre_feedforward_layernorm_2,
-        geom.rms_norm_eps,
-        &mut scratch.moe_in,
-    );
 
     let gather = MarlinDispatch {
         sorted_token_ids: &scratch.sorted_token_ids,
@@ -344,21 +328,15 @@ pub(crate) fn moe_into(
         &mut scratch.expert_out,
     )?;
 
-    ops::rms_norm_batch_into(
+    ops::dual_rms_norm_add_batch_into(
         ctx,
         dense,
         &moe.post_feedforward_layernorm_1,
-        geom.rms_norm_eps,
-        &mut scratch.dense_normed,
-    );
-    ops::rms_norm_batch_into(
-        ctx,
         &scratch.expert_out,
         &moe.post_feedforward_layernorm_2,
         geom.rms_norm_eps,
-        &mut scratch.expert_normed,
-    );
-    ops::add_batch_into(ctx, &scratch.dense_normed, &scratch.expert_normed, out)?;
+        out,
+    )?;
     Ok(())
 }
 
