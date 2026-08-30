@@ -1,80 +1,79 @@
 // Gemma 4 routed-expert dispatch.
-//
-// The router's softmax runs over every expert, so one block owns one token
-// and keeps the whole expert row in shared memory. The routed GEMM emits one
-// row per pick; the sum kernel folds those rows back onto their tokens.
 
 #include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <float.h>
+#include <math.h>
 
 namespace {
 
-// One warp per token: every reduction below is a shuffle, so a block wider
-// than a warp would silently drop the other warps' partials.
+// The strided lane scan and shuffle tree preserve lower-expert tie breaking.
 constexpr int kRouterBlock = 32;
+constexpr int kRouterExperts = 128;
+constexpr int kRouterLaneExperts = kRouterExperts / kRouterBlock;
 
 __global__ void gemma4_moe_router_topk_kernel(
     const __nv_bfloat16 *__restrict__ logits,
     const __nv_bfloat16 *__restrict__ per_expert_scale, int experts, int top_k,
     int *__restrict__ index_out, float *__restrict__ weight_out) {
-  extern __shared__ float probability[];
   const int row = blockIdx.x;
+  const int lane = threadIdx.x;
   const __nv_bfloat16 *row_logits = logits + (long long)row * experts;
 
-  __shared__ float reduced;
-  __shared__ int reduced_at;
-
-  float mine = -FLT_MAX;
-  for (int e = threadIdx.x; e < experts; e += blockDim.x) {
-    float value = __bfloat162float(row_logits[e]);
-    probability[e] = value;
-    mine = fmaxf(mine, value);
+  float held[kRouterLaneExperts];
+  bool poisoned = false;
+  for (int slot = 0; slot < kRouterLaneExperts; ++slot) {
+    int e = lane + slot * kRouterBlock;
+    held[slot] = e < experts ? __bfloat162float(row_logits[e]) : -FLT_MAX;
+    poisoned |= e < experts && !isfinite(held[slot]);
   }
-  for (int width = warpSize / 2; width > 0; width >>= 1) {
+  // One non-finite logit fails the whole row closed, -inf included: the
+  // softmax below would otherwise mask it and hand out ordinary weights.
+  if (__any_sync(0xffffffff, poisoned)) {
+    for (int slot = 0; slot < kRouterLaneExperts; ++slot) {
+      held[slot] = NAN;
+    }
+  }
+  float mine = -FLT_MAX;
+  for (int slot = 0; slot < kRouterLaneExperts; ++slot) {
+    mine = fmaxf(mine, held[slot]);
+  }
+  for (int width = kRouterBlock / 2; width > 0; width >>= 1) {
     mine = fmaxf(mine, __shfl_down_sync(0xffffffff, mine, width));
   }
-  if (threadIdx.x == 0) {
-    reduced = mine;
-  }
-  __syncthreads();
+  const float peak = __shfl_sync(0xffffffff, mine, 0);
 
-  const float peak = reduced;
   float total = 0.0f;
-  for (int e = threadIdx.x; e < experts; e += blockDim.x) {
-    float value = __expf(probability[e] - peak);
-    probability[e] = value;
-    total += value;
+  for (int slot = 0; slot < kRouterLaneExperts; ++slot) {
+    int e = lane + slot * kRouterBlock;
+    if (e < experts) {
+      held[slot] = __expf(held[slot] - peak);
+      total += held[slot];
+    }
   }
-  for (int width = warpSize / 2; width > 0; width >>= 1) {
+  for (int width = kRouterBlock / 2; width > 0; width >>= 1) {
     total += __shfl_down_sync(0xffffffff, total, width);
   }
-  if (threadIdx.x == 0) {
-    reduced = total;
+  const float norm = __shfl_sync(0xffffffff, total, 0);
+  for (int slot = 0; slot < kRouterLaneExperts; ++slot) {
+    held[slot] /= norm;
   }
-  __syncthreads();
 
-  const float norm = reduced;
-  for (int e = threadIdx.x; e < experts; e += blockDim.x) {
-    probability[e] /= norm;
-  }
-  __syncthreads();
-
-  // Selection is serial in k because each pick has to mask the previous one.
-  // A tie takes the lower expert, which is what torch.topk reports.
   float selected = 0.0f;
+  float my_win = 0.0f;
+  int my_taken = 0;
   for (int k = 0; k < top_k; ++k) {
     float best = -FLT_MAX;
     int best_at = experts;
-    for (int e = threadIdx.x; e < experts; e += blockDim.x) {
-      float value = probability[e];
-      if (value > best || (value == best && e < best_at)) {
-        best = value;
+    for (int slot = 0; slot < kRouterLaneExperts; ++slot) {
+      int e = lane + slot * kRouterBlock;
+      if (e < experts && (held[slot] > best || (held[slot] == best && e < best_at))) {
+        best = held[slot];
         best_at = e;
       }
     }
-    for (int width = warpSize / 2; width > 0; width >>= 1) {
+    for (int width = kRouterBlock / 2; width > 0; width >>= 1) {
       float other = __shfl_down_sync(0xffffffff, best, width);
       int other_at = __shfl_down_sync(0xffffffff, best_at, width);
       if (other > best || (other == best && other_at < best_at)) {
@@ -82,30 +81,32 @@ __global__ void gemma4_moe_router_topk_kernel(
         best_at = other_at;
       }
     }
-    if (threadIdx.x == 0) {
-      reduced = best;
-      reduced_at = best_at;
+    float win = __shfl_sync(0xffffffff, best, 0);
+    int taken = __shfl_sync(0xffffffff, best_at, 0);
+    if (taken >= experts) {
+      // No candidate compared true: a non-finite logit poisoned the whole
+      // row through the softmax. The pick stays valid and row-unique and
+      // its weight goes out NaN, so nothing indexes past the arrays.
+      taken = k;
+      win = NAN;
+    } else if (taken % kRouterBlock == lane) {
+      // A taken slot must lose every later pick, including the lower-expert
+      // tie against `best`'s floor that a -FLT_MAX clear would win once the
+      // rest of the row is NaN; NaN compares false everywhere.
+      held[taken / kRouterBlock] = NAN;
     }
-    __syncthreads();
-    const int taken = reduced_at;
-    if (threadIdx.x == 0) {
-      index_out[(long long)row * top_k + k] = taken;
-      weight_out[(long long)row * top_k + k] = reduced;
-      probability[taken] = -FLT_MAX;
+    if (lane == k) {
+      my_win = win;
+      my_taken = taken;
     }
-    selected += reduced;
-    __syncthreads();
+    selected += win;
   }
 
-  // The selected probabilities are renormalized among themselves before the
-  // per-expert scale lands, so a token's expert weights sum to one first.
-  if (threadIdx.x == 0) {
-    for (int k = 0; k < top_k; ++k) {
-      const long long at = (long long)row * top_k + k;
-      const int expert = index_out[at];
-      weight_out[at] =
-          weight_out[at] / selected * __bfloat162float(per_expert_scale[expert]);
-    }
+  if (lane < top_k) {
+    const long long at = (long long)row * top_k + lane;
+    index_out[at] = my_taken;
+    weight_out[at] =
+        my_win / selected * __bfloat162float(per_expert_scale[my_taken]);
   }
 }
 
@@ -138,11 +139,11 @@ CUresult gemma4_moe_router_topk_cuda(const __nv_bfloat16 *logits,
                                      cudaStream_t stream) {
   if (logits == nullptr || per_expert_scale == nullptr ||
       index_out == nullptr || weight_out == nullptr || rows <= 0 ||
-      experts <= 0 || top_k <= 0 || top_k > experts) {
+      experts != kRouterExperts || top_k <= 0 || top_k > experts ||
+      top_k > kRouterBlock) {
     return CUDA_ERROR_INVALID_VALUE;
   }
-  const size_t shared = (size_t)experts * sizeof(float);
-  gemma4_moe_router_topk_kernel<<<rows, kRouterBlock, shared, stream>>>(
+  gemma4_moe_router_topk_kernel<<<rows, kRouterBlock, 0, stream>>>(
       logits, per_expert_scale, experts, top_k, index_out, weight_out);
   return (CUresult)cudaGetLastError();
 }

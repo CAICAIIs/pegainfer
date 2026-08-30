@@ -17,6 +17,16 @@ Rows retire independently. Requests in one batch have their own frontiers, their
 | Page size | 16 tokens | both families |
 | Sliding window | 1024 tokens | the local family releases its front past this; the global family never releases |
 
+## The routed expert schedule
+
+The 26B routed path fixes whole-column K stripes in Gemma's Marlin template instantiations. One CTA reduces an output element in one order, so identical target rows produce identical bytes regardless of grid partition, scratch layout or companion rows. Kimi keeps the dynamic schedule. This policy changes neither the shared WNA16 launcher, the Gemma Rust wrapper nor the WNA16 C ABI. The lock-serialized fp32 staging path therefore never engages, but `c_tmp` remains allocated because the shared launcher refuses a null staging buffer.
+
+Alignment uses 16-row blocks below a 1024-row step (8192 routed slots) and 64-row blocks from there. Decode buckets top out at 16 rows, so decode never flips to the coarse block. The floor is measured, not chosen: a lone prompt loses first-token time on the coarse block at every length up to 4096 slots and ties at 8192, while the mixed steps a busy server prefills through — one 1024-token prompt beside the live decode rows — gain from it. Both blocks run the same two 128-thread tiles: the 704-wide gate and up projections admit only a 64-wide output tile, which has no correct 256-thread specialization, and a 256-thread tile for the 2816-wide down projection is byte-identical and no faster.
+
+The register router accepts exactly 128 experts and from 1 through 32 picks. A non-finite row fails closed: every emitted index stays valid and row-unique, while every emitted weight is NaN so downstream computation remains loud.
+
+The checkpoint-backed `the_routed_block_matches_the_reference_formulas` gate owns the scratch-capacity, companion-route and coarse-block evidence, including a narrow block replay after a coarse block on one scratch. On shared rows, it proves that the 16-row and 64-row block pick the same experts with the same weight bits and produce the same gate, weighted-down and block bits. `router_topk_matches_the_exact_128_expert_contract` owns the register-router boundary and non-finite rows. The kernels-owned `kimi_marlin_align_boundary_matches_vllm_contract` oracle owns stable counts, offsets, padding and expert-local order on both sides of the alignment dispatch boundary. `scripts/gemma4_gates.sh` owns the Gemma crate's ignored gates and the kernels crate's Gemma router contract (the device-only test under the `gemma4` feature), holding both crates' ignored sets against its manifest; the Kimi alignment oracle needs the `kimi-k2` feature and an `sm_90` device and is run by hand.
+
 ## The two pools
 
 Gemma 4 runs two attention families with different KV shapes, so the budget is two budgets. With 16-token pages, `C = ceil(8192/16) = 512` context pages and `W = ceil(1024/16) + 1 = 65` window pages:

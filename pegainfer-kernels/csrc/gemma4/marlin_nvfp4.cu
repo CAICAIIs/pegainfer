@@ -33,7 +33,7 @@ namespace pegainfer_gemma4_marlin_nvfp4 {
     kernel = Marlin<vllm::kBFloat16.id(), vllm::kFE2M1f.id(),                   \
                     vllm::kBFloat16.id(), vllm::kFE4M3fn.id(), NUM_THREADS,     \
                     THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS,          \
-                    M_BLOCK_SIZE_8, pipe_stages, 1, false>;                     \
+                    M_BLOCK_SIZE_8, pipe_stages, 1, false, true>;               \
   }
 
 #define GEMMA4_MARLIN_GET_IF_M1(N_BLOCKS, K_BLOCKS, NUM_THREADS) \
@@ -48,6 +48,9 @@ const ThreadConfig kSmallBatch[] = {
     {64, 128, 128},
 };
 
+// Prefill-sized dispatches share decode's tiles: a 64-wide tile has no
+// correct 256-thread specialization, and a 256-thread, 256-wide tile for the
+// down projection is byte-identical and no faster.
 const ThreadConfigs kTables{kSmallBatch, 2, kSmallBatch, 2};
 
 MarlinFuncPtr get_nvfp4_kernel(
@@ -62,6 +65,8 @@ MarlinFuncPtr get_nvfp4_kernel(
   }
   GEMMA4_MARLIN_GET_IF_M1(4, 8, 128)
   GEMMA4_MARLIN_GET_IF_M1(8, 4, 128)
+  GEMMA4_MARLIN_GET_IF(4, 4, 8, false, 128)
+  GEMMA4_MARLIN_GET_IF(4, 8, 4, false, 128)
   return kernel;
 }
 
