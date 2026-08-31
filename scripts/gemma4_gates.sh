@@ -39,10 +39,12 @@ GPU_LOCK_ROOT=/tmp
 # run a gate without producing the whole suite's prerequisites.
 GATES_NUMERIC_PARITY=(
   "gpu,ckpt,fixtures serve::oracle::context_waypoints_match_hf"
+  "gpu,ckpt,fixtures serve::oracle::fp8_argmax_agreement_meets_the_bf16_floor"
   "gpu,ckpt,fixtures serve::oracle::greedy_matches_hf_generate"
 )
 GATES_ADMISSION=(
   "gpu,ckpt,prompts serve::oracle::mixed_step_matches_serial"
+  "gpu,ckpt,prompts serve::oracle::fp8_mixed_walk_holds_its_structure"
   "gpu,ckpt,prompts engine::lane_tests::the_gathered_walk_matches_the_serial_path"
   "gpu,ckpt,prompts engine::lane_tests::the_gathered_transient_leaves_headroom"
 )
@@ -89,6 +91,15 @@ GATES_KERNELS=(
   "gpu ops::norm::parity::the_epilogue_norm_pair_matches_its_parts"
   "gpu ops::norm::parity::the_moe_combine_tail_matches_its_parts"
 )
+GATES_KERNELS_HD256_FP8_POOL=(
+  "gpu fp8_prep_stores_exact_bytes_at_layout_offsets"
+  "gpu fp8_decode_prep_stores_exact_bytes_at_layout_offsets"
+  "gpu fp8_window_read_matches_bf16_for_exact_values"
+  "gpu fp8_finite_window_read_matches_bf16_and_changes_the_result"
+  "gpu fp8_window_read_is_geometry_invariant_for_the_probed_row"
+  "gpu varied_fp8_window_read_is_geometry_invariant_for_the_probed_row"
+  "gpu decode_wrapper_without_fp8_twin_refuses_e4m3"
+)
 MANIFEST_LIB=(
   "${GATES_NUMERIC_PARITY[@]}"
   "${GATES_ADMISSION[@]}"
@@ -98,6 +109,15 @@ MANIFEST_LIB=(
   "${GATES_LOADER[@]}"
   "${GATES_DEVICE[@]}"
   "${GATES_ROUTED[@]}"
+)
+GATES_FP8_PROFILE=(
+  "serve::oracle::context_waypoints_match_hf"
+  "serve::oracle::greedy_matches_hf_generate"
+  "serve::oracle::fp8_argmax_agreement_meets_the_bf16_floor"
+  "serve::oracle::fp8_mixed_walk_holds_its_structure"
+  "serve::oracle::a_ragged_batch_does_not_depend_on_row_order"
+  "serve::oracle::eviction_is_footprint_only"
+  "serve::oracle::overlapped_prefill_matches_the_sync_step"
 )
 
 # Integration gates live in their own binaries, which `--lib` cannot see. One
@@ -122,8 +142,26 @@ CHAT_GOLDEN=test_data/gemma4-tokenizer-golden.json
 
 die() { echo "gemma4 gates: $*" >&2; exit 1; }
 
+gate_is_in() {
+  local wanted=$1 candidate
+  shift
+  for candidate in "$@"; do
+    [ "$candidate" = "$wanted" ] && return 0
+  done
+  return 1
+}
+
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root" || die "cannot enter the repository root"
+
+[ -z "${PEGAINFER_KV_FP8+x}" ] || die \
+  "PEGAINFER_KV_FP8 is ambient; PEGAINFER_GATE_STORAGE is the only storage switch"
+gate_storage=${PEGAINFER_GATE_STORAGE-bf16}
+case "$gate_storage" in
+  bf16) ;;
+  fp8) export PEGAINFER_KV_FP8=local ;;
+  *) die "PEGAINFER_GATE_STORAGE must be unset, bf16, or fp8" ;;
+esac
 
 # --- prerequisites, one refusal per tier ----------------------------------
 # Each is demanded only when a selected gate declares it, so a focused run
@@ -176,6 +214,10 @@ require_gpu() {
   exec {gpu_lock_fd}<"$lock_path" || die "cannot open device lock $lock_path"
   flock -n "$gpu_lock_fd" || die "GPU $gpu_uuid is already owned by another Gemma 4 gate runner"
   echo "gemma4 gates: claimed GPU $gpu_uuid (selector $selector)"
+  echo "gemma4 gates: storage profile $gate_storage"
+  if [ -n "${PEGAINFER_KV_FP8:-}" ]; then
+    echo "gemma4 gates: PEGAINFER_KV_FP8=$PEGAINFER_KV_FP8"
+  fi
 }
 
 require_ckpt() {
@@ -263,6 +305,13 @@ ignored_in() {
     --ignored --list 2>/dev/null | sed -n 's/^\(.*\): test$/\1/p' | sort
 }
 
+listed_in() {
+  local crate=$1
+  shift
+  cargo test --release -p "$crate" --features "$FEATURE" "$@" -- \
+    --list 2>/dev/null | sed -n 's/^\(.*\): test$/\1/p' | sort
+}
+
 check_membership() {
   local what=$1 listing=$2 expected=$3 missing extra
   missing=$(comm -13 <(printf '%s\n' "$listing") <(printf '%s\n' "$expected"))
@@ -276,6 +325,10 @@ lib_listing=$(ignored_in "$CRATE" --lib)
 lib_names=()
 for entry in "${MANIFEST_LIB[@]}"; do lib_names+=("${entry##* }"); done
 check_membership "library" "$lib_listing" "$(printf '%s\n' "${lib_names[@]}" | sort)"
+for gate in "${GATES_FP8_PROFILE[@]}"; do
+  gate_is_in "$gate" "${lib_names[@]}" || die \
+    "the fp8 storage profile names a gate outside the library manifest: $gate"
+done
 
 kernels_listing=$(ignored_in "$KERNELS_CRATE" --lib)
 [ -n "$kernels_listing" ] || die "could not list the kernels library's ignored gates"
@@ -283,6 +336,13 @@ kernels_names=()
 for entry in "${GATES_KERNELS[@]}"; do kernels_names+=("${entry##* }"); done
 check_membership "kernels library" "$kernels_listing" \
   "$(printf '%s\n' "${kernels_names[@]}" | sort)"
+
+kernels_pool_listing=$(listed_in "$KERNELS_CRATE" --test hd256_fp8_pool)
+[ -n "$kernels_pool_listing" ] || die "could not list the kernels hd256_fp8_pool integration gates"
+kernels_pool_names=()
+for entry in "${GATES_KERNELS_HD256_FP8_POOL[@]}"; do kernels_pool_names+=("${entry##* }"); done
+check_membership "kernels integration binary hd256_fp8_pool" "$kernels_pool_listing" \
+  "$(printf '%s\n' "${kernels_pool_names[@]}" | sort)"
 
 # The integration binaries the crate actually has, so adding one without a
 # manifest entry fails here instead of leaving its gates unowned.
@@ -320,6 +380,9 @@ done
 for entry in "${GATES_KERNELS[@]}"; do
   append_gate "${entry%% *}" kernels "${entry##* }"
 done
+for entry in "${GATES_KERNELS_HD256_FP8_POOL[@]}"; do
+  append_gate "${entry%% *}" kernels:hd256_fp8_pool "${entry##* }"
+done
 manifest_gate_count=${#all_gates[@]}
 for entry in "${GATES_DENSE_AND_ROUTED[@]}"; do
   routed_needs=${entry%% *}
@@ -330,6 +393,10 @@ done
 filter=${1:-}
 selected=()
 for entry in "${all_gates[@]}"; do
+  if [ "$gate_storage" = fp8 ]; then
+    gate=${entry##*|}
+    gate_is_in "$gate" "${GATES_FP8_PROFILE[@]}" || continue
+  fi
   [ -z "$filter" ] || [[ ${entry##*|} == *"$filter"* ]] || continue
   selected+=("$entry")
 done
@@ -360,9 +427,16 @@ failed=()
 for entry in "${selected[@]}"; do
   IFS='|' read -r _needs target profile gate <<<"$entry"
   test_crate=$CRATE
+  require_gpu_env=0
+  ignored_args=(--ignored)
   if [ "$target" = kernels ]; then
     test_crate=$KERNELS_CRATE
     target_args=(--lib)
+  elif [[ $target == kernels:* ]]; then
+    test_crate=$KERNELS_CRATE
+    target_args=(--test "${target#kernels:}")
+    require_gpu_env=1
+    ignored_args=()
   elif [ "$target" = lib ]; then
     target_args=(--lib)
   else
@@ -375,10 +449,13 @@ for entry in "${selected[@]}"; do
     device) ;;
     *) die "unknown execution profile $profile" ;;
   esac
+  if [ "$require_gpu_env" -eq 1 ]; then
+    model_env=(env PEGAINFER_REQUIRE_GPU=1)
+  fi
   echo "--- [$profile] $gate"
   if "${model_env[@]}" cargo test --release -p "$test_crate" --features "$FEATURE" \
       "${target_args[@]}" -- \
-      --ignored --exact "$gate" --test-threads=1 --nocapture 2>&1 | tail -20; then
+      "${ignored_args[@]}" --exact "$gate" --test-threads=1 --nocapture 2>&1 | tail -20; then
     completed=$((completed + 1))
   else
     failed+=("[$profile] $gate")

@@ -19,6 +19,7 @@ use cudarc::driver::CudaSlice;
 use half::bf16;
 use pegainfer_core::cuda_graph::CudaGraphState;
 use pegainfer_core::kv_pool::KvPool;
+use pegainfer_core::kv_pool::KvStorage;
 use pegainfer_core::ops;
 use pegainfer_core::ops::PrefillPagedPlan;
 use pegainfer_core::rope::RopeTableSpec;
@@ -313,6 +314,11 @@ fn copy_pool_pages(
     dst: &[i32],
 ) -> Result<()> {
     use cudarc::driver::DevicePtr;
+    // Page copies index bf16 elements, so only a bf16 pool may reach them.
+    anyhow::ensure!(
+        layout.storage == KvStorage::Bf16,
+        "pool page copies index bf16 elements; the fp8 pool must not reach them"
+    );
     anyhow::ensure!(
         src.len() == dst.len(),
         "page copy list mismatch: {} src vs {} dst",
@@ -714,6 +720,7 @@ impl GemmaServe {
         ctx: &DeviceContext,
         weights: Gemma4Weights,
         max_context: usize,
+        local_kv_storage: KvStorage,
         local_pages: usize,
         global_pages: usize,
     ) -> Result<Self> {
@@ -744,13 +751,14 @@ impl GemmaServe {
                 }
             })
             .collect();
-        let local_pool = KvPool::new(
+        let local_pool = KvPool::with_storage(
             ctx,
             locals,
             config.num_key_value_heads,
             config.head_dim,
             PAGE_SIZE,
             local_pages,
+            local_kv_storage,
         )?;
         let global_pool = KvPool::new(
             ctx,
