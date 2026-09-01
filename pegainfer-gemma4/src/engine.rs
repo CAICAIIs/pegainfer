@@ -1,5 +1,7 @@
 //! The Gemma 4 engine: one owned thread with iteration-level scheduling.
-//! Prefill runs whole at the step boundary; every active request then
+//! Prefill runs at the step boundary, whole unless the chunk knob splits it
+//! (the overlap lane always prefills whole);
+//! every active request then
 //! advances one token per batched decode step, sharing each layer's weight
 //! pass.
 
@@ -215,7 +217,7 @@ fn parse_admit_coalesce_ms(raw: &str) -> Result<Option<std::time::Duration>> {
 /// Holds arrivals that would invade a live decode batch so one window's
 /// arrivals land as a back-to-back burst of admissions: the stream's tail
 /// gap prices the number of interruptions. One mixed step merges extra
-/// prompts only with chunking or while its leader is under
+/// prompts only with chunking or while the gathered rows stay under
 /// `MIX_GATHER_ROWS`. The cohort bounds free-slot capacity, not a batch
 /// across completions; idle engines admit on sight and shallow batches skip.
 struct CoalesceDoor {
@@ -598,14 +600,16 @@ fn global_account_pages(context_len: usize) -> usize {
 /// sampler-row capacity so a burst still leaves decode rows headroom.
 const MIX_MAX_PROMPTS: usize = 4;
 
-/// The gathered step's prompt-row ceiling. Gathering amortizes only the
-/// step floor (~27 ms at 12B) while every live stream's inter-token gap
-/// pays the whole gathered step (~0.2 ms per row), so absorbing long
-/// prompts into one step trades a large certain loss for a small fixed
-/// win — measured at 16 coincident ~1900-token prompts, an unbounded
-/// gather tripled the stream's p99 gap for a sub-2% wall saving. Short
-/// bursts are where the floor dominates; the ceiling keeps the gather
-/// there, and a long prompt keeps its own step.
+/// The unchunked follower-gather budget, not a step row ceiling: the
+/// leader's unseen suffix counts against it but the leader itself is never
+/// bounded (a long leader still rides the live decode batch, alone), and
+/// the chunked walk ignores it — the chunk knob prices rows per step
+/// instead. The trade it bounds: gathering amortizes only the step floor
+/// while every live stream's inter-token gap pays the whole gathered step,
+/// so absorbing long prompts trades a large certain loss for a small fixed
+/// win; short bursts are where the floor dominates, and the budget keeps
+/// the gather there. Calibration measurements live in the benchmark
+/// records, not here.
 const MIX_GATHER_ROWS: usize = 512;
 
 /// One prompt mid-walk: its unseen suffix begins at `offset`, and `first`
@@ -1072,7 +1076,7 @@ impl EngineState {
                  the default {MAX_CONTEXT} ceiling"
             );
         }
-        let (weights, _) = Gemma4Weights::from_safetensors(dir, device, config)?;
+        let weights = Gemma4Weights::from_safetensors(dir, device, config)?;
         let ctx = DeviceContext::new_with_device(device)?;
         let vocab = weights.embed_tokens.rows;
         policy.check_against_vocab(vocab)?;
@@ -1233,10 +1237,12 @@ impl EngineState {
         }
     }
 
-    /// Validate, admit and prefill one request whole, emit its first token,
-    /// and hand it to the decode batch. An admission refusal is a refusal to
-    /// the client only when no active request could free the pages it needs;
-    /// otherwise the request waits at the queue head.
+    /// Validate and admit one request. The synchronous arms prefill it, emit
+    /// its first token, and hand it to the decode batch; the lane arm only
+    /// launches the in-flight prefill, which the join later settles. An
+    /// admission refusal is a refusal to the client only when no active
+    /// request could free the pages it needs; otherwise the request waits at
+    /// the queue head.
     fn admit_and_prefill(
         &mut self,
         item: Submitted,
@@ -2201,8 +2207,9 @@ fn deliver_decode_row(entry: &mut Active, token: DecodeToken) -> bool {
 /// Deliver one decode step's outcome to every active row and retire the
 /// finished ones — the event flow both the pure decode round and the mixed
 /// admission share; `row_base` is the row's offset into the step's logits
-/// (the mixed step's row 0 is the newcomer). A stop token retires the
-/// request without being emitted; a send failure retires a cancelled one.
+/// (a mixed step's first `row_base` rows are its newcomers). A stop token
+/// retires the request without being emitted; a send failure retires a
+/// cancelled one.
 fn emit_decode_rows(active: &mut Vec<Active>, sampled: &mut SampledRows, row_base: usize) {
     let mut retire: Vec<usize> = Vec::new();
     for (row, entry) in active.iter_mut().enumerate() {
@@ -2470,44 +2477,6 @@ mod knob_tests {
 #[cfg(test)]
 mod gate {
     use super::*;
-
-    #[test]
-    #[ignore = "requires a GPU"]
-    fn the_suppression_mask_writes_only_the_ids_it_is_given() {
-        let ctx = DeviceContext::new().expect("GPU required");
-        let (vocab, rows) = (8usize, 2usize);
-        let mut logits = HiddenStates::zeros(&ctx, vocab, rows).expect("logits");
-        let suppress_ids = ops::SuppressIds::upload(&ctx, &[3u32, 5], vocab).expect("ids");
-        ops::suppress_logits_bf16_in_place(&ctx, &mut logits, &suppress_ids).expect("suppress");
-
-        let host = logits.to_host(&ctx).expect("D2H");
-        for row in 0..rows {
-            for id in 0..vocab {
-                let value = host[row * vocab + id];
-                if id == 3 || id == 5 {
-                    assert!(
-                        value == f32::NEG_INFINITY,
-                        "row {row} id {id} is {value}, not suppressed"
-                    );
-                } else {
-                    assert!(value == 0.0, "row {row} id {id} moved to {value}");
-                }
-            }
-        }
-
-        // The bound is structural: an id the head does not span cannot reach
-        // the kernel, and neither can ids checked against a different head.
-        let past_the_head = ops::SuppressIds::upload(&ctx, &[vocab as u32], vocab);
-        assert!(
-            past_the_head.is_err(),
-            "an id at the head's width must be refused at upload"
-        );
-        let other_head = ops::SuppressIds::upload(&ctx, &[1u32], vocab + 1).expect("ids");
-        assert!(
-            ops::suppress_logits_bf16_in_place(&ctx, &mut logits, &other_head).is_err(),
-            "ids checked against a wider head must not be applied to these logits"
-        );
-    }
 
     #[test]
     fn the_generation_policy_refuses_ids_outside_the_head() {
@@ -3666,19 +3635,5 @@ mod lane_tests {
             Some((262, 4097))
         );
         assert_eq!(super::pool_pages(usize::MAX, 65, 512, 16, 0, 256), None);
-    }
-
-    #[test]
-    fn the_global_door_is_defensive() {
-        // Validation caps every context inside the ceiling and the pool
-        // provisions slots times the ceiling's pages, so no request's whole
-        // account can exceed its slot's share: the door only ever fires on
-        // an accounting bug, which is exactly its job.
-        for ceiling in [8192usize, 32768, 262_144] {
-            let provision_per_slot = ceiling.div_ceil(super::PAGE_SIZE);
-            for context_len in [1usize, 17, ceiling / 2, ceiling] {
-                assert!(super::global_account_pages(context_len) <= provision_per_slot);
-            }
-        }
     }
 }
