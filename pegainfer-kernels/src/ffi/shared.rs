@@ -24,11 +24,71 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    pub fn rms_norm_batched_dual_cuda(
+        x: *const Half,
+        weight_a: *const Half,
+        weight_b: *const Half,
+        out_a: *mut Half,
+        out_b: *mut Half,
+        hidden_dim: i32,
+        seq_len: i32,
+        eps: f32,
+        scale_a: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn dual_rms_norm_add_batched_cuda(
+        a: *const Half,
+        weight_a: *const Half,
+        b: *const Half,
+        weight_b: *const Half,
+        out: *mut Half,
+        hidden_dim: i32,
+        seq_len: i32,
+        eps: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn rms_norm_add_rms_norm_round_batched_cuda(
+        x: *const Half,
+        weight_post: *const Half,
+        res_in: *const Half,
+        weight_pre: *const Half,
+        residual_out: *mut Half,
+        out: *mut Half,
+        hidden_dim: i32,
+        seq_len: i32,
+        eps: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn rms_norm_add_scale_batched_cuda(
+        x: *const Half,
+        weight: *const Half,
+        residual: *const Half,
+        out: *mut Half,
+        hidden_dim: i32,
+        seq_len: i32,
+        eps: f32,
+        scale: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn add_cuda(
         a: *const Half,
         b: *const Half,
         out: *mut Half,
         n: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn advance_decode_metadata_cuda(
+        positions: *mut i32,
+        local_last: *mut i32,
+        pseudo_last: *mut i32,
+        kv_chunk: *mut i32,
+        rows: i32,
+        factor: i32,
         stream: CUstream,
     ) -> CUresult;
 
@@ -143,6 +203,15 @@ unsafe extern "C" {
         buf: *mut Half,
         cap: f32,
         n: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn suppress_logits_bf16_in_place_cuda(
+        logits: *mut Half,
+        ids: *const u32,
+        vocab: i32,
+        rows: i32,
+        id_count: i32,
         stream: CUstream,
     ) -> CUresult;
 
@@ -261,6 +330,28 @@ unsafe extern "C" {
         ldb: i32,
         stride_b: i64,
         c: *mut Half,
+        ldc: i32,
+        stride_c: i64,
+        batch_count: i32,
+        stream: CUstream,
+    ) -> i32;
+
+    /// cuBLAS `cublasGemmStridedBatchedEx` (f32 in/out, f32 compute). `beta`
+    /// selects overwrite (0.0) vs accumulate-into-C (1.0).
+    pub fn gemm_strided_batched_f32_cuda(
+        op_a: i32,
+        op_b: i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        a: *const f32,
+        lda: i32,
+        stride_a: i64,
+        b: *const f32,
+        ldb: i32,
+        stride_b: i64,
+        beta: f32,
+        c: *mut f32,
         ldc: i32,
         stride_c: i64,
         batch_count: i32,
@@ -1098,6 +1189,65 @@ unsafe extern "C" {
     ) -> i32;
 
     pub fn qkv_norm_rope_paged_decode_hd256_plain_cuda(
+        q_batch: *const Half,
+        k_batch: *const Half,
+        v_batch: *const Half,
+        q_norm_weight: *const Half,
+        k_norm_weight: *const Half,
+        cos_cache: *const Half,
+        sin_cache: *const Half,
+        q_batch_out: *mut Half,
+        kv_data: *mut Half,
+        k_offset_elems: i64,
+        v_offset_elems: i64,
+        page_indices: *const i32,
+        page_indices_len: i32,
+        page_indptr: *const i32,
+        page_origins: *const i32,
+        positions: *const i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        batch: i32,
+        cos_max_pos: i32,
+        rotary_dim: i32,
+        rms_eps: f32,
+        page_size: i32,
+        num_pages: i32,
+        stride_page: i64,
+        stream: CUstream,
+    ) -> i32;
+
+    /// E4m3 KV twin.
+    pub fn qkv_norm_rope_paged_prefill_hd256_plain_fp8kv_cuda(
+        q_batch: *const Half,
+        k_batch: *const Half,
+        v_batch: *const Half,
+        q_norm_weight: *const Half,
+        k_norm_weight: *const Half,
+        cos_cache: *const Half,
+        sin_cache: *const Half,
+        q_batch_out: *mut Half,
+        kv_data: *mut Half,
+        k_offset_elems: i64,
+        v_offset_elems: i64,
+        page_indices: *const i32,
+        page_indices_len: i32,
+        page_origin: i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        seq_len: i32,
+        start_pos: i32,
+        cos_max_pos: i32,
+        rotary_dim: i32,
+        rms_eps: f32,
+        page_size: i32,
+        num_pages: i32,
+        stride_page: i64,
+        stream: CUstream,
+    ) -> i32;
+
+    /// E4m3 KV twin.
+    pub fn qkv_norm_rope_paged_decode_hd256_plain_fp8kv_cuda(
         q_batch: *const Half,
         k_batch: *const Half,
         v_batch: *const Half,

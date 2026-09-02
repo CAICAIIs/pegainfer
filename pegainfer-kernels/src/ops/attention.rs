@@ -5,6 +5,7 @@ use cudarc::driver::DevicePtrMut;
 use half::bf16;
 
 use crate::ffi;
+use crate::paged_kv::KvStorage;
 use crate::paged_kv::PagedKvLayout;
 use crate::tensor::DeviceContext;
 use crate::tensor::DeviceVec;
@@ -109,6 +110,9 @@ impl PrefillPagedPlan {
     }
     pub fn kv_chunk_size_d(&self) -> &CudaSlice<i32> {
         &self.kv_chunk_size_d
+    }
+    pub fn decode_metadata_d_mut(&mut self) -> (&mut CudaSlice<i32>, &mut CudaSlice<i32>) {
+        (&mut self.last_page_len_d, &mut self.kv_chunk_size_d)
     }
     pub fn total_num_rows_d(&self) -> &CudaSlice<u32> {
         &self.total_num_rows_d
@@ -602,9 +606,20 @@ pub fn prefill_attention_paged_into(
     let kv_dim = num_kv_heads * head_dim;
     let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
 
-    let k_offset = (layer * layout.layer_stride) as i64;
-    let v_offset = (layer * layout.layer_stride + layout.kv_block_len) as i64;
-    let stride_page = layout.page_stride as i64;
+    let PagedGeometry {
+        k_offset_elems: k_offset,
+        v_offset_elems: v_offset,
+        stride_page,
+        ..
+    } = checked_paged_geometry(
+        "paged prefill",
+        layout,
+        kv_buffer.len(),
+        layer,
+        head_dim,
+        num_kv_heads,
+        false,
+    )?;
 
     let (q_ptr, _gq) = q_batch.data.device_ptr_mut(&ctx.stream);
     let (k_ptr, _gk) = k_batch.data.device_ptr_mut(&ctx.stream);
@@ -1237,9 +1252,20 @@ pub fn paged_attention_batch_decode_into(
     let head_dim = layout.head_dim;
     let page_size = layout.page_size;
 
-    let k_offset = (layer * layout.layer_stride) as i64;
-    let v_offset = (layer * layout.layer_stride + layout.kv_block_len) as i64;
-    let stride_page = layout.page_stride as i64;
+    let PagedGeometry {
+        k_offset_elems: k_offset,
+        v_offset_elems: v_offset,
+        stride_page,
+        ..
+    } = checked_paged_geometry(
+        "batch decode",
+        layout,
+        kv_buffer.len(),
+        layer,
+        head_dim,
+        num_kv_heads,
+        false,
+    )?;
 
     let (buf_ptr, _gbuf) = kv_buffer.device_ptr(&ctx.stream);
     let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
@@ -1387,9 +1413,20 @@ pub fn paged_attention_batch_decode_split_kv_into(
     let head_dim = layout.head_dim;
     let page_size = layout.page_size;
 
-    let k_offset = (layer * layout.layer_stride) as i64;
-    let v_offset = (layer * layout.layer_stride + layout.kv_block_len) as i64;
-    let stride_page = layout.page_stride as i64;
+    let PagedGeometry {
+        k_offset_elems: k_offset,
+        v_offset_elems: v_offset,
+        stride_page,
+        ..
+    } = checked_paged_geometry(
+        "batch split-K decode",
+        layout,
+        kv_buffer.len(),
+        layer,
+        head_dim,
+        num_kv_heads,
+        false,
+    )?;
 
     let (buf_ptr, _gbuf) = kv_buffer.device_ptr(&ctx.stream);
     let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
@@ -1505,9 +1542,20 @@ fn scatter_decode_kv_into_paged(
     let head_dim = layout.head_dim;
     let page_size = layout.page_size;
 
-    let k_offset = (layer * layout.layer_stride) as i64;
-    let v_offset = (layer * layout.layer_stride + layout.kv_block_len) as i64;
-    let stride_page = layout.page_stride as i64;
+    let PagedGeometry {
+        k_offset_elems: k_offset,
+        v_offset_elems: v_offset,
+        stride_page,
+        ..
+    } = checked_paged_geometry(
+        op_name,
+        layout,
+        kv_buffer.len(),
+        layer,
+        head_dim,
+        num_kv_heads,
+        false,
+    )?;
 
     let (buf_ptr, _gbuf) = kv_buffer.device_ptr(&ctx.stream);
     let (k_ptr, _gk) = k.data.device_ptr(&ctx.stream);
@@ -1577,9 +1625,20 @@ pub fn paged_attention_batch_decode_hd256_into(
     debug_assert_eq!(head_dim, 256);
     let page_size = layout.page_size;
 
-    let k_offset = (layer * layout.layer_stride) as i64;
-    let v_offset = (layer * layout.layer_stride + layout.kv_block_len) as i64;
-    let stride_page = layout.page_stride as i64;
+    let PagedGeometry {
+        k_offset_elems: k_offset,
+        v_offset_elems: v_offset,
+        stride_page,
+        ..
+    } = checked_paged_geometry(
+        "batch hd256 decode",
+        layout,
+        kv_buffer.len(),
+        layer,
+        head_dim,
+        num_kv_heads,
+        false,
+    )?;
 
     let (buf_ptr, _gbuf) = kv_buffer.device_ptr(&ctx.stream);
     let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
@@ -1684,9 +1743,20 @@ pub fn paged_attention_batch_decode_via_prefill_hd256_into(
         "batch hd256 decode via prefill",
     )?;
 
-    let k_offset = (layer * layout.layer_stride) as i64;
-    let v_offset = (layer * layout.layer_stride + layout.kv_block_len) as i64;
-    let stride_page = layout.page_stride as i64;
+    let PagedGeometry {
+        k_offset_elems: k_offset,
+        v_offset_elems: v_offset,
+        stride_page,
+        ..
+    } = checked_paged_geometry(
+        "batch hd256 decode via prefill",
+        layout,
+        kv_buffer.len(),
+        layer,
+        head_dim,
+        num_kv_heads,
+        false,
+    )?;
     let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
 
     let (buf_ptr, _gbuf) = kv_buffer.device_ptr(&ctx.stream);
@@ -1847,6 +1917,7 @@ pub fn paged_attention_batch_decode_split_kv_hd512_into(
         layer,
         512,
         num_kv_heads,
+        false,
     )?;
     anyhow::ensure!(
         row_offset < q.seq_len,
@@ -2124,9 +2195,20 @@ pub fn paged_attention_batch_decode_via_prefill_hd512_into(
         "batch hd512 decode via prefill",
     )?;
 
-    let k_offset = (layer * layout.layer_stride) as i64;
-    let v_offset = (layer * layout.layer_stride + layout.kv_block_len) as i64;
-    let stride_page = layout.page_stride as i64;
+    let PagedGeometry {
+        k_offset_elems: k_offset,
+        v_offset_elems: v_offset,
+        stride_page,
+        ..
+    } = checked_paged_geometry(
+        "batch hd512 decode via prefill",
+        layout,
+        kv_buffer.len(),
+        layer,
+        head_dim,
+        num_kv_heads,
+        false,
+    )?;
 
     let (buf_ptr, _gbuf) = kv_buffer.device_ptr(&ctx.stream);
     let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
@@ -2276,9 +2358,20 @@ pub fn batch_prefill_paged_hd512_into(
         kernel_cta_tile_q
     );
 
-    let k_offset = (layer * layout.layer_stride) as i64;
-    let v_offset = (layer * layout.layer_stride + layout.kv_block_len) as i64;
-    let stride_page = layout.page_stride as i64;
+    let PagedGeometry {
+        k_offset_elems: k_offset,
+        v_offset_elems: v_offset,
+        stride_page,
+        ..
+    } = checked_paged_geometry(
+        "hd512 prefill",
+        layout,
+        kv_buffer.len(),
+        layer,
+        head_dim,
+        num_kv_heads,
+        false,
+    )?;
 
     let (buf_ptr, _gbuf) = kv_buffer.device_ptr(&ctx.stream);
     let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
@@ -2368,6 +2461,7 @@ pub fn batch_prefill_paged_window_hd256_into(
         layer,
         256,
         num_kv_heads,
+        true,
     )?;
     anyhow::ensure!(
         plan.max_page_index < geometry.num_pages,
@@ -2468,38 +2562,80 @@ pub fn batch_prefill_paged_window_hd256_into(
     let (kcs_ptr, _gkcs) = plan.kv_chunk_size_d.device_ptr(&ctx.stream);
     let (tnr_ptr, _gtnr) = plan.total_num_rows_d.device_ptr(&ctx.stream);
 
-    let result = unsafe {
-        ffi::batch_prefill_paged_window_cuda_hd256(
-            q_ptr as *const ffi::Half,
-            out_ptr as *mut ffi::Half,
-            buf_ptr as *const ffi::Half,
-            geometry.k_offset_elems,
-            geometry.v_offset_elems,
-            pi_ptr as *const i32,
-            pip_ptr as *const i32,
-            lpl_ptr as *const i32,
-            qi_ptr as *const i32,
-            ri_ptr as *const i32,
-            qti_ptr as *const i32,
-            kti_ptr as *const i32,
-            kcs_ptr as *const i32,
-            tnr_ptr as *const u32,
-            num_qo_heads_i32,
-            num_kv_heads_i32,
-            256,
-            geometry.page_size,
-            total_tokens_i32,
-            plan.batch_size(),
-            plan.num_tiles,
-            geometry.stride_page,
-            sm_scale,
-            window_left,
-            crate::tensor::active_cu_stream(ctx),
-        )
+    let (result, entry_point) = match layout.storage {
+        KvStorage::E4m3 => {
+            #[cfg(feature = "gemma4")]
+            let result = unsafe {
+                ffi::gemma4_batch_prefill_paged_window_hd256_fp8kv_cuda(
+                    q_ptr as *const ffi::Half,
+                    out_ptr as *mut ffi::Half,
+                    buf_ptr as *const core::ffi::c_void,
+                    geometry.k_offset_elems,
+                    geometry.v_offset_elems,
+                    pi_ptr as *const i32,
+                    pip_ptr as *const i32,
+                    lpl_ptr as *const i32,
+                    qi_ptr as *const i32,
+                    ri_ptr as *const i32,
+                    qti_ptr as *const i32,
+                    kti_ptr as *const i32,
+                    kcs_ptr as *const i32,
+                    tnr_ptr as *const u32,
+                    num_qo_heads_i32,
+                    num_kv_heads_i32,
+                    256,
+                    geometry.page_size,
+                    total_tokens_i32,
+                    plan.batch_size(),
+                    plan.num_tiles,
+                    geometry.stride_page,
+                    sm_scale,
+                    0,
+                    window_left,
+                    crate::tensor::active_cu_stream(ctx),
+                )
+            };
+            #[cfg(not(feature = "gemma4"))]
+            anyhow::bail!("hd256 windowed batch prefill: fp8 KV needs the gemma4 feature");
+            #[cfg(feature = "gemma4")]
+            (result, "gemma4_batch_prefill_paged_window_hd256_fp8kv_cuda")
+        }
+        KvStorage::Bf16 => (
+            unsafe {
+                ffi::batch_prefill_paged_window_cuda_hd256(
+                    q_ptr as *const ffi::Half,
+                    out_ptr as *mut ffi::Half,
+                    buf_ptr as *const ffi::Half,
+                    geometry.k_offset_elems,
+                    geometry.v_offset_elems,
+                    pi_ptr as *const i32,
+                    pip_ptr as *const i32,
+                    lpl_ptr as *const i32,
+                    qi_ptr as *const i32,
+                    ri_ptr as *const i32,
+                    qti_ptr as *const i32,
+                    kti_ptr as *const i32,
+                    kcs_ptr as *const i32,
+                    tnr_ptr as *const u32,
+                    num_qo_heads_i32,
+                    num_kv_heads_i32,
+                    256,
+                    geometry.page_size,
+                    total_tokens_i32,
+                    plan.batch_size(),
+                    plan.num_tiles,
+                    geometry.stride_page,
+                    sm_scale,
+                    window_left,
+                    crate::tensor::active_cu_stream(ctx),
+                )
+            },
+            "batch_prefill_paged_window_cuda_hd256",
+        ),
     };
     if result != 0 {
         anyhow::bail!(
-            "batch_prefill_paged_window_cuda_hd256 failed for layer {layer}, \
+            "{entry_point} failed for layer {layer}, \
              bs={}, tiles={}, qo_heads={num_qo_heads}, kv_heads={num_kv_heads}, \
              window_left={window_left}: {result}{}",
             plan.batch_size(),
@@ -2764,7 +2900,21 @@ fn checked_paged_geometry(
     layer: usize,
     head_dim: usize,
     num_kv_heads: usize,
+    fp8_capable: bool,
 ) -> Result<PagedGeometry> {
+    // `pool_len` counts the pool's bf16 backing slots; an e4m3 pool packs two
+    // elements per slot. Only wrappers with an fp8 kernel twin may see one.
+    anyhow::ensure!(
+        fp8_capable || layout.storage == KvStorage::Bf16,
+        "{what} has no fp8 KV path; the layout carries {}-byte elements",
+        layout.storage.elem_bytes()
+    );
+    let pool_len = match layout.storage {
+        KvStorage::E4m3 => pool_len
+            .checked_mul(2)
+            .ok_or_else(|| anyhow::anyhow!("{what} fp8 pool element count overflows"))?,
+        KvStorage::Bf16 => pool_len,
+    };
     anyhow::ensure!(
         layout.head_dim == head_dim,
         "{what} layout.head_dim {} != {head_dim}",
@@ -2775,12 +2925,19 @@ fn checked_paged_geometry(
         "{what} layout.num_kv_heads {} != num_kv_heads {num_kv_heads}",
         layout.num_kv_heads
     );
+    // A zero head_dim makes every stride zero, and `pool_len / page_stride`
+    // below would panic on a layout that is otherwise self-consistent.
     anyhow::ensure!(
-        layout.page_size > 0 && layout.num_kv_heads > 0 && layout.num_layers > 0,
-        "{what} layout dims must be positive: page_size {} num_kv_heads {} num_layers {}",
+        layout.page_size > 0
+            && layout.num_kv_heads > 0
+            && layout.num_layers > 0
+            && layout.head_dim > 0,
+        "{what} layout dims must be positive: page_size {} num_kv_heads {} num_layers {} \
+         head_dim {}",
         layout.page_size,
         layout.num_kv_heads,
-        layout.num_layers
+        layout.num_layers,
+        layout.head_dim
     );
     let kv_block_len = layout
         .page_size
@@ -2957,6 +3114,7 @@ pub fn qkv_norm_rope_paged_prefill_hd256_plain_into(
         layer,
         256,
         num_kv_heads,
+        true,
     )?;
     ensure_vec_backed(q_norm_weight, "hd256 paged prep q_norm_weight")?;
     ensure_vec_backed(k_norm_weight, "hd256 paged prep k_norm_weight")?;
@@ -3062,8 +3220,21 @@ pub fn qkv_norm_rope_paged_prefill_hd256_plain_into(
     let (pi_ptr, _gpi) = page_indices.device_ptr(&ctx.stream);
     let pi_ptr = pi_ptr + (pages_offset * std::mem::size_of::<i32>()) as u64;
 
+    // Two `if`s, not a tuple-building match: a fn item only coerces to a
+    // fn pointer across plain `if` arms.
+    let fp8 = layout.storage == KvStorage::E4m3;
+    let launch = if fp8 {
+        ffi::qkv_norm_rope_paged_prefill_hd256_plain_fp8kv_cuda
+    } else {
+        ffi::qkv_norm_rope_paged_prefill_hd256_plain_cuda
+    };
+    let entry_point = if fp8 {
+        "qkv_norm_rope_paged_prefill_hd256_plain_fp8kv_cuda"
+    } else {
+        "qkv_norm_rope_paged_prefill_hd256_plain_cuda"
+    };
     let result = unsafe {
-        ffi::qkv_norm_rope_paged_prefill_hd256_plain_cuda(
+        launch(
             q_ptr as *const ffi::Half,
             k_ptr as *const ffi::Half,
             v_ptr as *const ffi::Half,
@@ -3093,8 +3264,7 @@ pub fn qkv_norm_rope_paged_prefill_hd256_plain_into(
     };
     if result != 0 {
         anyhow::bail!(
-            "qkv_norm_rope_paged_prefill_hd256_plain_cuda failed with error \
-             {result}{}",
+            "{entry_point} failed with error {result}{}",
             crate::ops::ffi_exception_message(result)
         );
     }
@@ -3173,6 +3343,7 @@ pub fn qkv_norm_rope_paged_decode_hd256_plain_into(
         layer,
         256,
         num_kv_heads,
+        true,
     )?;
     ensure_vec_backed(q_norm_weight, "hd256 paged decode prep q_norm_weight")?;
     ensure_vec_backed(k_norm_weight, "hd256 paged decode prep k_norm_weight")?;
@@ -3247,8 +3418,21 @@ pub fn qkv_norm_rope_paged_decode_hd256_plain_into(
     let (og_ptr, _gog) = page_origins.device_ptr(&ctx.stream);
     let (ps_ptr, _gps) = positions.device_ptr(&ctx.stream);
 
+    // Two `if`s, not a tuple-building match: a fn item only coerces to a
+    // fn pointer across plain `if` arms.
+    let fp8 = layout.storage == KvStorage::E4m3;
+    let launch = if fp8 {
+        ffi::qkv_norm_rope_paged_decode_hd256_plain_fp8kv_cuda
+    } else {
+        ffi::qkv_norm_rope_paged_decode_hd256_plain_cuda
+    };
+    let entry_point = if fp8 {
+        "qkv_norm_rope_paged_decode_hd256_plain_fp8kv_cuda"
+    } else {
+        "qkv_norm_rope_paged_decode_hd256_plain_cuda"
+    };
     let result = unsafe {
-        ffi::qkv_norm_rope_paged_decode_hd256_plain_cuda(
+        launch(
             q_ptr as *const ffi::Half,
             k_ptr as *const ffi::Half,
             v_ptr as *const ffi::Half,
@@ -3279,8 +3463,7 @@ pub fn qkv_norm_rope_paged_decode_hd256_plain_into(
     };
     if result != 0 {
         anyhow::bail!(
-            "qkv_norm_rope_paged_decode_hd256_plain_cuda failed with error \
-             {result}{}",
+            "{entry_point} failed with error {result}{}",
             crate::ops::ffi_exception_message(result)
         );
     }
@@ -3503,6 +3686,7 @@ pub fn qk_norm_partial_rope_paged_prefill_hd512_into(
         layer,
         512,
         num_kv_heads,
+        false,
     )?;
     anyhow::ensure!(
         q_norm_weight.len == 512,
@@ -3688,6 +3872,7 @@ pub fn qk_norm_partial_rope_paged_decode_hd512_into(
         layer,
         512,
         num_kv_heads,
+        false,
     )?;
     ensure_vec_backed(q_norm_weight, "hd512 paged decode prep q_norm_weight")?;
     ensure_vec_backed(k_norm_weight, "hd512 paged decode prep k_norm_weight")?;
