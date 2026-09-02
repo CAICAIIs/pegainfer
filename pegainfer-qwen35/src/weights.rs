@@ -16,11 +16,6 @@ use pegainfer_core::tensor::HiddenStates;
 use pegainfer_core::weight_loader::WeightPrefetch;
 use pegainfer_core::weight_loader::deserialize_shards;
 use pegainfer_core::weight_loader::load_shard_info_fixed;
-use pegainfer_core::weight_loader::load_tensor_1d;
-use pegainfer_core::weight_loader::load_tensor_1d_f32;
-use pegainfer_core::weight_loader::load_tensor_2d;
-use pegainfer_core::weight_loader::load_tensor_2d_col_shard;
-use pegainfer_core::weight_loader::load_tensor_2d_row_shard;
 use pegainfer_core::weight_loader::mmap_shards;
 use safetensors::SafeTensors;
 
@@ -28,13 +23,13 @@ use super::config::Config35;
 use super::config::LayerType;
 use super::config::LocalGeometry;
 use super::config::TensorParallelConfig;
+#[cfg(test)]
+mod fixture;
 pub(crate) mod layers;
 pub(crate) use layers::FullAttentionLayer;
 pub(crate) use layers::LayerKind;
 pub(crate) use layers::LinearAttentionLayer;
-pub(crate) use layers::MLP35;
 pub(crate) use layers::TransformerBlock35;
-use layers::*;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ModelRuntimeConfig {
@@ -190,14 +185,10 @@ impl Qwen35Model {
         let t_gpu = Instant::now();
         // Weight prefix for Qwen3.5 text model
         let wp = "model.language_model";
+        let src = layers::WeightSource::new(&ctx, &shards, &weight_map, &config, geometry);
 
         debug!("Loading embeddings to GPU");
-        let embed_tokens = load_tensor_2d(
-            &ctx,
-            &shards,
-            &weight_map,
-            &format!("{}.embed_tokens.weight", wp),
-        )?;
+        let embed_tokens = src.tensor_2d(&format!("{}.embed_tokens.weight", wp))?;
         debug!(
             "embed_tokens: [{}, {}]",
             embed_tokens.rows, embed_tokens.cols
@@ -207,7 +198,7 @@ impl Qwen35Model {
             info!("output projection: tied embed_tokens");
             None
         } else {
-            let m = load_tensor_2d(&ctx, &shards, &weight_map, "lm_head.weight")?;
+            let m = src.tensor_2d("lm_head.weight")?;
             anyhow::ensure!(
                 m.rows == config.vocab_size && m.cols == config.hidden_size,
                 "lm_head.weight is [{}, {}], expected [vocab {}, hidden {}]",
@@ -225,187 +216,19 @@ impl Qwen35Model {
             config.num_hidden_layers
         );
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
-        let (_, q_rows) = geometry.shard_range(config.full_attn_q_dim());
-        let (kv_row_offset, kv_rows) = geometry.shard_range(config.full_attn_kv_dim());
-        let (inter_row_offset, inter_rows) = geometry.shard_range(config.intermediate_size);
         for i in 0..config.num_hidden_layers {
             let prefix = format!("{}.layers.{}", wp, i);
             let layer_type = config.layer_types[i];
-
-            let attn = match layer_type {
-                LayerType::FullAttention => {
-                    let attn_prefix = format!("{}.self_attn", prefix);
-                    LayerKind::FullAttention(FullAttentionLayer {
-                        q_proj: load_full_attention_gated_q_proj(
-                            &ctx,
-                            &shards,
-                            &weight_map,
-                            &format!("{}.q_proj.weight", attn_prefix),
-                            &config,
-                            geometry,
-                        )?,
-                        k_proj: load_tensor_2d_row_shard_if_needed(
-                            &ctx,
-                            &shards,
-                            &weight_map,
-                            &format!("{}.k_proj.weight", attn_prefix),
-                            geometry,
-                            kv_row_offset,
-                            kv_rows,
-                        )?,
-                        v_proj: load_tensor_2d_row_shard_if_needed(
-                            &ctx,
-                            &shards,
-                            &weight_map,
-                            &format!("{}.v_proj.weight", attn_prefix),
-                            geometry,
-                            kv_row_offset,
-                            kv_rows,
-                        )?,
-                        o_proj: load_tensor_2d_col_shard_if_needed(
-                            &ctx,
-                            &shards,
-                            &weight_map,
-                            &format!("{}.o_proj.weight", attn_prefix),
-                            geometry,
-                            geometry.shard_range(config.full_attn_q_dim()).0,
-                            q_rows,
-                        )?,
-                        q_norm: load_tensor_1d(
-                            &ctx,
-                            &shards,
-                            &weight_map,
-                            &format!("{}.q_norm.weight", attn_prefix),
-                        )?,
-                        k_norm: load_tensor_1d(
-                            &ctx,
-                            &shards,
-                            &weight_map,
-                            &format!("{}.k_norm.weight", attn_prefix),
-                        )?,
-                    })
-                }
-                LayerType::LinearAttention => {
-                    let attn_prefix = format!("{}.linear_attn", prefix);
-                    LayerKind::LinearAttention(LinearAttentionLayer {
-                        in_proj_qkv: load_tensor_2d(
-                            &ctx,
-                            &shards,
-                            &weight_map,
-                            &format!("{}.in_proj_qkv.weight", attn_prefix),
-                        )?,
-                        in_proj_z: load_tensor_2d(
-                            &ctx,
-                            &shards,
-                            &weight_map,
-                            &format!("{}.in_proj_z.weight", attn_prefix),
-                        )?,
-                        in_proj_b: load_tensor_2d(
-                            &ctx,
-                            &shards,
-                            &weight_map,
-                            &format!("{}.in_proj_b.weight", attn_prefix),
-                        )?,
-                        in_proj_a: load_tensor_2d(
-                            &ctx,
-                            &shards,
-                            &weight_map,
-                            &format!("{}.in_proj_a.weight", attn_prefix),
-                        )?,
-                        conv1d_weight: load_tensor_1d(
-                            &ctx,
-                            &shards,
-                            &weight_map,
-                            &format!("{}.conv1d.weight", attn_prefix),
-                        )?,
-                        dt_bias: load_tensor_1d(
-                            &ctx,
-                            &shards,
-                            &weight_map,
-                            &format!("{}.dt_bias", attn_prefix),
-                        )?,
-                        a_log: load_tensor_1d_f32(
-                            &ctx,
-                            &shards,
-                            &weight_map,
-                            &format!("{}.A_log", attn_prefix),
-                        )?,
-                        norm_weight: load_tensor_1d_f32(
-                            &ctx,
-                            &shards,
-                            &weight_map,
-                            &format!("{}.norm.weight", attn_prefix),
-                        )?,
-                        out_proj: load_tensor_2d(
-                            &ctx,
-                            &shards,
-                            &weight_map,
-                            &format!("{}.out_proj.weight", attn_prefix),
-                        )?,
-                    })
-                }
-            };
-
-            let gate_proj = load_tensor_2d_row_shard_if_needed(
-                &ctx,
-                &shards,
-                &weight_map,
-                &format!("{}.mlp.gate_proj.weight", prefix),
-                geometry,
-                inter_row_offset,
-                inter_rows,
-            )?;
-            let up_proj = load_tensor_2d_row_shard_if_needed(
-                &ctx,
-                &shards,
-                &weight_map,
-                &format!("{}.mlp.up_proj.weight", prefix),
-                geometry,
-                inter_row_offset,
-                inter_rows,
-            )?;
-            let gate_up_proj = DeviceMatrix::vstack(&ctx, &[&gate_proj, &up_proj])?;
-            drop(gate_proj);
-            drop(up_proj);
-
-            let block = TransformerBlock35 {
-                input_layernorm: load_tensor_1d(
-                    &ctx,
-                    &shards,
-                    &weight_map,
-                    &format!("{}.input_layernorm.weight", prefix),
-                )?,
-                attn,
-                post_attention_layernorm: load_tensor_1d(
-                    &ctx,
-                    &shards,
-                    &weight_map,
-                    &format!("{}.post_attention_layernorm.weight", prefix),
-                )?,
-                mlp: MLP35 {
-                    gate_up_proj,
-                    down_proj: load_tensor_2d_col_shard_if_needed(
-                        &ctx,
-                        &shards,
-                        &weight_map,
-                        &format!("{}.mlp.down_proj.weight", prefix),
-                        geometry,
-                        inter_row_offset,
-                        inter_rows,
-                    )?,
-                },
-            };
-
+            layers.push(TransformerBlock35::load(&src, &prefix, layer_type)?);
             debug!(
                 "Loaded layer {}/{}: {:?}",
                 i + 1,
                 config.num_hidden_layers,
                 layer_type
             );
-            layers.push(block);
         }
 
-        let norm = load_tensor_1d(&ctx, &shards, &weight_map, &format!("{}.norm.weight", wp))?;
+        let norm = src.tensor_1d(&format!("{}.norm.weight", wp))?;
 
         debug!(
             "Precomputing partial RoPE cache (rotary_dim={}, max_position_embeddings={})",
@@ -564,77 +387,28 @@ impl Qwen35Model {
         let linear_ba = self.config.linear_num_value_heads;
         let intermediate = geom.local_intermediate_size();
 
-        let full_q_samples: Vec<_> = self
-            .layers
-            .iter()
-            .filter_map(|layer| match &layer.attn {
-                LayerKind::FullAttention(attn) => Some((&attn.q_proj, 0)),
-                LayerKind::LinearAttention(_) => None,
-            })
-            .collect();
-        let full_kv_samples: Vec<_> = self
-            .layers
-            .iter()
-            .filter_map(|layer| match &layer.attn {
-                LayerKind::FullAttention(attn) => Some([(&attn.k_proj, 0), (&attn.v_proj, 0)]),
-                LayerKind::LinearAttention(_) => None,
-            })
-            .flatten()
-            .collect();
-        let full_o_samples: Vec<_> = self
-            .layers
-            .iter()
-            .filter_map(|layer| match &layer.attn {
-                LayerKind::FullAttention(attn) => Some((&attn.o_proj, 0)),
-                LayerKind::LinearAttention(_) => None,
-            })
-            .collect();
-        let linear_qkv_samples: Vec<_> = self
-            .layers
-            .iter()
-            .filter_map(|layer| match &layer.attn {
-                LayerKind::LinearAttention(attn) => Some((&attn.in_proj_qkv, 0)),
-                LayerKind::FullAttention(_) => None,
-            })
-            .collect();
-        let linear_z_samples: Vec<_> = self
-            .layers
-            .iter()
-            .filter_map(|layer| match &layer.attn {
-                LayerKind::LinearAttention(attn) => Some((&attn.in_proj_z, 0)),
-                LayerKind::FullAttention(_) => None,
-            })
-            .collect();
-        let linear_ba_samples: Vec<_> = self
-            .layers
-            .iter()
-            .filter_map(|layer| match &layer.attn {
-                LayerKind::LinearAttention(attn) => {
-                    Some([(&attn.in_proj_b, 0), (&attn.in_proj_a, 0)])
-                }
-                LayerKind::FullAttention(_) => None,
-            })
-            .flatten()
-            .collect();
-        let linear_out_samples: Vec<_> = self
-            .layers
-            .iter()
-            .filter_map(|layer| match &layer.attn {
-                LayerKind::LinearAttention(attn) => Some((&attn.out_proj, 0)),
-                LayerKind::FullAttention(_) => None,
-            })
-            .collect();
-        let gate_up_samples: Vec<_> = self
-            .layers
-            .iter()
-            .map(|layer| (&layer.mlp.gate_up_proj, 0))
-            .collect();
-        let down_samples: Vec<_> = self
-            .layers
-            .iter()
-            .map(|layer| (&layer.mlp.down_proj, 0))
-            .collect();
-        let lm_head_samples = [(self.output_projection(), 0)];
+        let full_attn = || {
+            self.layers
+                .iter()
+                .filter_map(|layer| layer.attn.full_attention())
+        };
+        let linear_attn = || {
+            self.layers
+                .iter()
+                .filter_map(|layer| layer.attn.linear_attention())
+        };
+        let full_q_samples = sample_mats(full_attn().map(|attn| &attn.q_proj));
+        let full_kv_samples =
+            sample_mats(full_attn().flat_map(|attn| [&attn.k_proj, &attn.v_proj]));
+        let full_o_samples = sample_mats(full_attn().map(|attn| &attn.o_proj));
+        let linear_qkv_samples = sample_mats(linear_attn().map(|attn| &attn.in_proj_qkv));
+        let linear_z_samples = sample_mats(linear_attn().map(|attn| &attn.in_proj_z));
+        let linear_ba_samples =
+            sample_mats(linear_attn().flat_map(|attn| [&attn.in_proj_b, &attn.in_proj_a]));
+        let linear_out_samples = sample_mats(linear_attn().map(|attn| &attn.out_proj));
+        let gate_up_samples = sample_mats(self.layers.iter().map(|layer| &layer.mlp.gate_up_proj));
+        let down_samples = sample_mats(self.layers.iter().map(|layer| &layer.mlp.down_proj));
+        let lm_head_samples = sample_mats([self.output_projection()]);
 
         for &n in super::batch_decode_graph::BATCH_BUCKETS
             .iter()
@@ -703,6 +477,13 @@ impl Qwen35Model {
     }
 }
 
+/// Wrap the matrices one tuning pass samples into cuBLASLt tune candidates.
+fn sample_mats<'a>(
+    mats: impl IntoIterator<Item = &'a DeviceMatrix>,
+) -> Vec<(&'a DeviceMatrix, usize)> {
+    mats.into_iter().map(|m| (m, 0)).collect()
+}
+
 fn tune_if_nonempty(
     ctx: &DeviceContext,
     samples: &[(&DeviceMatrix, usize)],
@@ -713,84 +494,4 @@ fn tune_if_nonempty(
         return Ok(());
     }
     crate::ops::gemm_lt_tune(ctx, samples, rows, n)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn test_config() -> Config35 {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("config.json"),
-            r#"{
-  "max_position_embeddings": 262144,
-  "tie_word_embeddings": true,
-  "text_config": {
-    "hidden_size": 2560,
-    "intermediate_size": 9216,
-    "num_hidden_layers": 1,
-    "num_attention_heads": 16,
-    "num_key_value_heads": 4,
-    "head_dim": 256,
-    "vocab_size": 248320,
-    "rms_norm_eps": 1e-6,
-    "layer_types": ["linear_attention"],
-    "linear_conv_kernel_dim": 4,
-    "linear_key_head_dim": 128,
-    "linear_num_key_heads": 16,
-    "linear_num_value_heads": 32,
-    "linear_value_head_dim": 128,
-    "rope_parameters": { "rope_theta": 10000.0, "partial_rotary_factor": 0.25 },
-    "eos_token_id": 151645
-  }
-}"#,
-        )
-        .unwrap();
-        Config35::from_file(dir.path().to_str().unwrap()).expect("fixture validates")
-    }
-
-    fn test_geometry(rank: usize, world_size: usize) -> LocalGeometry {
-        let config = test_config();
-        let tp = TensorParallelConfig::try_from((rank, world_size)).unwrap();
-        LocalGeometry::try_new(&config, tp, false).unwrap()
-    }
-
-    #[test]
-    fn gated_q_shard_range_keeps_matching_q_and_gate_rows() {
-        let config = test_config();
-
-        let rank0 = full_attention_gated_q_shard_range(&config, test_geometry(0, 2));
-        assert_eq!(
-            rank0,
-            GatedQShardRange {
-                row_offset: 0,
-                rows: 4096,
-            }
-        );
-
-        let rank1 = full_attention_gated_q_shard_range(&config, test_geometry(1, 2));
-        assert_eq!(
-            rank1,
-            GatedQShardRange {
-                row_offset: 4096,
-                rows: 4096,
-            }
-        );
-    }
-
-    #[test]
-    fn mlp_tp2_uses_matching_gate_up_rows_and_down_cols() {
-        let config = test_config();
-        let geom = test_geometry(1, 2);
-
-        let (inter_offset, inter_rows) = geom.shard_range(config.intermediate_size);
-        assert_eq!((inter_offset, inter_rows), (4608, 4608));
-        assert_eq!(geom.local_intermediate_size(), inter_rows);
-
-        let local_gate_up_rows = 2 * inter_rows;
-        let local_down_cols = inter_rows;
-        assert_eq!(local_gate_up_rows, 9216);
-        assert_eq!(local_down_cols, 4608);
-    }
 }
