@@ -53,19 +53,6 @@ pub(crate) enum LayerKind {
 }
 
 impl LayerKind {
-    pub(super) fn load(src: &WeightSource, prefix: &str, layer_type: LayerType) -> Result<Self> {
-        match layer_type {
-            LayerType::FullAttention => Ok(Self::FullAttention(FullAttentionLayer::load(
-                src,
-                &format!("{prefix}.self_attn"),
-            )?)),
-            LayerType::LinearAttention => Ok(Self::LinearAttention(LinearAttentionLayer::load(
-                src,
-                &format!("{prefix}.linear_attn"),
-            )?)),
-        }
-    }
-
     pub(super) fn full_attention(&self) -> Option<&FullAttentionLayer> {
         match self {
             Self::FullAttention(attn) => Some(attn),
@@ -117,9 +104,19 @@ impl TransformerBlock35 {
     /// Load one decoder block: `prefix` is the layer's tensor prefix (e.g.
     /// `model.language_model.layers.3`).
     pub(super) fn load(src: &WeightSource, prefix: &str, layer_type: LayerType) -> Result<Self> {
+        let attn = match layer_type {
+            LayerType::FullAttention => LayerKind::FullAttention(FullAttentionLayer::load(
+                src,
+                &format!("{prefix}.self_attn"),
+            )?),
+            LayerType::LinearAttention => LayerKind::LinearAttention(LinearAttentionLayer::load(
+                src,
+                &format!("{prefix}.linear_attn"),
+            )?),
+        };
         Ok(Self {
             input_layernorm: src.tensor_1d(&format!("{prefix}.input_layernorm.weight"))?,
-            attn: LayerKind::load(src, prefix, layer_type)?,
+            attn,
             post_attention_layernorm: src
                 .tensor_1d(&format!("{prefix}.post_attention_layernorm.weight"))?,
             mlp: MLP35::load(src, prefix)?,
@@ -280,15 +277,52 @@ fn full_attention_gated_q_shard_range(
 mod tests {
     use super::*;
 
+    fn test_config() -> Config35 {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{
+  "max_position_embeddings": 262144,
+  "tie_word_embeddings": true,
+  "text_config": {
+    "hidden_size": 2560,
+    "intermediate_size": 9216,
+    "num_hidden_layers": 1,
+    "num_attention_heads": 16,
+    "num_key_value_heads": 4,
+    "head_dim": 256,
+    "vocab_size": 248320,
+    "rms_norm_eps": 1e-6,
+    "layer_types": ["linear_attention"],
+    "linear_conv_kernel_dim": 4,
+    "linear_key_head_dim": 128,
+    "linear_num_key_heads": 16,
+    "linear_num_value_heads": 32,
+    "linear_value_head_dim": 128,
+    "rope_parameters": { "rope_theta": 10000.0, "partial_rotary_factor": 0.25 },
+    "eos_token_id": 151645
+  }
+}"#,
+        )
+        .unwrap();
+        Config35::from_file(dir.path().to_str().unwrap()).expect("fixture validates")
+    }
+
+    fn test_geometry(rank: usize, world_size: usize) -> LocalGeometry {
+        let config = test_config();
+        let tp = TensorParallelConfig::try_from((rank, world_size)).unwrap();
+        LocalGeometry::try_new(&config, tp, false).unwrap()
+    }
+
     #[test]
     fn gated_q_shard_range_keeps_matching_q_and_gate_rows() {
-        let config = fixture::test_config();
+        let config = test_config();
 
-        let rank0 = full_attention_gated_q_shard_range(&config, fixture::test_geometry(0, 2));
+        let rank0 = full_attention_gated_q_shard_range(&config, test_geometry(0, 2));
         assert_eq!(rank0, (0, 4096));
 
         // Rank 1 starts at its own first head's q rows, not the flat midpoint.
-        let rank1 = full_attention_gated_q_shard_range(&config, fixture::test_geometry(1, 2));
+        let rank1 = full_attention_gated_q_shard_range(&config, test_geometry(1, 2));
         assert_eq!(rank1, (4096, 4096));
     }
 }

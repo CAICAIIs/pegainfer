@@ -23,8 +23,6 @@ use super::config::Config35;
 use super::config::LayerType;
 use super::config::LocalGeometry;
 use super::config::TensorParallelConfig;
-#[cfg(test)]
-mod fixture;
 pub(crate) mod layers;
 pub(crate) use layers::FullAttentionLayer;
 pub(crate) use layers::LayerKind;
