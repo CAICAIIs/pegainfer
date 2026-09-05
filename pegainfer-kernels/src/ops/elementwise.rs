@@ -1,5 +1,6 @@
 use anyhow::Result;
 use anyhow::anyhow;
+use anyhow::bail;
 use cudarc::driver::CudaSlice;
 use cudarc::driver::DevicePtr;
 use cudarc::driver::DevicePtrMut;
@@ -45,6 +46,53 @@ pub fn add_batch_into(
     };
     result.result()?;
 
+    Ok(())
+}
+
+/// Advance the per-row decode tables written by a regular graph replay.
+pub fn advance_decode_metadata(
+    ctx: &DeviceContext,
+    positions: &mut CudaSlice<i32>,
+    local_last: &mut CudaSlice<i32>,
+    pseudo_last: &mut CudaSlice<i32>,
+    kv_chunk: &mut CudaSlice<i32>,
+    rows: usize,
+    factor: usize,
+) -> Result<()> {
+    anyhow::ensure!(rows > 0, "advance_decode_metadata: rows must be positive");
+    anyhow::ensure!(
+        factor > 0,
+        "advance_decode_metadata: factor must be positive"
+    );
+    let pseudo_rows = rows
+        .checked_mul(factor)
+        .filter(|n| i32::try_from(*n).is_ok())
+        .ok_or_else(|| anyhow!("advance_decode_metadata: rows x factor exceeds i32"))?;
+    anyhow::ensure!(
+        positions.len() >= rows
+            && local_last.len() >= rows
+            && kv_chunk.len() >= rows
+            && pseudo_last.len() >= pseudo_rows,
+        "advance_decode_metadata: {rows} rows x {factor} exceeds a table"
+    );
+    let rows = super::checked_i32(rows, "advance decode metadata rows")?;
+    let factor = super::checked_i32(factor, "advance decode metadata factor")?;
+    let (positions_ptr, _positions_guard) = positions.device_ptr_mut(&ctx.stream);
+    let (local_ptr, _local_guard) = local_last.device_ptr_mut(&ctx.stream);
+    let (pseudo_ptr, _pseudo_guard) = pseudo_last.device_ptr_mut(&ctx.stream);
+    let (chunk_ptr, _chunk_guard) = kv_chunk.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::advance_decode_metadata_cuda(
+            positions_ptr as *mut i32,
+            local_ptr as *mut i32,
+            pseudo_ptr as *mut i32,
+            chunk_ptr as *mut i32,
+            rows,
+            factor,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    result.result()?;
     Ok(())
 }
 
@@ -219,7 +267,7 @@ pub fn scaled_add_rows_token_range_into(
 pub fn gather_hidden_tokens_into(
     ctx: &DeviceContext,
     input: &HiddenStates,
-    token_indices: &CudaSlice<i32>,
+    token_indices: &impl DevicePtr<i32>,
     token_count: usize,
     out: &mut HiddenStates,
 ) -> Result<()> {
@@ -1040,6 +1088,74 @@ pub fn softcap_bf16_in_place(ctx: &DeviceContext, buf: &mut HiddenStates, cap: f
     Ok(())
 }
 
+/// Device-resident suppression ids that were held against a head width when
+/// they were uploaded. The kernel indexes `logits` by these ids without
+/// re-reading them on the host, so the bound has to be structural: this type
+/// is the only way to reach it, and it cannot be built without the check.
+pub struct SuppressIds {
+    ids: CudaSlice<u32>,
+    vocab: usize,
+}
+
+impl SuppressIds {
+    /// Upload `ids` for a head that spans `vocab` columns, refusing any id
+    /// the head does not contain.
+    pub fn upload(ctx: &DeviceContext, ids: &[u32], vocab: usize) -> Result<Self> {
+        for &id in ids {
+            if id as usize >= vocab {
+                bail!("suppression id {id} is outside the {vocab} columns the head spans");
+            }
+        }
+        let ids = ctx
+            .stream
+            .clone_htod(ids)
+            .map_err(|e| anyhow!("uploading suppression ids failed: {e}"))?;
+        Ok(Self { ids, vocab })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+}
+
+/// Write negative infinity into every `(row, id)` slot in `logits` with one
+/// launch.
+pub fn suppress_logits_bf16_in_place(
+    ctx: &DeviceContext,
+    logits: &mut HiddenStates,
+    ids: &SuppressIds,
+) -> Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    if logits.hidden_dim != ids.vocab {
+        bail!(
+            "suppression ids were checked against {} columns but these logits span {}",
+            ids.vocab,
+            logits.hidden_dim
+        );
+    }
+    logits.checked_extent("suppress_logits_bf16 logits")?;
+    let vocab = super::checked_i32(logits.hidden_dim, "suppression vocabulary")?;
+    let rows = super::checked_i32(logits.seq_len, "suppression rows")?;
+    let id_count = super::checked_i32(ids.ids.len(), "suppression id count")?;
+    let (logits_ptr, _logits_guard) = logits.data.device_ptr_mut(&ctx.stream);
+    let (ids_ptr, _ids_guard) = ids.ids.device_ptr(&ctx.stream);
+    let result = unsafe {
+        ffi::suppress_logits_bf16_in_place_cuda(
+            logits_ptr as *mut ffi::Half,
+            ids_ptr as *const u32,
+            vocab,
+            rows,
+            id_count,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    result
+        .result()
+        .map_err(|e| anyhow!("suppress_logits_bf16_in_place_cuda failed: {e}"))
+}
+
 /// In-place multiply by a host scalar — Gemma 4's per-layer `layer_scalar`,
 /// a `[1]` weight the model reads to the host at load.
 pub fn scale_bf16_in_place(ctx: &DeviceContext, buf: &mut HiddenStates, scale: f32) -> Result<()> {
@@ -1070,6 +1186,47 @@ mod tests {
     use half::bf16;
 
     use super::*;
+
+    /// The suppression contract, beside the kernel that owns it: writes are
+    /// exactly the given ids, the upload refuses an id at the head's width,
+    /// and ids validated against a different head never reach these logits.
+    #[test]
+    #[ignore = "requires a GPU"]
+    fn the_suppression_mask_writes_only_the_ids_it_is_given() {
+        let ctx = DeviceContext::new().expect("GPU required");
+        let (vocab, rows) = (8usize, 2usize);
+        let mut logits = HiddenStates::zeros(&ctx, vocab, rows).expect("logits");
+        let suppress_ids = SuppressIds::upload(&ctx, &[3u32, 5], vocab).expect("ids");
+        suppress_logits_bf16_in_place(&ctx, &mut logits, &suppress_ids).expect("suppress");
+
+        let host = logits.to_host(&ctx).expect("D2H");
+        for row in 0..rows {
+            for id in 0..vocab {
+                let value = host[row * vocab + id];
+                if id == 3 || id == 5 {
+                    assert!(
+                        value == f32::NEG_INFINITY,
+                        "row {row} id {id} is {value}, not suppressed"
+                    );
+                } else {
+                    assert!(value == 0.0, "row {row} id {id} moved to {value}");
+                }
+            }
+        }
+
+        // The bound is structural: an id the head does not span cannot reach
+        // the kernel, and neither can ids checked against a different head.
+        let past_the_head = SuppressIds::upload(&ctx, &[vocab as u32], vocab);
+        assert!(
+            past_the_head.is_err(),
+            "an id at the head's width must be refused at upload"
+        );
+        let other_head = SuppressIds::upload(&ctx, &[1u32], vocab + 1).expect("ids");
+        assert!(
+            suppress_logits_bf16_in_place(&ctx, &mut logits, &other_head).is_err(),
+            "ids checked against a wider head must not be applied to these logits"
+        );
+    }
 
     fn hidden_from_host(
         ctx: &DeviceContext,

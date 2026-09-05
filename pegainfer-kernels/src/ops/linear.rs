@@ -96,6 +96,84 @@ pub fn gemm_strided_batched_bf16(
     Ok(())
 }
 
+/// f32 strided-batched GEMM, same cuBLAS boundary as
+/// [`gemm_strided_batched_bf16`] but with f32 operands and an `accumulate`
+/// switch (`C += A·B` instead of `C = A·B`). The consumer is the K3 KCP state
+/// merge (per-head fp32 `S' = M·S + D`), which pre-fills `C` with `D` and
+/// accumulates the transition product in one call.
+#[allow(clippy::too_many_arguments, clippy::many_single_char_names)]
+pub fn gemm_strided_batched_f32(
+    ctx: &DeviceContext,
+    transpose_a: bool,
+    transpose_b: bool,
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &impl cudarc::driver::DevicePtr<f32>,
+    lda: usize,
+    stride_a: usize,
+    b: &impl cudarc::driver::DevicePtr<f32>,
+    ldb: usize,
+    stride_b: usize,
+    accumulate: bool,
+    c: &mut cudarc::driver::CudaSlice<f32>,
+    ldc: usize,
+    stride_c: usize,
+    batch: usize,
+) -> Result<()> {
+    ensure!(
+        m > 0 && n > 0 && k > 0 && batch > 0,
+        "gemm_strided_batched_f32 empty dims: m={m} n={n} k={k} batch={batch}"
+    );
+    ensure!(
+        a.len() >= stride_a * batch,
+        "gemm_strided_batched_f32 A too small: have {}, need {}",
+        a.len(),
+        stride_a * batch
+    );
+    ensure!(
+        b.len() >= stride_b * batch,
+        "gemm_strided_batched_f32 B too small: have {}, need {}",
+        b.len(),
+        stride_b * batch
+    );
+    ensure!(
+        c.len() >= stride_c * batch,
+        "gemm_strided_batched_f32 C too small: have {}, need {}",
+        c.len(),
+        stride_c * batch
+    );
+    let (a_ptr, _ga) = a.device_ptr(&ctx.stream);
+    let (b_ptr, _gb) = b.device_ptr(&ctx.stream);
+    let (c_ptr, _gc) = c.device_ptr_mut(&ctx.stream);
+    let status = unsafe {
+        ffi::gemm_strided_batched_f32_cuda(
+            i32::from(transpose_a),
+            i32::from(transpose_b),
+            m as i32,
+            n as i32,
+            k as i32,
+            a_ptr as *const f32,
+            lda as i32,
+            stride_a as i64,
+            b_ptr as *const f32,
+            ldb as i32,
+            stride_b as i64,
+            if accumulate { 1.0 } else { 0.0 },
+            c_ptr as *mut f32,
+            ldc as i32,
+            stride_c as i64,
+            batch as i32,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    ensure!(
+        status == 0,
+        "gemm_strided_batched_f32 failed: status={status} (m={m} n={n} k={k} batch={batch})"
+    );
+    Ok(())
+}
+
 #[allow(clippy::many_single_char_names, clippy::too_many_arguments)]
 pub fn gemm_bf16_f32(
     ctx: &DeviceContext,
@@ -381,6 +459,46 @@ pub fn gemm_rows_into_checked(
         x.seq_len,
         weight.cols,
         x.seq_len == 1,
+        ctx,
+    )
+}
+
+/// Row-range GEMM over a token span of `x`:
+/// `Y = W[row_offset..row_offset+num_rows, :] @ X[x_row0..x_row0+out.seq_len]`.
+/// The span length is `out.seq_len`; `x.seq_len` bounds the readable rows.
+pub fn gemm_rows_span_into_checked(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    row_offset: usize,
+    num_rows: usize,
+    x: &HiddenStates,
+    x_row0: usize,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    assert!(row_offset + num_rows <= weight.rows);
+    assert_eq!(weight.cols, x.hidden_dim);
+    assert_eq!(out.hidden_dim, num_rows);
+    assert!(
+        x_row0 + out.seq_len <= x.seq_len,
+        "x span [{x_row0}, {x_row0}+{}) exceeds x.seq_len {}",
+        out.seq_len,
+        x.seq_len
+    );
+
+    let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
+    let w_sub = w_ptr + (row_offset * weight.cols * std::mem::size_of::<half::bf16>()) as u64;
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let x_sub = x_ptr + (x_row0 * x.hidden_dim * std::mem::size_of::<half::bf16>()) as u64;
+    let (y_ptr, _gy) = out.data.device_ptr_mut(&ctx.stream);
+
+    launch_gemm(
+        w_sub as *const ffi::Half,
+        x_sub as *const ffi::Half,
+        y_ptr as *mut ffi::Half,
+        num_rows,
+        out.seq_len,
+        weight.cols,
+        out.seq_len == 1,
         ctx,
     )
 }
