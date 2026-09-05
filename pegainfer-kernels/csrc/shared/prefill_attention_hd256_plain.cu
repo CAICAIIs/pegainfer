@@ -19,6 +19,8 @@
 
 #include "common.cuh"
 #include "ffi_guard.cuh"
+#include "qk_prep.cuh"
+#include <cuda_fp8.h>
 
 #define HD256_PLAIN 256
 #define THREADS_HD256_PLAIN 256
@@ -28,17 +30,6 @@ __device__ __forceinline__ __nv_bfloat16 rms_norm_elem_hd256_plain(
     __nv_bfloat16 x, float rms_inv, __nv_bfloat16 weight) {
     float w = __bfloat162float(weight);
     return __float2bfloat16(__bfloat162float(x) * rms_inv * w);
-}
-
-__device__ __forceinline__ void apply_rope_pair_hd256_plain(
-    __nv_bfloat16& x0, __nv_bfloat16& x1,
-    __nv_bfloat16 cos_val, __nv_bfloat16 sin_val) {
-    float fx0 = __bfloat162float(x0);
-    float fx1 = __bfloat162float(x1);
-    float fc = __bfloat162float(cos_val);
-    float fs = __bfloat162float(sin_val);
-    x0 = __float2bfloat16(fx0 * fc - fx1 * fs);
-    x1 = __float2bfloat16(fx0 * fs + fx1 * fc);
 }
 
 __global__ void qk_norm_rope_prefill_hd256_plain_kernel(
@@ -105,7 +96,7 @@ __global__ void qk_norm_rope_prefill_hd256_plain_kernel(
     if (d < half_rotary) {
         __nv_bfloat16 lo = smem[d];
         __nv_bfloat16 hi = smem[d + half_rotary];
-        apply_rope_pair_hd256_plain(
+        apply_rope_pair(
             lo,
             hi,
             cos_cache[pos * rotary_dim + d],
@@ -134,33 +125,27 @@ __global__ void qk_norm_rope_prefill_hd256_plain_kernel(
     }
 }
 
-__device__ __forceinline__ int64_t paged_kv_offset_hd256_plain(
-    int page_id,
-    int64_t block_offset_elems,
-    int64_t stride_page,
-    int page_size,
-    int num_kv_heads,
-    int pos,
-    int kv_head,
-    int d) {
-    int offset_in_page = pos % page_size;
-    return static_cast<int64_t>(page_id) * stride_page
-        + block_offset_elems
-        + static_cast<int64_t>(offset_in_page) * num_kv_heads * HD256_PLAIN
-        + static_cast<int64_t>(kv_head) * HD256_PLAIN
-        + d;
-}
-
 // Paged serving prep. grid.y carries three bands: [0, num_q_heads) Q,
 // then num_kv_heads K, then num_kv_heads V. Q and K are plain-w normed
 // and rotated; V is weightless-normed over its own head vector (v_proj
 // output — a separate reduction, unlike the hd512 K=V fork) and never
 // rotated. K and V write straight into the pool's per-layer K/V blocks.
+template <typename KvT>
+__device__ __forceinline__ KvT kv_store_cast(__nv_bfloat16 x);
+template <>
+__device__ __forceinline__ __nv_bfloat16 kv_store_cast(__nv_bfloat16 x) {
+    return x;
+}
+template <>
+__device__ __forceinline__ __nv_fp8_e4m3 kv_store_cast(__nv_bfloat16 x) {
+    return __nv_fp8_e4m3(__bfloat162float(x));
+}
+
 // PER_TOKEN_META = true is the batched-decode form: token t is its own
 // request, so its absolute position, its page-table window (page_indices +
 // page_indptr[t]) and its released-front origin ride per-token arrays and
 // the scalar start_pos/page_origin are ignored.
-template <bool PER_TOKEN_META>
+template <bool PER_TOKEN_META, typename KvT>
 __global__ void qkv_norm_rope_paged_prefill_hd256_plain_kernel(
     const __nv_bfloat16* __restrict__ q_batch,      // [q_dim, seq_len]
     const __nv_bfloat16* __restrict__ k_batch,      // [kv_dim, seq_len]
@@ -170,7 +155,7 @@ __global__ void qkv_norm_rope_paged_prefill_hd256_plain_kernel(
     const __nv_bfloat16* __restrict__ cos_cache,    // [max_seq * rotary_dim]
     const __nv_bfloat16* __restrict__ sin_cache,
     __nv_bfloat16* __restrict__ q_batch_out,        // [q_dim, seq_len]
-    __nv_bfloat16* __restrict__ kv_data,            // paged KV pool
+    KvT* __restrict__ kv_data,                      // paged KV pool
     int64_t k_offset_elems,
     int64_t v_offset_elems,
     const int* __restrict__ page_indices,           // resident page row(s)
@@ -252,10 +237,11 @@ __global__ void qkv_norm_rope_paged_prefill_hd256_plain_kernel(
 
     if (!is_q && !is_k) {
         // V band: weightless norm, no RoPE — the whole block exits here.
-        int64_t dst = paged_kv_offset_hd256_plain(
+        int64_t dst = paged_kv_offset<HD256_PLAIN>(
             page_id, v_offset_elems, stride_page, page_size,
             num_kv_heads, pos, head_local, d);
-        kv_data[dst] = __float2bfloat16(__bfloat162float(x) * inv_rms);
+        kv_data[dst] = kv_store_cast<KvT>(
+            __float2bfloat16(__bfloat162float(x) * inv_rms));
         return;
     }
 
@@ -268,7 +254,7 @@ __global__ void qkv_norm_rope_paged_prefill_hd256_plain_kernel(
     if (d < half_rotary) {
         __nv_bfloat16 lo = smem[d];
         __nv_bfloat16 hi = smem[d + half_rotary];
-        apply_rope_pair_hd256_plain(
+        apply_rope_pair(
             lo,
             hi,
             cos_cache[pos * rotary_dim + d],
@@ -280,11 +266,11 @@ __global__ void qkv_norm_rope_paged_prefill_hd256_plain_kernel(
             q_batch_out[dst + d] = lo;
             q_batch_out[dst + d + half_rotary] = hi;
         } else {
-            int64_t dst = paged_kv_offset_hd256_plain(
+            int64_t dst = paged_kv_offset<HD256_PLAIN>(
                 page_id, k_offset_elems, stride_page, page_size,
                 num_kv_heads, pos, head_local, d);
-            kv_data[dst] = lo;
-            kv_data[dst + half_rotary] = hi;
+            kv_data[dst] = kv_store_cast<KvT>(lo);
+            kv_data[dst + half_rotary] = kv_store_cast<KvT>(hi);
         }
     }
 
@@ -293,10 +279,10 @@ __global__ void qkv_norm_rope_paged_prefill_hd256_plain_kernel(
             int dst = token * q_dim + head_local * HD256_PLAIN;
             q_batch_out[dst + d] = smem[d];
         } else {
-            int64_t dst = paged_kv_offset_hd256_plain(
+            int64_t dst = paged_kv_offset<HD256_PLAIN>(
                 page_id, k_offset_elems, stride_page, page_size,
                 num_kv_heads, pos, head_local, d);
-            kv_data[dst] = smem[d];
+            kv_data[dst] = kv_store_cast<KvT>(smem[d]);
         }
     }
 }
@@ -373,7 +359,10 @@ int qk_norm_rope_prefill_hd256_plain_cuda(
     PEGAINFER_FFI_GUARD_END(-1)
 }
 
-int qkv_norm_rope_paged_prefill_hd256_plain_cuda(
+} // extern "C"
+
+template <typename KvT>
+static int qkv_prep_paged_prefill_launch(
     const __nv_bfloat16* q_batch,
     const __nv_bfloat16* k_batch,
     const __nv_bfloat16* v_batch,
@@ -382,7 +371,7 @@ int qkv_norm_rope_paged_prefill_hd256_plain_cuda(
     const __nv_bfloat16* cos_cache,
     const __nv_bfloat16* sin_cache,
     __nv_bfloat16* q_batch_out,
-    __nv_bfloat16* kv_data,
+    void* kv_data,
     int64_t k_offset_elems,
     int64_t v_offset_elems,
     const int* page_indices,
@@ -436,7 +425,7 @@ int qkv_norm_rope_paged_prefill_hd256_plain_cuda(
         return -1;
     }
     dim3 prep_grid(seq_len, num_q_heads + 2 * num_kv_heads);
-    qkv_norm_rope_paged_prefill_hd256_plain_kernel<false>
+    qkv_norm_rope_paged_prefill_hd256_plain_kernel<false, KvT>
         <<<prep_grid, THREADS_HD256_PLAIN, 0, stream>>>(
         q_batch,
         k_batch,
@@ -446,7 +435,7 @@ int qkv_norm_rope_paged_prefill_hd256_plain_cuda(
         cos_cache,
         sin_cache,
         q_batch_out,
-        kv_data,
+        reinterpret_cast<KvT*>(kv_data),
         k_offset_elems,
         v_offset_elems,
         page_indices,
@@ -474,7 +463,8 @@ int qkv_norm_rope_paged_prefill_hd256_plain_cuda(
     PEGAINFER_FFI_GUARD_END(-1)
 }
 
-int qkv_norm_rope_paged_decode_hd256_plain_cuda(
+template <typename KvT>
+static int qkv_prep_paged_decode_launch(
     const __nv_bfloat16* q_batch,
     const __nv_bfloat16* k_batch,
     const __nv_bfloat16* v_batch,
@@ -483,7 +473,7 @@ int qkv_norm_rope_paged_decode_hd256_plain_cuda(
     const __nv_bfloat16* cos_cache,
     const __nv_bfloat16* sin_cache,
     __nv_bfloat16* q_batch_out,
-    __nv_bfloat16* kv_data,
+    void* kv_data,
     int64_t k_offset_elems,
     int64_t v_offset_elems,
     const int* page_indices,
@@ -528,7 +518,7 @@ int qkv_norm_rope_paged_decode_hd256_plain_cuda(
         return -1;
     }
     dim3 prep_grid(batch, num_q_heads + 2 * num_kv_heads);
-    qkv_norm_rope_paged_prefill_hd256_plain_kernel<true>
+    qkv_norm_rope_paged_prefill_hd256_plain_kernel<true, KvT>
         <<<prep_grid, THREADS_HD256_PLAIN, 0, stream>>>(
         q_batch,
         k_batch,
@@ -538,7 +528,7 @@ int qkv_norm_rope_paged_decode_hd256_plain_cuda(
         cos_cache,
         sin_cache,
         q_batch_out,
-        kv_data,
+        reinterpret_cast<KvT*>(kv_data),
         k_offset_elems,
         v_offset_elems,
         page_indices,
@@ -564,6 +554,100 @@ int qkv_norm_rope_paged_decode_hd256_plain_cuda(
     }
     return 0;
     PEGAINFER_FFI_GUARD_END(-1)
+}
+
+extern "C" {
+
+int qkv_norm_rope_paged_prefill_hd256_plain_cuda(
+    const __nv_bfloat16* q_batch, const __nv_bfloat16* k_batch,
+    const __nv_bfloat16* v_batch,
+    const __nv_bfloat16* q_norm_weight, const __nv_bfloat16* k_norm_weight,
+    const __nv_bfloat16* cos_cache, const __nv_bfloat16* sin_cache,
+    __nv_bfloat16* q_batch_out, __nv_bfloat16* kv_data,
+    int64_t k_offset_elems, int64_t v_offset_elems,
+    const int* page_indices, int page_indices_len, int page_origin,
+    int num_q_heads, int num_kv_heads, int seq_len, int start_pos,
+    int cos_max_pos, int rotary_dim, float rms_eps,
+    int page_size, int num_pages, int64_t stride_page, cudaStream_t stream)
+{
+    return qkv_prep_paged_prefill_launch<__nv_bfloat16>(
+        q_batch, k_batch, v_batch,
+        q_norm_weight, k_norm_weight, cos_cache, sin_cache,
+        q_batch_out, kv_data, k_offset_elems, v_offset_elems,
+        page_indices, page_indices_len, page_origin,
+        num_q_heads, num_kv_heads, seq_len, start_pos,
+        cos_max_pos, rotary_dim, rms_eps, page_size, num_pages,
+        stride_page, stream);
+}
+
+// E4m3 KV twin.
+int qkv_norm_rope_paged_prefill_hd256_plain_fp8kv_cuda(
+    const __nv_bfloat16* q_batch, const __nv_bfloat16* k_batch,
+    const __nv_bfloat16* v_batch,
+    const __nv_bfloat16* q_norm_weight, const __nv_bfloat16* k_norm_weight,
+    const __nv_bfloat16* cos_cache, const __nv_bfloat16* sin_cache,
+    __nv_bfloat16* q_batch_out, void* kv_data,
+    int64_t k_offset_elems, int64_t v_offset_elems,
+    const int* page_indices, int page_indices_len, int page_origin,
+    int num_q_heads, int num_kv_heads, int seq_len, int start_pos,
+    int cos_max_pos, int rotary_dim, float rms_eps,
+    int page_size, int num_pages, int64_t stride_page, cudaStream_t stream)
+{
+    return qkv_prep_paged_prefill_launch<__nv_fp8_e4m3>(
+        q_batch, k_batch, v_batch,
+        q_norm_weight, k_norm_weight, cos_cache, sin_cache,
+        q_batch_out, kv_data, k_offset_elems, v_offset_elems,
+        page_indices, page_indices_len, page_origin,
+        num_q_heads, num_kv_heads, seq_len, start_pos,
+        cos_max_pos, rotary_dim, rms_eps, page_size, num_pages,
+        stride_page, stream);
+}
+
+int qkv_norm_rope_paged_decode_hd256_plain_cuda(
+    const __nv_bfloat16* q_batch, const __nv_bfloat16* k_batch,
+    const __nv_bfloat16* v_batch,
+    const __nv_bfloat16* q_norm_weight, const __nv_bfloat16* k_norm_weight,
+    const __nv_bfloat16* cos_cache, const __nv_bfloat16* sin_cache,
+    __nv_bfloat16* q_batch_out, __nv_bfloat16* kv_data,
+    int64_t k_offset_elems, int64_t v_offset_elems,
+    const int* page_indices, int page_indices_len,
+    const int* page_indptr, const int* page_origins, const int* positions,
+    int num_q_heads, int num_kv_heads, int batch,
+    int cos_max_pos, int rotary_dim, float rms_eps,
+    int page_size, int num_pages, int64_t stride_page, cudaStream_t stream)
+{
+    return qkv_prep_paged_decode_launch<__nv_bfloat16>(
+        q_batch, k_batch, v_batch,
+        q_norm_weight, k_norm_weight, cos_cache, sin_cache,
+        q_batch_out, kv_data, k_offset_elems, v_offset_elems,
+        page_indices, page_indices_len, page_indptr, page_origins,
+        positions, num_q_heads, num_kv_heads, batch,
+        cos_max_pos, rotary_dim, rms_eps, page_size, num_pages,
+        stride_page, stream);
+}
+
+// E4m3 KV twin.
+int qkv_norm_rope_paged_decode_hd256_plain_fp8kv_cuda(
+    const __nv_bfloat16* q_batch, const __nv_bfloat16* k_batch,
+    const __nv_bfloat16* v_batch,
+    const __nv_bfloat16* q_norm_weight, const __nv_bfloat16* k_norm_weight,
+    const __nv_bfloat16* cos_cache, const __nv_bfloat16* sin_cache,
+    __nv_bfloat16* q_batch_out, void* kv_data,
+    int64_t k_offset_elems, int64_t v_offset_elems,
+    const int* page_indices, int page_indices_len,
+    const int* page_indptr, const int* page_origins, const int* positions,
+    int num_q_heads, int num_kv_heads, int batch,
+    int cos_max_pos, int rotary_dim, float rms_eps,
+    int page_size, int num_pages, int64_t stride_page, cudaStream_t stream)
+{
+    return qkv_prep_paged_decode_launch<__nv_fp8_e4m3>(
+        q_batch, k_batch, v_batch,
+        q_norm_weight, k_norm_weight, cos_cache, sin_cache,
+        q_batch_out, kv_data, k_offset_elems, v_offset_elems,
+        page_indices, page_indices_len, page_indptr, page_origins,
+        positions, num_q_heads, num_kv_heads, batch,
+        cos_max_pos, rotary_dim, rms_eps, page_size, num_pages,
+        stride_page, stream);
 }
 
 } // extern "C"
