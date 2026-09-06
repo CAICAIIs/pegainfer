@@ -2019,16 +2019,8 @@ impl PrefillPromoteBackend for SchedulerBackend {
         state: PrefillBackendState,
     ) -> ActiveBackendState {
         match (self, state) {
-            (SchedulerBackend::Single(single), PrefillBackendState::Single { kv, rec }) => {
-                let slot_idx = slot_for_new_request(active_len, single.max_batch())
-                    .expect("admission must reserve a graph slot");
-                single
-                    .copy_recurrent_to_slot(&rec, slot_idx)
-                    .expect("copy recurrent state to slot failed");
-                ActiveBackendState::Single {
-                    kv,
-                    graph_slot_idx: slot_idx,
-                }
+            (SchedulerBackend::Single(single), state @ PrefillBackendState::Single { .. }) => {
+                single.promote_prefill_state(active_len, state)
             }
             (SchedulerBackend::Tp(_), PrefillBackendState::Tp { request_id }) => {
                 ActiveBackendState::Tp { request_id }
