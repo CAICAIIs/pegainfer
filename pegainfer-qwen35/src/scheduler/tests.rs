@@ -799,40 +799,39 @@ fn collect_finished_with_timeout(
 }
 
 #[test]
-fn send_rejection_reports_kv_lifetime_request_tokens() {
-    let (token_tx, mut token_rx) = TokenSink::standalone();
-    let req = SchedulerRequest {
-        trace_parent: None,
-        request_id: Some("too-large".to_string()),
-        queued_at_unix_s: None,
-        data_parallel_rank: None,
-        prompt_tokens: vec![1; 16],
-        params: SamplingParams::default(),
-        max_tokens: 65,
-        lora_adapter: None,
-        kv_transfer_params: None,
-        token_tx,
-        logprobs: 0,
-        echo: false,
+fn send_rejection_reports_lifetime_kv_and_context_limits() {
+    let rejection_message = |reason: RejectReason, max_tokens: usize| {
+        let (token_tx, mut token_rx) = TokenSink::standalone();
+        let req = test_request_with_shape("rejected", token_tx, vec![1; 16], max_tokens);
+        send_rejection(&req, reason);
+        match token_rx.blocking_recv().map(|(_, event)| event) {
+            Some(TokenEvent::Rejected {
+                message,
+                prompt_tokens,
+                completion_tokens,
+            }) => {
+                assert_eq!((prompt_tokens, completion_tokens), (16, 0));
+                message
+            }
+            other => panic!("expected rejection event, got {other:?}"),
+        }
     };
 
-    send_rejection(&req, RejectReason::KvBudget);
+    let kv = rejection_message(RejectReason::KvBudget, 65);
+    assert!(
+        kv.contains("max_request_tokens=80"),
+        "rejection should report the full lifetime KV request: {kv}"
+    );
 
-    match token_rx.blocking_recv().map(|(_, event)| event) {
-        Some(TokenEvent::Rejected {
-            message,
-            prompt_tokens,
-            completion_tokens,
-        }) => {
-            assert_eq!(prompt_tokens, 16);
-            assert_eq!(completion_tokens, 0);
-            assert!(
-                message.contains("max_request_tokens=80"),
-                "rejection should report the full lifetime KV request"
-            );
-        }
-        _ => panic!("expected rejection event"),
-    }
+    let context = rejection_message(RejectReason::ContextLength { limit: 32 }, 17);
+    assert!(
+        context.contains("maximum context length of 32 tokens"),
+        "rejection should report the context-window limit: {context}"
+    );
+    assert!(
+        context.contains("requested 33"),
+        "rejection should report prompt + max_tokens: {context}"
+    );
 }
 
 #[test]
@@ -871,11 +870,13 @@ fn echo_request_is_rejected_before_backend_admission() {
 }
 
 #[test]
-fn inflight_prefill_waits_instead_of_parking_after_last_decode_retires() {
-    assert!(
-        !should_block_on_submit(true, true),
-        "an in-flight prefill must keep the scheduler off submit_rx.blocking_recv()"
-    );
+fn submit_parking_requires_idle_owned_work_and_no_inflight_prefill() {
+    // Parking on submit_rx while a prefill is in flight would never observe its
+    // completion, so only a fully idle scheduler may block there.
+    assert!(should_block_on_submit(true, false));
+    assert!(!should_block_on_submit(true, true));
+    assert!(!should_block_on_submit(false, false));
+    assert!(!should_block_on_submit(false, true));
 }
 
 #[test]
@@ -936,45 +937,4 @@ fn tp2_scheduler_runs_forced_mixed_steps() {
     assert_eq!(decode_finish, FinishReason::Length);
     assert_eq!(prefill_tokens, 2);
     assert_eq!(prefill_finish, FinishReason::Length);
-}
-
-#[test]
-fn send_rejection_reports_context_window_limit() {
-    let (token_tx, mut token_rx) = TokenSink::standalone();
-    let req = SchedulerRequest {
-        trace_parent: None,
-        request_id: Some("too-long".to_string()),
-        queued_at_unix_s: None,
-        data_parallel_rank: None,
-        prompt_tokens: vec![1; 16],
-        params: SamplingParams::default(),
-        max_tokens: 17,
-        lora_adapter: None,
-        kv_transfer_params: None,
-        token_tx,
-        logprobs: 0,
-        echo: false,
-    };
-
-    send_rejection(&req, RejectReason::ContextLength { limit: 32 });
-
-    match token_rx.blocking_recv().map(|(_, event)| event) {
-        Some(TokenEvent::Rejected {
-            message,
-            prompt_tokens,
-            completion_tokens,
-        }) => {
-            assert_eq!(prompt_tokens, 16);
-            assert_eq!(completion_tokens, 0);
-            assert!(
-                message.contains("maximum context length of 32 tokens"),
-                "rejection should report the context-window limit"
-            );
-            assert!(
-                message.contains("requested 33"),
-                "rejection should report prompt + max_tokens"
-            );
-        }
-        _ => panic!("expected rejection event"),
-    }
 }
