@@ -941,11 +941,16 @@ fn scheduler_loop(
                 remaining_tokens: req.req.prompt_tokens.len().saturating_sub(req.cursor),
             })
             .collect();
+        let decode_overlap = matches!(
+            &backend,
+            SchedulerBackend::Single(single) if single.overlap_enabled()
+        );
         let step_prefill_budget = choose_prefill_budget(
             scheduler_policy,
             prefill_budget,
             &active_decode,
             &prefill_queue,
+            decode_overlap,
         );
         let scheduled = take_prefill_chunks(&mut prefilling, step_prefill_budget);
         // ITL diagnostics (#470): capture the *actual* prefill-chunk token count
