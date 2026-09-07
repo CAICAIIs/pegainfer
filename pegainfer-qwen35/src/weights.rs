@@ -151,8 +151,8 @@ impl Qwen35Model {
 
         let mut config = Config35::from_file(model_path)?;
         let tensor_parallel = runtime.tensor_parallel.unwrap_or_default();
-        let geometry = LocalGeometry::try_new(&config, tensor_parallel, runtime.enable_cuda_graph)
-            .map_err(anyhow::Error::from)?;
+        let geometry =
+            LocalGeometry::try_new(&config, tensor_parallel).map_err(anyhow::Error::from)?;
         debug!(
             "Config: hidden_size={}, num_layers={}, full_attn={}, linear_attn={}, max_position_embeddings={}, tp_rank={}, tp_world_size={}",
             config.hidden_size,
@@ -358,6 +358,34 @@ impl Qwen35Model {
 
     pub(crate) fn attach_tp_comm(&mut self, comm: Comm) {
         self.tp_comm = Some(comm);
+    }
+
+    /// Force NCCL connect before any CUDA Graph capture records a collective
+    /// (lazy connect inside `cuStreamBeginCapture` wedges the capture). NCCL
+    /// 2.22+ connects per size-selected algorithm, so warm one all-reduce at
+    /// every decode bucket's message size. No-op without a TP communicator.
+    pub(crate) fn warmup_tp_collective(&self) -> Result<()> {
+        if let Some(comm) = &self.tp_comm {
+            let buckets = super::batch_decode_graph::BATCH_BUCKETS;
+            let max_elems = buckets.last().unwrap() * self.config.hidden_size;
+            let mut scratch = self
+                .ctx
+                .stream
+                .alloc_zeros::<half::bf16>(max_elems)
+                .map_err(|e| anyhow::anyhow!("alloc NCCL warm-up scratch: {e}"))?;
+            for &bucket in buckets {
+                let mut view = scratch.slice_mut(0..bucket * self.config.hidden_size);
+                comm.all_reduce_in_place(&mut view, &ReduceOp::Sum)
+                    .map_err(|e| {
+                        anyhow::anyhow!("Qwen3.5 NCCL warm-up all-reduce failed: {e:?}")
+                    })?;
+            }
+            self.ctx
+                .stream
+                .synchronize()
+                .map_err(|e| anyhow::anyhow!("Qwen3.5 NCCL warm-up sync failed: {e}"))?;
+        }
+        Ok(())
     }
 
     pub(crate) fn all_reduce_hidden(&self, hidden: &mut HiddenStates) -> Result<()> {

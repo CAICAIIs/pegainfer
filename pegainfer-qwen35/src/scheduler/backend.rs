@@ -115,8 +115,11 @@ fn attached_logprobs(
 }
 
 pub(super) struct TpSchedulerBackend {
-    executor: Qwen35TpExecutor,
+    pub(super) executor: Qwen35TpExecutor,
     next_request_id: u64,
+    /// Slot move derived by the in-flight `take_active_request`; consumed by
+    /// the paired `drop_active_state` so the workers apply the same move.
+    pub(super) pending_compaction: Option<TpSlotCompaction>,
 }
 
 impl SingleGpuBackend {
@@ -265,8 +268,12 @@ impl SingleGpuBackend {
 
     pub(super) fn decode_graph(&mut self, active: &mut [ActiveRequest35]) -> Result<()> {
         let (tokens, mut kvs) = single_decode_views(active);
-        self.model
-            .batch_decode_graph(&tokens, &mut kvs, &mut self.graph_state)
+        self.model.batch_decode_graph(
+            &tokens,
+            &mut kvs,
+            &mut self.graph_state,
+            crate::batch_decode::DecodeGraphUse::Serve,
+        )
     }
 
     pub(super) fn sample_prefill_logits(
@@ -386,10 +393,11 @@ impl TpSchedulerBackend {
         device_ordinals: &[usize],
         max_batch: usize,
         max_prefill_tokens: usize,
+        enable_cuda_graph: bool,
     ) -> Result<Self> {
         let executor = Qwen35TpExecutor::from_runtime_with_limits(
             model_path,
-            false,
+            enable_cuda_graph,
             device_ordinals,
             max_batch,
             max_prefill_tokens,
@@ -397,6 +405,7 @@ impl TpSchedulerBackend {
         Ok(Self {
             executor,
             next_request_id: 1,
+            pending_compaction: None,
         })
     }
 
@@ -498,7 +507,40 @@ impl TpSchedulerBackend {
         request_id: RequestId,
         expectation: DropExpectation,
     ) -> Result<()> {
-        self.executor.drop_request(request_id, expectation)
+        self.executor
+            .drop_request_with_compaction(request_id, expectation, None)
+    }
+
+    /// Remove the TP request at `idx` via swap_remove and stash the resulting
+    /// slot compaction for the paired `drop_active_state`. Mirrors
+    /// `compact_single_slot`: after the swap, slots `0..active.len()` stay
+    /// dense because the moved request's slot follows it.
+    pub(super) fn take_active_request(
+        &mut self,
+        active: &mut Vec<ActiveRequest35>,
+        idx: usize,
+    ) -> ActiveRequest35 {
+        let compaction = compaction_after_retire(active.len(), idx);
+        let removed = active.swap_remove(idx);
+
+        self.pending_compaction = compaction.map(|compaction| {
+            let moved = &mut active[idx];
+            let ActiveBackendState::Tp {
+                request_id,
+                slot_idx,
+            } = &mut moved.backend_state
+            else {
+                panic!("TP scheduler received single-GPU active state")
+            };
+            debug_assert_eq!(*slot_idx, compaction.moved_from);
+            *slot_idx = compaction.moved_to;
+            TpSlotCompaction {
+                moved_request_id: *request_id,
+                from: compaction.moved_from,
+                to: compaction.moved_to,
+            }
+        });
+        removed
     }
 }
 

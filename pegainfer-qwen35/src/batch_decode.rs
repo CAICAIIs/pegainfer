@@ -26,6 +26,22 @@ use crate::ops;
 
 static LOG_UNCOMPILED_DECODE_ROUTE: std::sync::Once = std::sync::Once::new();
 
+/// How a `batch_decode_graph` call interacts with the per-bucket CUDA graphs.
+///
+/// TP serving never captures lazily: a mid-serving capture on one rank while a
+/// peer replays desyncs the recorded NCCL collectives, so tensor-parallel
+/// decodes are replay-only after the startup pre-capture sweep.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DecodeGraphUse {
+    /// Replay if captured, lazily capture otherwise (single-GPU serving).
+    Serve,
+    /// Record + instantiate + upload, no launch (the TP sweep's Capture phase).
+    CaptureOnly,
+    /// Replay only; error if never captured (TP serving, and the TP sweep's
+    /// Launch phase that drains the captured collectives across ranks).
+    Replay,
+}
+
 impl Qwen35Model {
     pub(crate) fn select_tokens_from_logits_varied(
         &self,
@@ -340,6 +356,25 @@ impl Qwen35Model {
         token_ids: &[u32],
         kv_states: &mut [&mut KvState],
         graph_state: &mut BatchDecodeGraphState,
+        graph_use: DecodeGraphUse,
+    ) -> Result<()> {
+        let padded_bs = bucket_for(token_ids.len());
+        self.batch_decode_graph_padded(token_ids, kv_states, graph_state, graph_use, padded_bs)
+    }
+
+    /// `batch_decode_graph` with the bucket chosen by the caller instead of
+    /// derived from `bs`. Rows `bs..padded_bs` are padding either way — they
+    /// ride the pool's reserved padding page and a free recurrent slot — so a
+    /// caller that only needs a *bucket* (the TP pre-capture sweep) can pass
+    /// one real row and still capture or launch the bucket-`padded_bs` graph
+    /// without holding `padded_bs` KV pages.
+    pub(crate) fn batch_decode_graph_padded(
+        &self,
+        token_ids: &[u32],
+        kv_states: &mut [&mut KvState],
+        graph_state: &mut BatchDecodeGraphState,
+        graph_use: DecodeGraphUse,
+        padded_bs: usize,
     ) -> Result<()> {
         let bs = token_ids.len();
         anyhow::ensure!(bs > 0, "batch_decode_graph requires at least one request");
@@ -349,8 +384,16 @@ impl Qwen35Model {
             "batch size {bs} exceeds decode capacity {}",
             graph_state.slot_states.len()
         );
+        anyhow::ensure!(
+            padded_bs >= bs && BATCH_BUCKETS.contains(&padded_bs),
+            "padded batch {padded_bs} is not a decode bucket covering bs={bs}"
+        );
 
         if !self.config.decode_group_is_compiled() {
+            anyhow::ensure!(
+                graph_use == DecodeGraphUse::Serve,
+                "Qwen3.5 batched hybrid eager fallback only supports lazy serve-mode decode, got {graph_use:?}"
+            );
             LOG_UNCOMPILED_DECODE_ROUTE.call_once(|| {
                 let group = self.config.num_attention_heads / self.config.num_key_value_heads;
                 log::info!(
@@ -365,7 +408,6 @@ impl Qwen35Model {
             return self.batch_decode_batched_hybrid(token_ids, kv_states, graph_state);
         }
 
-        let padded_bs = bucket_for(bs);
         graph_state.linear_pointer_tables.validate_for(
             &self.config,
             padded_bs,
@@ -411,17 +453,35 @@ impl Qwen35Model {
         let mut graphs = std::mem::take(&mut graph_state.graphs);
         let linear_state_ptrs = &graph_state.linear_pointer_tables.state_ptrs;
         let linear_conv_state_ptrs = &graph_state.linear_pointer_tables.conv_state_ptrs;
-        let result = graphs[bucket_idx].run_or_capture(&self.ctx, || {
-            self.batch_decode_kernels_graph(
-                kv_buffer,
-                &layout,
-                padded_bs,
-                None,
-                linear_state_ptrs,
-                linear_conv_state_ptrs,
-                &mut graph_state.buffers,
-            )
-        });
+        let result = match graph_use {
+            DecodeGraphUse::Serve => graphs[bucket_idx].run_or_capture(&self.ctx, || {
+                self.batch_decode_kernels_graph(
+                    kv_buffer,
+                    &layout,
+                    padded_bs,
+                    None,
+                    linear_state_ptrs,
+                    linear_conv_state_ptrs,
+                    &mut graph_state.buffers,
+                )
+            }),
+            DecodeGraphUse::CaptureOnly => graphs[bucket_idx].capture_only(&self.ctx, || {
+                self.batch_decode_kernels_graph(
+                    kv_buffer,
+                    &layout,
+                    padded_bs,
+                    None,
+                    linear_state_ptrs,
+                    linear_conv_state_ptrs,
+                    &mut graph_state.buffers,
+                )
+            }),
+            // Replay is a pure enqueue: every bucket was recorded by the
+            // startup pre-capture sweep, so a missing graph here means the
+            // sweep was skipped or incomplete — fail loudly, never capture
+            // mid-serving (a one-sided capture desyncs TP collectives).
+            DecodeGraphUse::Replay => graphs[bucket_idx].launch_captured(&self.ctx),
+        };
         graph_state.graphs = graphs;
         result
     }

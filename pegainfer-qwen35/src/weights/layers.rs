@@ -433,7 +433,7 @@ mod tests {
     fn test_geometry(rank: usize, world_size: usize) -> LocalGeometry {
         let config = test_config();
         let tp = TensorParallelConfig::try_from((rank, world_size)).unwrap();
-        LocalGeometry::try_new(&config, tp, false).unwrap()
+        LocalGeometry::try_new(&config, tp).unwrap()
     }
 
     #[test]

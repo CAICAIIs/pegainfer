@@ -90,26 +90,22 @@ pub(crate) struct LocalGeometry {
 }
 
 impl LocalGeometry {
-    /// Validate `config` against `tp` and the runtime execution mode, then derive
-    /// this rank's local dimensions.
+    /// Validate `config` against `tp`, then derive this rank's local dimensions.
     ///
     /// Fails on unsupported combinations before expensive loading:
-    /// - sharded TP demands eager execution (`enable_cuda_graph` off);
     /// - every sharded model dimension must divide evenly by `world_size`
     ///   (linear-attention key heads included; the value-head count follows
     ///   from the `Config35` key/value-head invariant);
     /// - `rank < world_size` and `world_size >= 1` are guaranteed by
     ///   `TensorParallelConfig::try_from`.
+    ///
+    /// CUDA Graph under TP is gated at executor startup on
+    /// [`Config35::decode_group_is_compiled`] (P2c): uncompiled GQA
+    /// groups keep the batched eager path instead of failing validation here.
     pub(crate) fn try_new(
         config: &Config35,
         tp: TensorParallelConfig,
-        enable_cuda_graph: bool,
     ) -> Result<Self, ConfigError> {
-        if tp.is_sharded() && enable_cuda_graph {
-            return Err(ConfigError::TpRequiresEager {
-                world_size: tp.world_size(),
-            });
-        }
         if !config.num_attention_heads.is_multiple_of(tp.world_size()) {
             return Err(ConfigError::TpIndivisible {
                 field: "num_attention_heads",
@@ -279,7 +275,7 @@ mod tests {
     fn tp2_local_geometry_matches_dense_dims() {
         let cfg = config();
         let tp = TensorParallelConfig::try_from((1, 2)).unwrap();
-        let geom = LocalGeometry::try_new(&cfg, tp, false).unwrap();
+        let geom = LocalGeometry::try_new(&cfg, tp).unwrap();
         assert!(geom.is_sharded());
         assert_eq!(geom.shard_range(4096), (2048, 2048));
         assert_eq!(geom.local_num_attention_heads(), 8);
@@ -309,7 +305,7 @@ mod tests {
     fn rejects_indivisible_dense_dimensions() {
         let tp = TensorParallelConfig::try_from((0, 3)).unwrap();
         let cfg = config();
-        let mut err = LocalGeometry::try_new(&cfg, tp, false).unwrap_err();
+        let mut err = LocalGeometry::try_new(&cfg, tp).unwrap_err();
         assert_eq!(
             err,
             ConfigError::TpIndivisible {
@@ -322,7 +318,7 @@ mod tests {
         let mut broken = cfg;
         broken.num_attention_heads = 15;
         broken.num_key_value_heads = 4;
-        err = LocalGeometry::try_new(&broken, tp, false).unwrap_err();
+        err = LocalGeometry::try_new(&broken, tp).unwrap_err();
         assert_eq!(
             err,
             ConfigError::TpIndivisible {
@@ -334,7 +330,7 @@ mod tests {
 
         broken.num_key_value_heads = 3;
         broken.intermediate_size = 9217;
-        err = LocalGeometry::try_new(&broken, tp, false).unwrap_err();
+        err = LocalGeometry::try_new(&broken, tp).unwrap_err();
         assert_eq!(
             err,
             ConfigError::TpIndivisible {
@@ -346,16 +342,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_tensor_parallel_with_cuda_graph() {
-        let cfg = config();
-        let tp = TensorParallelConfig::try_from((0, 2)).unwrap();
-        assert_eq!(
-            LocalGeometry::try_new(&cfg, tp, true),
-            Err(ConfigError::TpRequiresEager { world_size: 2 })
-        );
-    }
-
-    #[test]
     fn requires_linear_attention_key_head_divisibility() {
         let tp = TensorParallelConfig::try_from((1, 2)).unwrap();
         let mut broken = config();
@@ -363,7 +349,7 @@ mod tests {
         // branch is the key-head TP guard itself.
         broken.linear_num_key_heads = 17;
         broken.linear_num_value_heads = 34;
-        let err = LocalGeometry::try_new(&broken, tp, false).unwrap_err();
+        let err = LocalGeometry::try_new(&broken, tp).unwrap_err();
         assert_eq!(
             err,
             ConfigError::TpIndivisible {
