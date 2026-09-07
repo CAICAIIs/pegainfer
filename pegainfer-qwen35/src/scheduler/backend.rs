@@ -179,7 +179,11 @@ impl SingleGpuBackend {
     }
 
     pub(super) fn alloc_recurrent(&self) -> Result<RecurrentState> {
-        RecurrentState::new(self.model.device_ctx(), self.model.config())
+        RecurrentState::new(
+            self.model.device_ctx(),
+            self.model.config(),
+            self.model.geometry,
+        )
     }
 
     pub(super) fn batch_prefill_logits(&self, chunk: &mut ScheduledChunk) -> Result<HiddenStates> {

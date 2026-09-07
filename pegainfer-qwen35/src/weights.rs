@@ -269,10 +269,14 @@ impl Qwen35Model {
         // Reserve space for prefill scratch (GDR chunkwise + per-layer transients)
         // before allocating KV pool, so prefill doesn't OOM.
         let max_prefill_len = super::prefill::SCRATCH_ESTIMATE_SEQ;
-        let scratch_reserve =
-            super::prefill_buffers::GdrChunkwiseScratch35::estimate_bytes(&config, max_prefill_len);
-        let recurrent_reserve =
-            STATES_PER_DECODE_SLOT * max_batch * super::recurrent_state::bytes_per_request(&config);
+        let scratch_reserve = super::prefill_buffers::GdrChunkwiseScratch35::estimate_bytes(
+            &config,
+            geometry,
+            max_prefill_len,
+        );
+        let recurrent_reserve = STATES_PER_DECODE_SLOT
+            * max_batch
+            * super::recurrent_state::bytes_per_request(&config, geometry);
         let min_kv_bytes = MIN_KV_PAGES * bytes_per_page;
         anyhow::ensure!(
             free_bytes >= scratch_reserve + recurrent_reserve + min_kv_bytes,
@@ -380,9 +384,9 @@ impl Qwen35Model {
         let geom = self.geometry;
         let full_q = geom.local_full_attn_gated_q_dim();
         let full_kv = geom.local_full_attn_kv_dim();
-        let linear_qkv = self.config.linear_attn_qkv_dim();
-        let linear_z = self.config.linear_attn_z_dim();
-        let linear_ba = self.config.linear_num_value_heads;
+        let linear_qkv = geom.local_linear_qkv_dim();
+        let linear_z = geom.local_linear_z_dim();
+        let linear_ba = geom.local_linear_num_value_heads();
         let intermediate = geom.local_intermediate_size();
 
         let full_attn = || {
