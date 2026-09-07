@@ -741,6 +741,64 @@ fn test_e2e_qwen35_shared_sm_last_decoder() {
         off.tokens
     };
 
+    // The auto policy may now combine with Shared-SM overlap: it only reshapes
+    // per-step prefill chunk budgets, so chunk boundaries change while greedy
+    // tokens must not.
+    {
+        let auto_handle = pegainfer_qwen35::start_engine_with_capacity_policy_and_overlap(
+            Path::new(&model_path),
+            EngineLoadOptions {
+                enable_cuda_graph: true,
+                device_ordinals: vec![0],
+                seed: 42,
+                ..EngineLoadOptions::default()
+            },
+            4,
+            8192,
+            pegainfer_qwen35::Qwen35SchedulerPolicy::Auto,
+            pegainfer_qwen35::Qwen35DecodeOverlap::SharedSm,
+        )
+        .expect("Failed to start Qwen3.5 auto + shared-SM scheduler");
+        let mut auto_load = auto_handle
+            .metrics_watch()
+            .expect("scheduler must expose metrics");
+
+        let mut auto_active_rx = submit_repeated_token_request(
+            &auto_handle,
+            "overlap-auto-last-decoder",
+            seed_token,
+            512,
+            128,
+        );
+        wait_for_first_token(&mut auto_active_rx, "overlap-auto-last-decoder");
+        let _ = drain_tokens(&mut auto_active_rx, "overlap-auto-last-decoder");
+        let mut auto_prefill_rx = submit_repeated_token_request(
+            &auto_handle,
+            "overlap-auto-inflight-prefill",
+            seed_token,
+            8192,
+            2,
+        );
+        wait_for_running_requests(&mut auto_load, 2, std::time::Duration::from_secs(10));
+        assert_no_generated_event(&mut auto_prefill_rx, "overlap-auto-inflight-prefill");
+        drop(auto_active_rx);
+        let auto_prefill = collect_generation_with_timeout(
+            &mut auto_prefill_rx,
+            "overlap-auto-inflight-prefill",
+            0,
+            std::time::Duration::from_secs(30),
+        );
+        assert_eq!(
+            auto_prefill.tokens.len(),
+            2,
+            "auto + shared-SM in-flight prefill must finish after the last decoder is cancelled"
+        );
+        assert_eq!(
+            auto_prefill.tokens, off_reference_tokens,
+            "auto + shared-SM overlapped prefill must match the greedy default-Off reference"
+        );
+    }
+
     let handle = pegainfer_qwen35::start_engine_with_capacity_policy_and_overlap(
         Path::new(&model_path),
         EngineLoadOptions {
