@@ -40,6 +40,10 @@ pub(crate) struct RecurrentState {
 /// layer. The underlying `CudaSlice` allocations inside `RecurrentState` stay
 /// at fixed device addresses for the request lifetime, so these tables should
 /// be built once per slot/request and then reused across decode tokens.
+///
+/// Where the row set changes between steps (eager TP decode), allocate once at
+/// capacity with `with_capacity` and `refill_from_recurrent_refs` the live
+/// rows each step: H2D copies into the existing tables, no per-step allocation.
 pub(crate) struct LinearStatePointerTables {
     pub(crate) state_ptrs: Vec<CudaSlice<u64>>,
     pub(crate) conv_state_ptrs: Vec<CudaSlice<u64>>,
@@ -83,6 +87,33 @@ impl RecurrentState {
 }
 
 impl LinearStatePointerTables {
+    /// Allocate zeroed per-layer tables with room for `capacity` rows. Rows
+    /// carry no pointers until `refill_from_recurrent_refs` writes them.
+    pub(crate) fn with_capacity(
+        ctx: &DeviceContext,
+        config: &Config35,
+        capacity: usize,
+        label: &str,
+    ) -> Result<Self> {
+        let num_linear_layers = config.num_hidden_layers - config.num_full_attention_layers();
+        let mut state_ptrs = Vec::with_capacity(num_linear_layers);
+        let mut conv_state_ptrs = Vec::with_capacity(num_linear_layers);
+        for layer_idx in 0..num_linear_layers {
+            state_ptrs.push(ctx.stream.alloc_zeros::<u64>(capacity).map_err(|e| {
+                anyhow::anyhow!("alloc {label} linear state pointer table {layer_idx}: {e}")
+            })?);
+            conv_state_ptrs.push(ctx.stream.alloc_zeros::<u64>(capacity).map_err(|e| {
+                anyhow::anyhow!("alloc {label} conv state pointer table {layer_idx}: {e}")
+            })?);
+        }
+        Ok(Self {
+            state_ptrs,
+            conv_state_ptrs,
+            batch_size: capacity,
+        })
+    }
+
+    /// Tables sized exactly to `batch_size` rows, filled once.
     pub(crate) fn from_recurrent_refs(
         ctx: &DeviceContext,
         config: &Config35,
@@ -90,15 +121,37 @@ impl LinearStatePointerTables {
         batch_size: usize,
         label: &str,
     ) -> Result<Self> {
+        let mut tables = Self::with_capacity(ctx, config, batch_size, label)?;
+        tables.refill_from_recurrent_refs(ctx, recurrent_states, batch_size, label)?;
+        Ok(tables)
+    }
+
+    /// Overwrite rows `0..batch_size` of every layer table with the current
+    /// state addresses of `recurrent_states`. Copies into the existing
+    /// allocations only; rows past `batch_size` keep whatever they held and
+    /// must stay unaddressed (the kernels are handed `batch_size`).
+    pub(crate) fn refill_from_recurrent_refs(
+        &mut self,
+        ctx: &DeviceContext,
+        recurrent_states: &mut [&mut RecurrentState],
+        batch_size: usize,
+        label: &str,
+    ) -> Result<()> {
         anyhow::ensure!(
             batch_size <= recurrent_states.len(),
             "{label} pointer table batch {batch_size} exceeds recurrent refs {}",
             recurrent_states.len()
         );
-        let num_linear_layers = config.num_hidden_layers - config.num_full_attention_layers();
-        let mut linear_state_ptrs = Vec::with_capacity(num_linear_layers);
-        let mut linear_conv_state_ptrs = Vec::with_capacity(num_linear_layers);
-        for layer_idx in 0..num_linear_layers {
+        anyhow::ensure!(
+            batch_size <= self.batch_size,
+            "{label} pointer table batch {batch_size} exceeds capacity {}",
+            self.batch_size
+        );
+        let tables = self
+            .state_ptrs
+            .iter_mut()
+            .zip(self.conv_state_ptrs.iter_mut());
+        for (layer_idx, (state_table, conv_table)) in tables.enumerate() {
             let mut state_ptrs = Vec::with_capacity(batch_size);
             let mut conv_state_ptrs = Vec::with_capacity(batch_size);
             for slot in recurrent_states.iter_mut().take(batch_size) {
@@ -116,19 +169,18 @@ impl LinearStatePointerTables {
                 state_ptrs.push(state_ptr);
                 conv_state_ptrs.push(conv_ptr);
             }
-            linear_state_ptrs.push(ctx.stream.clone_htod(&state_ptrs).map_err(|e| {
-                anyhow::anyhow!("copy {label} linear state pointer table {layer_idx}: {e}")
-            })?);
-            linear_conv_state_ptrs.push(ctx.stream.clone_htod(&conv_state_ptrs).map_err(|e| {
-                anyhow::anyhow!("copy {label} conv state pointer table {layer_idx}: {e}")
-            })?);
+            ctx.stream
+                .memcpy_htod(state_ptrs.as_slice(), state_table)
+                .map_err(|e| {
+                    anyhow::anyhow!("copy {label} linear state pointer table {layer_idx}: {e}")
+                })?;
+            ctx.stream
+                .memcpy_htod(conv_state_ptrs.as_slice(), conv_table)
+                .map_err(|e| {
+                    anyhow::anyhow!("copy {label} conv state pointer table {layer_idx}: {e}")
+                })?;
         }
-
-        Ok(Self {
-            state_ptrs: linear_state_ptrs,
-            conv_state_ptrs: linear_conv_state_ptrs,
-            batch_size,
-        })
+        Ok(())
     }
 
     pub(crate) fn validate_for(
