@@ -671,6 +671,10 @@ fn scheduler_loop(
     let mut prefilling: Vec<PrefillingRequest35> = Vec::new();
     let mut inflight_prefill: Option<InflightPrefill> = None;
     let max_batch = backend.max_batch();
+    let decode_overlap = matches!(
+        &backend,
+        SchedulerBackend::Single(single) if single.overlap_enabled()
+    );
 
     info!("scheduler ready (max_batch={})", max_batch);
 
@@ -941,10 +945,6 @@ fn scheduler_loop(
                 remaining_tokens: req.req.prompt_tokens.len().saturating_sub(req.cursor),
             })
             .collect();
-        let decode_overlap = matches!(
-            &backend,
-            SchedulerBackend::Single(single) if single.overlap_enabled()
-        );
         let step_prefill_budget = choose_prefill_budget(
             scheduler_policy,
             prefill_budget,
@@ -963,9 +963,7 @@ fn scheduler_loop(
         let plan = plan::build_next_plan(!active.is_empty(), scheduled);
         if let Some(plan) = plan {
             let itl_plan_kind = match &plan {
-                ExecutionPlan::Unified { .. } if matches!(&backend, SchedulerBackend::Single(single) if single.overlap_enabled()) => {
-                    "overlap_launch"
-                }
+                ExecutionPlan::Unified { .. } if decode_overlap => "overlap_launch",
                 ExecutionPlan::Unified { .. } => "unified",
                 ExecutionPlan::Prefill { .. } => "prefill",
                 ExecutionPlan::Decode => "decode",
@@ -973,8 +971,7 @@ fn scheduler_loop(
             let itl_step_start = itl_debug.then(Instant::now);
             let step_result = match plan {
                 ExecutionPlan::Unified { pending } => {
-                    if matches!(&backend, SchedulerBackend::Single(single) if single.overlap_enabled())
-                    {
+                    if decode_overlap {
                         launch_overlap_step(
                             &mut backend,
                             &mut active,
