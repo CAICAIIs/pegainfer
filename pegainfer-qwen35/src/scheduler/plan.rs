@@ -456,10 +456,10 @@ mod tests {
         );
         assert!(
             matches!(
-                build_next_plan::<Pending>(true, vec![]),
-                Some(ExecutionPlan::Decode)
+                build_next_plan::<Pending>(true, vec![pending(1, 4096)]),
+                Some(ExecutionPlan::Unified { .. })
             ),
-            "zero prefill budget turns the scheduler tick into decode-only work"
+            "the kept budget keeps the tick a unified prefill+decode step instead of a decode-only tick"
         );
     }
 
