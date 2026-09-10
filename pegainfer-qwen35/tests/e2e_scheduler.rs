@@ -132,8 +132,8 @@ fn generate_tokens_with_logprobs(
             lora_adapter: None,
             kv_transfer_params: None,
             token_tx,
-            logprobs,
-            echo: false,
+            logprobs: (logprobs > 0).then_some(logprobs),
+            prompt_logprobs: None,
         })
         .expect("submit failed");
 
@@ -163,8 +163,8 @@ fn submit_repeated_token_request(
             lora_adapter: None,
             kv_transfer_params: None,
             token_tx,
-            logprobs: 0,
-            echo: false,
+            logprobs: None,
+            prompt_logprobs: None,
         })
         .unwrap_or_else(|err| panic!("submit {request_id}: {err}"));
     token_rx
@@ -349,8 +349,8 @@ fn expect_context_window_rejection(handle: &EngineHandle, max_context_tokens: us
             lora_adapter: None,
             kv_transfer_params: None,
             token_tx,
-            logprobs: 0,
-            echo: false,
+            logprobs: None,
+            prompt_logprobs: None,
         })
         .expect("submit over-context request");
 
@@ -562,8 +562,8 @@ fn run_full_scheduler_e2e(
                     lora_adapter: None,
                     kv_transfer_params: None,
                     token_tx,
-                    logprobs: 0,
-                    echo: false,
+                    logprobs: None,
+                    prompt_logprobs: None,
                 })
                 .expect("submit failed");
             receivers.push((case.name.to_string(), 0, token_rx));
@@ -604,8 +604,8 @@ fn run_full_scheduler_e2e(
                     lora_adapter: None,
                     kv_transfer_params: None,
                     token_tx,
-                    logprobs,
-                    echo: false,
+                    logprobs: (logprobs > 0).then_some(logprobs),
+                    prompt_logprobs: None,
                 })
                 .expect("submit failed");
             receivers.push((name, logprobs, token_rx));
@@ -647,8 +647,8 @@ fn run_full_scheduler_e2e(
                 lora_adapter: None,
                 kv_transfer_params: None,
                 token_tx,
-                logprobs: 0,
-                echo: false,
+                logprobs: None,
+                prompt_logprobs: None,
             })
             .expect("submit failed");
         std::thread::sleep(std::time::Duration::from_millis(500));

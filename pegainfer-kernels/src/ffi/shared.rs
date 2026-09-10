@@ -243,6 +243,7 @@ unsafe extern "C" {
         picked: *const i32,
         top_k: *const i32,
         out_picked_lp: *mut f32,
+        out_picked_rank: *mut i32,
         out_topk_vals: *mut f32,
         out_topk_ids: *mut i32,
         rows: i32,
