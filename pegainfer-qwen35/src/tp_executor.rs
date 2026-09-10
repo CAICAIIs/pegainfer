@@ -95,18 +95,18 @@ enum TpWorkerCommand {
     RunPrefillChunks {
         chunks: Vec<TpPrefillChunkItem>,
         sample_seed: u64,
-        start: Arc<TpCommandStartGate>,
+        start: Arc<TpGate>,
         resp: mpsc::Sender<TpWorkerResponse>,
     },
     RunDecodeStep {
         requests: Vec<TpDecodeStepItem>,
         sample_seed: u64,
-        start: Arc<TpCommandStartGate>,
+        start: Arc<TpGate>,
         resp: mpsc::Sender<TpWorkerResponse>,
     },
     RunUnifiedStep {
         plan: TpUnifiedPlan,
-        start: Arc<TpCommandStartGate>,
+        start: Arc<TpGate>,
         resp: mpsc::Sender<TpWorkerResponse>,
     },
     DropRequest {
@@ -115,14 +115,14 @@ enum TpWorkerCommand {
         /// `Some` only when the dropped request held a decode slot that a
         /// still-active request now takes over. Eager workers ignore it.
         compaction: Option<TpSlotCompaction>,
-        start: Arc<TpCommandStartGate>,
+        start: Arc<TpGate>,
         resp: mpsc::Sender<TpWorkerResponse>,
     },
     /// Startup-only (graph-enabled TP): one phase of the decode-graph
     /// pre-capture sweep, barriered across ranks by the controller.
     Precapture {
         phase: PrecapturePhase,
-        start: Arc<TpCommandStartGate>,
+        start: Arc<TpGate>,
         resp: mpsc::Sender<TpWorkerResponse>,
     },
     #[cfg(test)]
@@ -167,48 +167,45 @@ pub enum DropExpectation {
     MustExist,
 }
 
+/// One-shot go/cancel decision broadcast to every rank's thread.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum TpCommandDecision {
+enum TpGateDecision {
     #[default]
     Pending,
-    Execute,
+    Go,
     Cancel,
 }
 
+/// A gate the dispatcher resolves exactly once; waiters block until the
+/// decision leaves `Pending`. Used for per-command starts and for startup.
 #[derive(Default)]
-struct TpCommandStartGate {
-    decision: Mutex<TpCommandDecision>,
+struct TpGate {
+    decision: Mutex<TpGateDecision>,
     changed: Condvar,
 }
 
-impl TpCommandStartGate {
-    fn execute(&self) -> bool {
-        self.resolve(TpCommandDecision::Execute)
-    }
-
-    fn cancel(&self) -> bool {
-        self.resolve(TpCommandDecision::Cancel)
-    }
-
-    fn wait(&self) -> TpCommandDecision {
+impl TpGate {
+    /// Resolve the decision; returns false if someone resolved it first.
+    fn resolve(&self, next: TpGateDecision) -> bool {
         let mut decision = self.decision.lock().unwrap_or_else(PoisonError::into_inner);
-        while *decision == TpCommandDecision::Pending {
+        if *decision != TpGateDecision::Pending {
+            return false;
+        }
+        *decision = next;
+        self.changed.notify_all();
+        true
+    }
+
+    /// Block until the gate is resolved, then return the decision.
+    fn wait(&self) -> TpGateDecision {
+        let mut decision = self.decision.lock().unwrap_or_else(PoisonError::into_inner);
+        while *decision == TpGateDecision::Pending {
             decision = self
                 .changed
                 .wait(decision)
                 .unwrap_or_else(PoisonError::into_inner);
         }
         *decision
-    }
-
-    fn resolve(&self, next: TpCommandDecision) -> bool {
-        let mut decision = self.decision.lock().unwrap_or_else(PoisonError::into_inner);
-        if *decision != TpCommandDecision::Pending {
-            return false;
-        }
-        *decision = next;
-        self.changed.notify_all();
-        true
     }
 }
 
@@ -442,7 +439,7 @@ impl Qwen35TpExecutor {
 
         let nccl_id = cudarc::nccl::safe::Id::new()
             .map_err(|e| anyhow::anyhow!("failed to create Qwen3.5 TP NCCL id: {e:?}"))?;
-        let startup_gate = Arc::new(TpStartupGate::default());
+        let startup_gate = Arc::new(TpGate::default());
         let effective_max_batch = Arc::new(AtomicUsize::new(0));
         let poison = Arc::new(TpRuntimePoison::default());
         let mut workers = Vec::with_capacity(world_size);
@@ -467,7 +464,7 @@ impl Qwen35TpExecutor {
                     startups.push(startup);
                 }
                 Err(err) => {
-                    startup_gate.cancel();
+                    startup_gate.resolve(TpGateDecision::Cancel);
                     return Err(err);
                 }
             }
@@ -479,11 +476,11 @@ impl Qwen35TpExecutor {
                     min_rank_max_batch = min_rank_max_batch.min(rank_max_batch);
                 }
                 Ok(Err(err)) => {
-                    startup_gate.cancel();
+                    startup_gate.resolve(TpGateDecision::Cancel);
                     return Err(err);
                 }
                 Err(_) => {
-                    startup_gate.cancel();
+                    startup_gate.resolve(TpGateDecision::Cancel);
                     return Err(anyhow::anyhow!(
                         "Qwen3.5 TP worker {rank} exited during pre-NCCL startup"
                     ));
@@ -503,11 +500,11 @@ impl Qwen35TpExecutor {
         let (watchdog_done, watchdog) = match spawn_nccl_startup_watchdog() {
             Ok(watchdog) => watchdog,
             Err(err) => {
-                startup_gate.cancel();
+                startup_gate.resolve(TpGateDecision::Cancel);
                 return Err(err);
             }
         };
-        startup_gate.connect();
+        startup_gate.resolve(TpGateDecision::Go);
         let startup_result = startups
             .into_iter()
             .enumerate()
@@ -1013,7 +1010,7 @@ impl Qwen35TpExecutor {
     fn dispatch_mutating(
         &self,
         operation: &'static str,
-        build: impl Fn(Arc<TpCommandStartGate>, mpsc::Sender<TpWorkerResponse>) -> TpWorkerCommand,
+        build: impl Fn(Arc<TpGate>, mpsc::Sender<TpWorkerResponse>) -> TpWorkerCommand,
     ) -> Result<mpsc::Receiver<TpWorkerResponse>> {
         dispatch_mutating_commands(
             self.world_size,
@@ -1039,15 +1036,15 @@ fn dispatch_mutating_commands(
     world_size: usize,
     operation: &'static str,
     poison: &TpRuntimePoison,
-    build: impl Fn(Arc<TpCommandStartGate>, mpsc::Sender<TpWorkerResponse>) -> TpWorkerCommand,
+    build: impl Fn(Arc<TpGate>, mpsc::Sender<TpWorkerResponse>) -> TpWorkerCommand,
     mut send: impl FnMut(usize, TpWorkerCommand) -> Result<()>,
 ) -> Result<mpsc::Receiver<TpWorkerResponse>> {
-    let start = Arc::new(TpCommandStartGate::default());
+    let start = Arc::new(TpGate::default());
     let (resp_tx, resp_rx) = mpsc::channel();
     for rank in 0..world_size {
         let command = build(Arc::clone(&start), resp_tx.clone());
         if let Err(err) = send(rank, command) {
-            start.cancel();
+            start.resolve(TpGateDecision::Cancel);
             let reason = poison.poison(format!(
                 "failed to dispatch {operation} to TP worker rank {rank}: {err:#}"
             ));
@@ -1055,7 +1052,7 @@ fn dispatch_mutating_commands(
         }
     }
     drop(resp_tx);
-    let resolved = start.execute();
+    let resolved = start.resolve(TpGateDecision::Go);
     debug_assert!(resolved, "fresh TP command gate resolved more than once");
     Ok(resp_rx)
 }
@@ -1496,7 +1493,7 @@ mod tests {
 
     #[test]
     fn startup_gate_cancel_releases_waiting_workers() {
-        let gate = Arc::new(TpStartupGate::default());
+        let gate = Arc::new(TpGate::default());
         let worker_gate = Arc::clone(&gate);
         let (done_tx, done_rx) = mpsc::channel();
         let waiter = thread::spawn(move || {
@@ -1505,10 +1502,11 @@ mod tests {
 
         gate.cancel();
 
-        assert!(
-            !done_rx
+        assert_eq!(
+            done_rx
                 .recv_timeout(std::time::Duration::from_secs(1))
-                .expect("cancelled startup gate should release workers within one second")
+                .expect("cancelled startup gate should release workers within one second"),
+            TpGateDecision::Cancel,
         );
         waiter.join().unwrap();
     }
@@ -1634,7 +1632,7 @@ mod tests {
         let TpWorkerCommand::RunPrefillChunks { start, .. } = rank0_rx.recv().unwrap() else {
             panic!("expected prefill command")
         };
-        assert_eq!(start.wait(), TpCommandDecision::Cancel);
+        assert_eq!(start.wait(), TpGateDecision::Cancel);
         assert!(matches!(
             rank1_rx.try_recv(),
             Err(mpsc::TryRecvError::Empty)

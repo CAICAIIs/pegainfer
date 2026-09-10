@@ -48,49 +48,6 @@ pub(super) struct TpWorker {
     done: mpsc::Receiver<()>,
 }
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-enum TpStartupDecision {
-    #[default]
-    Pending,
-    Connect,
-    Cancel,
-}
-
-#[derive(Default)]
-pub(super) struct TpStartupGate {
-    decision: Mutex<TpStartupDecision>,
-    changed: Condvar,
-}
-
-impl TpStartupGate {
-    pub(super) fn connect(&self) {
-        self.set(TpStartupDecision::Connect);
-    }
-
-    pub(super) fn cancel(&self) {
-        self.set(TpStartupDecision::Cancel);
-    }
-
-    pub(super) fn wait(&self) -> bool {
-        let mut decision = self.decision.lock().unwrap_or_else(PoisonError::into_inner);
-        while *decision == TpStartupDecision::Pending {
-            decision = self
-                .changed
-                .wait(decision)
-                .unwrap_or_else(PoisonError::into_inner);
-        }
-        *decision == TpStartupDecision::Connect
-    }
-
-    fn set(&self, next: TpStartupDecision) {
-        let mut decision = self.decision.lock().unwrap_or_else(PoisonError::into_inner);
-        if *decision == TpStartupDecision::Pending {
-            *decision = next;
-            self.changed.notify_all();
-        }
-    }
-}
-
 impl TpWorker {
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::type_complexity)]
@@ -102,7 +59,7 @@ impl TpWorker {
         max_prefill_tokens: usize,
         graph_enabled: bool,
         nccl_id: cudarc::nccl::safe::Id,
-        startup_gate: Arc<TpStartupGate>,
+        startup_gate: Arc<TpGate>,
         effective_max_batch: Arc<AtomicUsize>,
         poison: Arc<TpRuntimePoison>,
     ) -> Result<(
@@ -137,7 +94,7 @@ impl TpWorker {
                             return;
                         }
                     };
-                    if !startup_gate.wait() {
+                    if startup_gate.wait() != TpGateDecision::Go {
                         return;
                     }
                     let max_batch = effective_max_batch.load(Ordering::Acquire);
@@ -449,7 +406,7 @@ impl TpWorkerState {
                     start,
                     resp,
                 } => {
-                    if start.wait() == TpCommandDecision::Cancel {
+                    if start.wait() == TpGateDecision::Cancel {
                         false
                     } else {
                         let result = self.execute_prefill_chunks(&chunks, sample_seed);
@@ -462,7 +419,7 @@ impl TpWorkerState {
                     start,
                     resp,
                 } => {
-                    if start.wait() == TpCommandDecision::Cancel {
+                    if start.wait() == TpGateDecision::Cancel {
                         false
                     } else {
                         let result = self.execute_decode(&requests, sample_seed);
@@ -470,7 +427,7 @@ impl TpWorkerState {
                     }
                 }
                 TpWorkerCommand::RunUnifiedStep { plan, start, resp } => {
-                    if start.wait() == TpCommandDecision::Cancel {
+                    if start.wait() == TpGateDecision::Cancel {
                         false
                     } else {
                         let result = self.execute_unified(&plan);
@@ -483,7 +440,7 @@ impl TpWorkerState {
                     start,
                     resp,
                 } => {
-                    if start.wait() == TpCommandDecision::Cancel {
+                    if start.wait() == TpGateDecision::Cancel {
                         false
                     } else {
                         let result = self
@@ -493,7 +450,7 @@ impl TpWorkerState {
                     }
                 }
                 TpWorkerCommand::Precapture { phase, start, resp } => {
-                    if start.wait() == TpCommandDecision::Cancel {
+                    if start.wait() == TpGateDecision::Cancel {
                         false
                     } else {
                         let result = self.precapture_phase(phase).map(|()| TpWorkerReply::Ack);
