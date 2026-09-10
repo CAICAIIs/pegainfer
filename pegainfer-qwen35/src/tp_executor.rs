@@ -1500,7 +1500,7 @@ mod tests {
             let _ = done_tx.send(worker_gate.wait());
         });
 
-        gate.cancel();
+        gate.resolve(TpGateDecision::Cancel);
 
         assert_eq!(
             done_rx
