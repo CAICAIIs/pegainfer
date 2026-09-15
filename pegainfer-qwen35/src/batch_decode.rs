@@ -694,15 +694,7 @@ impl Qwen35Model {
             eps,
             &mut bufs.normed,
         )?;
-        ops::gemm_rows_into_checked(
-            &self.ctx,
-            self.output_projection(),
-            0,
-            self.config.selection_vocab,
-            &bufs.normed,
-            &mut bufs.logits,
-        )?;
-        self.suppress_pad_logits(&mut bufs.logits)?;
+        self.output_logits_into(&bufs.normed, &mut bufs.logits)?;
         debug_assert_eq!(bufs.logits.seq_len, padded_bs);
 
         Ok(())
@@ -773,15 +765,7 @@ impl Qwen35Model {
             eps,
             &mut bufs.normed,
         )?;
-        ops::gemm_rows_into_checked(
-            &self.ctx,
-            self.output_projection(),
-            0,
-            self.config.selection_vocab,
-            &bufs.normed,
-            &mut bufs.logits,
-        )?;
-        self.suppress_pad_logits(&mut bufs.logits)?;
+        self.output_logits_into(&bufs.normed, &mut bufs.logits)?;
         debug_assert_eq!(bufs.logits.seq_len, bs);
         Ok(())
     }

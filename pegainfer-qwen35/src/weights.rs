@@ -7,6 +7,8 @@ use cudarc::nccl::safe::Comm;
 use cudarc::nccl::safe::ReduceOp;
 use log::debug;
 use log::info;
+use pegainfer_core::ops::gemm_rows_into_checked;
+use pegainfer_core::ops::suppress_logits_bf16_in_place;
 use pegainfer_core::rope::RopeTableSpec;
 use pegainfer_core::rope::precompute_rope;
 use pegainfer_core::tensor::DeviceContext;
@@ -69,8 +71,9 @@ pub struct Qwen35Model {
     /// (e.g. `--max-batch 5` allocates bucket 8 but admits at most 5). See #470.
     pub(super) decode_admission_batch: usize,
     tp_comm: Option<Comm>,
-    /// -inf suppression for the tile-alignment pad rows of the logits GEMM
-    /// (absent when the selection width needs no padding).
+    /// -inf suppression for the tile-alignment pad rows, applied by
+    /// [`Qwen35Model::output_logits_into`] (absent when the selection width
+    /// needs no padding).
     pad_logit_suppress: Option<crate::ops::SuppressIds>,
 }
 
@@ -348,18 +351,37 @@ impl Qwen35Model {
         &self.config
     }
 
+    /// Only the GEMM tuning helper samples this directly; logits go through
+    /// [`Qwen35Model::output_logits_into`] so the pad-row mask cannot be skipped.
     pub(super) fn output_projection(&self) -> &DeviceMatrix {
         self.lm_head.as_ref().unwrap_or(&self.embed_tokens)
     }
 
-    /// Force the tile-alignment pad rows of a logits buffer to -inf.
-    pub(crate) fn suppress_pad_logits(&self, logits: &mut HiddenStates) -> Result<()> {
-        match &self.pad_logit_suppress {
-            Some(suppress) => {
-                crate::ops::suppress_logits_bf16_in_place(&self.ctx, logits, suppress)
-            }
-            None => Ok(()),
+    /// Write selectable logits for `normed` rows: the output-projection GEMM
+    /// followed by the tile-alignment pad-row mask.
+    ///
+    /// The two belong together — a site that ran the GEMM alone would leave the
+    /// pad rows selectable, which on the wire is an undecodable id fed back into
+    /// later decode steps rather than a failure — so this is the only way the
+    /// model produces logits.
+    pub(crate) fn output_logits_into(
+        &self,
+        normed: &HiddenStates,
+        logits: &mut HiddenStates,
+    ) -> Result<()> {
+        let vocab = self.config.selection_vocab;
+        gemm_rows_into_checked(
+            &self.ctx,
+            self.output_projection(),
+            0,
+            vocab,
+            normed,
+            logits,
+        )?;
+        if let Some(suppress) = &self.pad_logit_suppress {
+            suppress_logits_bf16_in_place(&self.ctx, logits, suppress)?;
         }
+        Ok(())
     }
 
     pub(crate) fn ensure_rope_cache_covers(&self, positions: usize) -> Result<()> {

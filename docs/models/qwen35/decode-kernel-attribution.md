@@ -51,7 +51,7 @@ Fixed by aligning the selection width to the 128-token tile multiple (`248077 �
 
 The widened width is a GEMM decision, not a token-space one, so two invariants keep it from leaking into selection. Both are silent when broken — the pad rows are trained embeddings with plausible logits:
 
-- **The pad rows must be unselectable.** `248077..248192` are real checkpoint rows but not decodable tokens; `suppress_pad_logits` forces them to `-inf` after every logits GEMM (uploaded once at load, runs inside the decode CUDA Graph). Without it a permissive sample can emit an undecodable id and feed it back into later decode steps.
+- **The pad rows must be unselectable.** `248077..248192` are real checkpoint rows but not decodable tokens; `Qwen35Model::output_logits_into` forces them to `-inf` right after the output-projection GEMM (uploaded once at load, runs inside the decode CUDA Graph). Without it a permissive sample can emit an undecodable id and feed it back into later decode steps. The GEMM and the mask are one method rather than two statements at each site, because a site that ran the GEMM alone fails silently — the pad rows carry plausible logits.
 - **The pad rows must not move the routing threshold.** `effectively_greedy`'s `top_p <= 1/vocab` nucleus has to be measured against the decodable width, not the arena: a `top_p` between `1/248077` and `1/248192` is effectively greedy and must keep taking the deterministic argmax path instead of the rejection sampler, which picks an arbitrary member of a bf16-tied top. `SampleScratch` carries that width separately (`with_selection_width`) so a padded arena routes exactly the rows an unpadded one would.
 
 ### 5. What is NOT the problem

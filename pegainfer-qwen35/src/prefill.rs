@@ -117,15 +117,7 @@ impl Qwen35Model {
             &mut normed,
         )?;
         let mut logits = HiddenStates::zeros(&self.ctx, self.config.selection_vocab, n)?;
-        ops::gemm_rows_into_checked(
-            &self.ctx,
-            self.output_projection(),
-            0,
-            self.config.selection_vocab,
-            &normed,
-            &mut logits,
-        )?;
-        self.suppress_pad_logits(&mut logits)?;
+        self.output_logits_into(&normed, &mut logits)?;
         debug_assert_eq!(logits.seq_len, n);
         Ok(logits)
     }
