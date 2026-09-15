@@ -153,9 +153,15 @@ mod tests {
         let params = vec![pegainfer_frontend::sampler::SamplingParams::default(); rows];
         let params_refs: Vec<&pegainfer_frontend::sampler::SamplingParams> =
             params.iter().collect();
-        let mut scratch =
-            pegainfer_sample::SampleScratch::new(&model.ctx, model.config.selection_vocab, rows)
-                .unwrap();
+        // Mirrors the production scratch: the arena spans the tile-aligned
+        // selection width, the routing decision keys off the decodable vocab.
+        let mut scratch = pegainfer_sample::SampleScratch::with_selection_width(
+            &model.ctx,
+            model.config.selection_vocab,
+            model.config.decodable_vocab,
+            rows,
+        )
+        .unwrap();
         let steps = vec![0u64; params_refs.len()];
         pegainfer_sample::select_batch(&model.ctx, logits, &params_refs, &steps, 0, &mut scratch)
             .unwrap()

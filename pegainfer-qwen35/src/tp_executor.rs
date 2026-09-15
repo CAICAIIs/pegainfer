@@ -1395,9 +1395,10 @@ impl TpWorkerPrepared {
             prefill_scratch_bytes as f64 / 1024.0 / 1024.0,
         );
         let decode_buffers = model.create_batch_decode_buffers_with_capacity(max_batch)?;
-        let sample_scratch = pegainfer_sample::SampleScratch::new(
+        let sample_scratch = pegainfer_sample::SampleScratch::with_selection_width(
             model.device_ctx(),
             model.config().selection_vocab,
+            model.config().decodable_vocab,
             max_batch,
         )?;
         Ok((

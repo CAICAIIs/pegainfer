@@ -103,11 +103,14 @@ pub(crate) struct Config35 {
     /// `false` requires a top-level `lm_head.weight`; `true` reuses `embed_tokens`.
     pub(crate) tie_word_embeddings: bool,
 
-    /// Token-selection width: `vocab_size` bounded to the frontend-decodable vocab.
+    /// Token-selection width: `vocab_size` bounded to the frontend-decodable
+    /// vocab, then rounded up to the logits GEMM's tile multiple. Buffers and
+    /// the sampler arena span this width.
     pub(crate) selection_vocab: usize,
-    /// Tokenizer-decodable width. The selection width may be tile-aligned
-    /// past this (see [`Config35::bound_selection_vocab`]); logits rows beyond
-    /// it are suppressed to -inf before selection.
+    /// Tokenizer-decodable width. The selection width may be tile-aligned past
+    /// this (see [`Config35::bound_selection_vocab`]); logits rows beyond it are
+    /// suppressed to -inf before selection, and the argmax-vs-sample routing
+    /// decision is measured against this width rather than the aligned one.
     pub(crate) decodable_vocab: usize,
 }
 
@@ -150,12 +153,27 @@ impl Config35 {
         self.linear_num_value_heads * self.linear_value_head_dim
     }
 
-    /// Bound the output-selection width to the frontend-decodable vocab.
+    /// Bound the output-selection width to the frontend-decodable vocab and
+    /// record the two widths that follow from it.
     ///
     /// The frontend decodes a dense prefix of the vocab; the checkpoint may pad
     /// beyond it. Refusing a tokenizer wider than the checkpoint is the
     /// fail-closed rule, and it is checked here at the validation boundary
     /// rather than scattered through the loader.
+    ///
+    /// The two widths the rest of the crate keys off:
+    ///
+    /// * [`Config35::selection_vocab`] — the alignable one: logits buffers, the
+    ///   sampler arena and the output-projection GEMM all span it, and the pad
+    ///   rows past the decodable vocab are suppressed to -inf before selection.
+    /// * [`Config35::decodable_vocab`] — the semantic one: the tokens that can
+    ///   actually be emitted, hence the width the argmax-vs-sample routing
+    ///   decision is measured against.
+    ///
+    /// Keeping them separate is what lets the GEMM be widened for throughput
+    /// without moving `top_p <= 1/vocab` routing: pad columns are not tokens, so
+    /// they must not decide whether an effectively-greedy request takes the
+    /// deterministic argmax path or the rejection sampler.
     pub(crate) fn bound_selection_vocab(
         &mut self,
         effective_vocab: usize,
