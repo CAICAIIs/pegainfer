@@ -353,7 +353,7 @@ impl Qwen35Model {
 
     /// Only the GEMM tuning helper samples this directly; logits go through
     /// [`Qwen35Model::output_logits_into`] so the pad-row mask cannot be skipped.
-    pub(super) fn output_projection(&self) -> &DeviceMatrix {
+    fn output_projection(&self) -> &DeviceMatrix {
         self.lm_head.as_ref().unwrap_or(&self.embed_tokens)
     }
 
