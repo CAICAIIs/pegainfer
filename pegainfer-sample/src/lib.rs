@@ -83,9 +83,8 @@ pub struct SampleScratch {
     /// Vocab width every buffer above was sized for; `select_batch` rejects a
     /// logits arena whose `hidden_dim` differs, since the sizes are baked in.
     vocab: usize,
-    /// Width the argmax-vs-sample routing decision is measured against. Equal
-    /// to `vocab` unless a model tile-aligns its logits width past the tokens
-    /// it can actually emit (see [`SampleScratch::with_selection_width`]).
+    /// Width the argmax-vs-sample routing decision is measured against: the
+    /// emittable tokens, not the arena a model may have tile-aligned wider.
     selection_width: usize,
     max_rows: usize,
 }
@@ -95,20 +94,11 @@ impl SampleScratch {
         Self::with_selection_width(ctx, vocab, vocab, max_rows)
     }
 
-    /// Build scratch for a logits arena that spans `vocab` columns while the
-    /// model can only emit the first `selection_width` ids.
-    ///
-    /// A model may widen its logits past the decodable vocab to reach a GEMM
-    /// tile multiple (qwen35's output projection: an odd decodable vocab drops
-    /// cublasLt onto an align-1 kernel), suppressing the extra rows to `-inf`
-    /// before selection. The arena still spans the widened `vocab`, but those
-    /// pad columns are not tokens, so they must not widen the
-    /// `top_p <= 1/vocab` nucleus [`effectively_greedy`] keys off: a `top_p` at
-    /// or below `1/selection_width` stays an effectively-greedy request and has
-    /// to keep taking the deterministic argmax path, rather than falling to the
-    /// rejection sampler over bf16-tied maxima because the arena was widened.
-    /// Equivalently, `selection_width` is the width at which a padded arena
-    /// routes exactly the rows an unpadded arena would.
+    /// For an arena spanning `vocab` columns whose last `vocab - selection_width`
+    /// columns the model cannot emit (it widened them to reach a GEMM tile
+    /// multiple). Those pad columns must not widen the `top_p <= 1/vocab`
+    /// nucleus [`effectively_greedy`] keys off, or a request that is effectively
+    /// greedy would drop to the rejection sampler over bf16-tied maxima.
     pub fn with_selection_width(
         ctx: &DeviceContext,
         vocab: usize,
@@ -167,12 +157,6 @@ impl SampleScratch {
     pub fn vocab(&self) -> usize {
         self.vocab
     }
-
-    /// Width the argmax-vs-sample routing decision is measured against — the
-    /// semantic vocab, not the (possibly tile-aligned) arena width.
-    pub fn selection_width(&self) -> usize {
-        self.selection_width
-    }
 }
 
 /// Pick the next token for every row of a logits arena.
@@ -189,9 +173,8 @@ impl SampleScratch {
 /// argmax survives. Routing those through argmax keeps an effectively-greedy
 /// request deterministic — the rejection sampler would otherwise pick an
 /// arbitrary member of a bf16-tied top — and skips a softmax it does not need.
-/// `vocab` here is `scratch`'s semantic selection width, which is narrower than
-/// the arena when a model aligned its logits GEMM (see
-/// [`SampleScratch::with_selection_width`]).
+/// `vocab` here is `scratch`'s selection width, narrower than the arena when a
+/// model aligned its logits GEMM.
 ///
 /// `seed` must be fresh per decode step (one engine seed at startup, advanced
 /// per step); unseeded rows decorrelate through the philox subsequence.
@@ -237,9 +220,8 @@ pub fn select_batch(
         "select_batch: logits vocab {vocab} != scratch vocab {}",
         scratch.vocab
     );
-    // Route on the semantic width, not the arena width: `scratch`'s buffers
-    // span `vocab`, but pad columns a model aligned its GEMM to are not
-    // emittable tokens, so they must not move the `top_p <= 1/vocab` nucleus.
+    // Pad columns a model aligned its GEMM to are not emittable tokens, so they
+    // must not move the `top_p <= 1/vocab` nucleus.
     let is_argmax = |p: &&SamplingParams| effectively_greedy(p, scratch.selection_width);
     let mut tokens = vec![0u32; n];
 

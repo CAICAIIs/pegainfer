@@ -311,9 +311,8 @@ impl Qwen35Model {
             page_size,
             num_pages,
         )?;
-        // Rows the selection width adds past the decodable vocab are real
-        // checkpoint embeddings but not decodable tokens; force their logits
-        // to -inf so they can never win selection.
+        // The alignment pad rows are real checkpoint embeddings but not
+        // decodable tokens, so they must never win selection.
         let pad_logit_suppress = if config.selection_vocab > config.decodable_vocab {
             let ids: Vec<u32> = (config.decodable_vocab..config.selection_vocab)
                 .map(|id| id as u32)
@@ -353,9 +352,7 @@ impl Qwen35Model {
         self.lm_head.as_ref().unwrap_or(&self.embed_tokens)
     }
 
-    /// Suppress the tile-alignment pad rows of a logits buffer: rows past the
-    /// decodable vocab are forced to -inf so they can never win greedy or
-    /// sampled selection (a no-op when the width needs no padding).
+    /// Force the tile-alignment pad rows of a logits buffer to -inf.
     pub(crate) fn suppress_pad_logits(&self, logits: &mut HiddenStates) -> Result<()> {
         match &self.pad_logit_suppress {
             Some(suppress) => {

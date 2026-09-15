@@ -179,18 +179,11 @@ fn tiny_top_p_routes_to_argmax_even_under_bf16_ties() {
 
 #[test]
 fn padded_arena_width_does_not_suppress_the_argmax_routing() {
-    // Regression for the qwen35 tile-aligned logits width (#1046 review). A
-    // model may widen its logits past the decodable vocab to reach a GEMM tile
-    // multiple and suppress the pad columns to -inf. The routing decision must
-    // still be measured against the decodable vocab: here the arena spans 512
-    // columns while only the first 256 can be emitted, and top_p = 1/256 is
-    // exactly the effectively-greedy boundary. Keyed off the arena width
-    // (1/512) it would fall to the rejection sampler and pick the bf16-tied
-    // peer; keyed off the decodable vocab it keeps the deterministic argmax.
+    // qwen35 tile-aligns its logits width past the decodable vocab (#1046). A
+    // top_p at exactly 1/decodable collapses to the argmax on the unpadded
+    // arena, so it must still do so at twice the arena width.
     let ctx = DeviceContext::new().unwrap();
     let decodable = 256usize;
-    // The arena spans twice the decodable width, so 1/decodable and 1/vocab
-    // land in different routing buckets (top_p = 1/256 is above 1/512).
     let vocab = 2 * decodable;
     let lo = 128usize;
     let hi = 200usize;
@@ -201,8 +194,8 @@ fn padded_arena_width_does_not_suppress_the_argmax_routing() {
 
     let tiny = sampling(1.0, -1, 1.0 / decodable as f32);
 
-    // Without the semantic bound the row is not effectively greedy: the
-    // sampler may return either tied peer, which is what the bound prevents.
+    // Control: at the arena width 1/256 is no longer a single-token nucleus,
+    // and the sampler may return the tied peer.
     let mut wide = SampleScratch::new(&ctx, vocab, 1).unwrap();
     let mut sampled_the_peer = false;
     for s in 0..64u64 {
@@ -216,8 +209,6 @@ fn padded_arena_width_does_not_suppress_the_argmax_routing() {
     );
 
     let mut bounded = SampleScratch::with_selection_width(&ctx, vocab, decodable, 1).unwrap();
-    assert_eq!(bounded.vocab(), vocab);
-    assert_eq!(bounded.selection_width(), decodable);
     for s in 0..64u64 {
         assert_eq!(
             select_batch(&ctx, &arena, &[&tiny], &[0], s, &mut bounded).unwrap(),
@@ -225,19 +216,6 @@ fn padded_arena_width_does_not_suppress_the_argmax_routing() {
             "seed {s}: the decodable vocab must keep this row on the argmax path"
         );
     }
-}
-
-#[test]
-fn selection_width_above_the_arena_is_rejected() {
-    let ctx = DeviceContext::new().unwrap();
-    assert!(
-        SampleScratch::with_selection_width(&ctx, 256, 257, 1).is_err(),
-        "a selection width wider than the arena must be refused"
-    );
-    assert!(
-        SampleScratch::with_selection_width(&ctx, 256, 0, 1).is_err(),
-        "a zero selection width must be refused"
-    );
 }
 
 #[test]

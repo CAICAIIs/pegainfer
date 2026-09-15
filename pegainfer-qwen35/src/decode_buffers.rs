@@ -116,9 +116,6 @@ impl BatchDecodeBuffers35 {
             kv_tile_indices_d: ctx.stream.alloc_zeros(bs)?,
             kv_chunk_size_d: ctx.stream.alloc_zeros(bs)?,
 
-            // The arena spans the tile-aligned selection width; the
-            // argmax-vs-sample routing keys off the decodable vocab instead, so
-            // pad columns cannot move the `top_p <= 1/vocab` routing decision.
             sample: pegainfer_sample::SampleScratch::with_selection_width(
                 ctx,
                 config.selection_vocab,
