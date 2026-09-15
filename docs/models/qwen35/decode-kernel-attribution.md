@@ -49,6 +49,11 @@ Neither kernel has had an sm_80 tuning pass (decode tuning history is sm_120/RTX
 
 Fixed by aligning the selection width to the 128-token tile multiple (`248077 → 248192`, still inside the 248,320-row checkpoint weight) at the `bound_selection_vocab` boundary, so every downstream buffer and the sampler stay consistent. The align-1 kernel disappears; measured on A100-40GB: c16 TPOT `14.26 → 13.51 ms` (−5.3%), c8 `11.98 → 11.23`, QPS16 `23.77 → 22.68` (vLLM `23.60`); `hf_golden_gate` TP1/TP2 validate output equivalence against HF, which computes logits over the full checkpoint vocab itself.
 
+The widened width is a GEMM decision, not a token-space one, so two invariants keep it from leaking into selection. Both are silent when broken — the pad rows are trained embeddings with plausible logits:
+
+- **The pad rows must be unselectable.** `248077..248192` are real checkpoint rows but not decodable tokens; `suppress_pad_logits` forces them to `-inf` after every logits GEMM (uploaded once at load, runs inside the decode CUDA Graph). Without it a permissive sample can emit an undecodable id and feed it back into later decode steps.
+- **The pad rows must not move the routing threshold.** `effectively_greedy`'s `top_p <= 1/vocab` nucleus has to be measured against the decodable width, not the arena: a `top_p` between `1/248077` and `1/248192` is effectively greedy and must keep taking the deterministic argmax path instead of the rejection sampler, which picks an arbitrary member of a bf16-tied top. `SampleScratch` carries that width separately (`with_selection_width`) so a padded arena routes exactly the rows an unpadded one would.
+
 ### 5. What is NOT the problem
 
 - bs1 GEMM/GEMV: ours 7.42 vs vLLM ~7.1 ms/step — both near the weight-read bandwidth floor.
