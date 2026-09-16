@@ -191,24 +191,22 @@ mod tests {
             assert_eq!(logits.hidden_dim, selection, "{label}: arena width");
             let row = crate::ops::extract_vec(&model.ctx, logits, 0).unwrap();
             let row = row.to_host(&model.ctx).unwrap();
-            for id in decodable..selection {
-                assert_eq!(
-                    f32::from(row[id]),
-                    f32::NEG_INFINITY,
-                    "{label}: pad id {id} survived selection (want -inf)"
+            for (id, value) in row.iter().enumerate().take(selection).skip(decodable) {
+                assert!(
+                    value.is_sign_negative() && value.is_infinite(),
+                    "{label}: pad id {id} survived selection (want -inf, got {value})"
                 );
             }
-            let live = (0..decodable)
-                .filter(|&id| f32::from(row[id]).is_finite())
-                .count();
-            assert!(live > 0, "{label}: decodable vocab came out entirely -inf");
+            assert!(
+                row[..decodable].iter().any(|value| value.is_finite()),
+                "{label}: decodable vocab came out entirely -inf"
+            );
         };
 
-        let prompts: Vec<Vec<u32>> = vec![vec![9707, 374, 220, 17]];
-        let prompt_refs: Vec<&[u32]> = prompts.iter().map(|p| p.as_slice()).collect();
+        let prompt_refs: Vec<&[u32]> = vec![&[9707, 374, 220, 17]];
         let mut kv_states = vec![model.alloc_kv()];
         let mut rec_states =
-            vec![RecurrentState::new(&model.ctx, &model.config, model.geometry).unwrap()];
+            [RecurrentState::new(&model.ctx, &model.config, model.geometry).unwrap()];
         let mut rec_refs: Vec<&mut RecurrentState> = rec_states.iter_mut().collect();
         let prefill_logits = model
             .batch_prefill_logits(&prompt_refs, &mut kv_states, &mut rec_refs)
