@@ -153,12 +153,81 @@ mod tests {
         let params = vec![pegainfer_frontend::sampler::SamplingParams::default(); rows];
         let params_refs: Vec<&pegainfer_frontend::sampler::SamplingParams> =
             params.iter().collect();
-        let mut scratch =
-            pegainfer_sample::SampleScratch::new(&model.ctx, model.config.selection_vocab, rows)
-                .unwrap();
+        let mut scratch = pegainfer_sample::SampleScratch::with_selection_width(
+            &model.ctx,
+            model.config.selection_vocab,
+            model.config.decodable_vocab,
+            rows,
+        )
+        .unwrap();
         let steps = vec![0u64; params_refs.len()];
         pegainfer_sample::select_batch(&model.ctx, logits, &params_refs, &steps, 0, &mut scratch)
             .unwrap()
+    }
+
+    /// The alignment pad columns must come out of the model already masked, on
+    /// both the prefill and the decode logits path. A logits site that ran the
+    /// output projection without the mask leaves them selectable, and nothing
+    /// else in the suite would notice: the pad rows are trained embeddings with
+    /// plausible logits, so the failure shows up as an undecodable id on the
+    /// wire rather than a crash.
+    #[test]
+    fn pad_columns_are_suppressed_on_the_model_logits_paths() {
+        let Some(model_path) = crate::test_fixture::model_path_or_skip(
+            "pad_columns_are_suppressed_on_the_model_logits_paths",
+        ) else {
+            return;
+        };
+        let model = Qwen35Model::from_safetensors(&model_path, 0, 2).unwrap();
+
+        let decodable = model.config.decodable_vocab;
+        let selection = model.config.selection_vocab;
+        if decodable == selection {
+            eprintln!("checkpoint needs no alignment pad; nothing to assert");
+            return;
+        }
+
+        let pad_tail_is_suppressed = |logits: &HiddenStates, label: &str| {
+            assert_eq!(logits.hidden_dim, selection, "{label}: arena width");
+            let row = crate::ops::extract_vec(&model.ctx, logits, 0).unwrap();
+            let row = row.to_host(&model.ctx).unwrap();
+            for (id, value) in row.iter().enumerate().take(selection).skip(decodable) {
+                assert!(
+                    value.is_sign_negative() && value.is_infinite(),
+                    "{label}: pad id {id} survived selection (want -inf, got {value})"
+                );
+            }
+            assert!(
+                row[..decodable].iter().any(|value| value.is_finite()),
+                "{label}: decodable vocab came out entirely -inf"
+            );
+        };
+
+        let prompt_refs: Vec<&[u32]> = vec![&[9707, 374, 220, 17]];
+        let mut kv_states = vec![model.alloc_kv()];
+        let mut rec_states =
+            [RecurrentState::new(&model.ctx, &model.config, model.geometry).unwrap()];
+        let mut rec_refs: Vec<&mut RecurrentState> = rec_states.iter_mut().collect();
+        let prefill_logits = model
+            .batch_prefill_logits(&prompt_refs, &mut kv_states, &mut rec_refs)
+            .unwrap();
+        pad_tail_is_suppressed(&prefill_logits, "prefill");
+
+        let next = greedy_sample_batch(&model, &prefill_logits, 1)[0];
+        let mut graph_state = model.create_batch_decode_graph_state().unwrap();
+        graph_state
+            .copy_state_to_slot(&model.ctx, &rec_states[0], 0)
+            .unwrap();
+        let mut kv_refs: Vec<&mut KvState> = kv_states.iter_mut().collect();
+        model
+            .batch_decode_graph(
+                &[next],
+                &mut kv_refs,
+                &mut graph_state,
+                DecodeGraphUse::Serve,
+            )
+            .unwrap();
+        pad_tail_is_suppressed(&graph_state.buffers.logits, "decode");
     }
 
     /// Verify that unified_step decode output matches batch_decode_graph standalone.

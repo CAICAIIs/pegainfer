@@ -116,7 +116,12 @@ impl BatchDecodeBuffers35 {
             kv_tile_indices_d: ctx.stream.alloc_zeros(bs)?,
             kv_chunk_size_d: ctx.stream.alloc_zeros(bs)?,
 
-            sample: pegainfer_sample::SampleScratch::new(ctx, config.selection_vocab, bs)?,
+            sample: pegainfer_sample::SampleScratch::with_selection_width(
+                ctx,
+                config.selection_vocab,
+                config.decodable_vocab,
+                bs,
+            )?,
             steps: Vec::new(),
 
             padding_page_id,

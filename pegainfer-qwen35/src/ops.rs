@@ -2,6 +2,7 @@
 
 pub(crate) use pegainfer_core::ops::GEMM_LT_MAX_N;
 pub(crate) use pegainfer_core::ops::PrefillPagedPlan;
+pub(crate) use pegainfer_core::ops::SuppressIds;
 pub(crate) use pegainfer_core::ops::add_batch;
 pub(crate) use pegainfer_core::ops::add_batch_into;
 pub(crate) use pegainfer_core::ops::embedding_batch;
@@ -9,7 +10,6 @@ pub(crate) use pegainfer_core::ops::extract_vec;
 pub(crate) use pegainfer_core::ops::gemm;
 pub(crate) use pegainfer_core::ops::gemm_into;
 pub(crate) use pegainfer_core::ops::gemm_lt_tune;
-pub(crate) use pegainfer_core::ops::gemm_rows_into_checked;
 pub(crate) use pegainfer_core::ops::paged_attention_batch_decode_hd256_into;
 pub(crate) use pegainfer_core::ops::paged_attention_batch_decode_via_prefill_hd256_into;
 pub(crate) use pegainfer_core::ops::qk_norm_partial_rope_batched_decode_hd256_into;
