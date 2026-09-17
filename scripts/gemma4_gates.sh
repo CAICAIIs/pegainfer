@@ -72,6 +72,13 @@ GATES_KV_AND_LANES=(
   "gpu,ckpt,fixtures serve::oracle::incremental_serving_matches_recompute"
   "gpu,ckpt serve::oracle::prefix_restore_matches_cold_path"
 )
+# The replacement global-attention kernel only exists in a build that had
+# TileLang or a pre-generated directory, and the gate says so rather than
+# passing quietly; it is listed apart because that is a build property, not a
+# prerequisite this script can arrange.
+GATES_TILELANG_GLOBAL=(
+  "gpu,ckpt,prompts,tlgeom serve::oracle::the_replacement_global_kernel_matches_the_incumbent"
+)
 # The disagreeing-config gate deliberately fails before any device is opened.
 GATES_LOADER=(
   "ckpt weights::load::tests::a_disagreeing_config_names_every_faulty_tensor"
@@ -108,6 +115,7 @@ MANIFEST_LIB=(
   "${GATES_LOADER[@]}"
   "${GATES_DEVICE[@]}"
   "${GATES_ROUTED[@]}"
+  "${GATES_TILELANG_GLOBAL[@]}"
 )
 GATES_FP8_PROFILE=(
   "serve::oracle::context_waypoints_match_hf"
@@ -132,14 +140,24 @@ GATES_GEMMA4_TOKENIZER_PARITY=(
   "ckpt,chatgolden string_form_chat_renders_match_hf_reference"
 )
 
-CHAT_GOLDEN=test_data/gemma4-tokenizer-golden.json
+# The fixture set is named by the checkpoint it was dumped from; the
+# committed set is 12b. Another tag selects fixtures dumped for another
+# checkpoint under the same names, and the gates are told where they are.
+FIXTURE_TAG=${PEGAINFER_GEMMA4_FIXTURE_TAG:-12b}
+[[ $FIXTURE_TAG =~ ^[a-z0-9]+$ ]] || { echo "gemma4 gates: PEGAINFER_GEMMA4_FIXTURE_TAG must be alphanumeric" >&2; exit 1; }
+# The committed chat reference predates the tag, so 12b keeps its own name.
+if [ "$FIXTURE_TAG" = 12b ]; then
+  CHAT_GOLDEN=test_data/gemma4-tokenizer-golden.json
+else
+  CHAT_GOLDEN=test_data/gemma4-$FIXTURE_TAG-tokenizer-golden.json
+fi
 FIXTURES=(
-  test_data/gemma4-12b-hf-golden.safetensors
-  test_data/gemma4-12b-hf-window-golden.safetensors
-  test_data/gemma4-12b-hf-longctx-golden.safetensors
-  test_data/gemma4-12b-generate.safetensors
+  test_data/gemma4-$FIXTURE_TAG-hf-golden.safetensors
+  test_data/gemma4-$FIXTURE_TAG-hf-window-golden.safetensors
+  test_data/gemma4-$FIXTURE_TAG-hf-longctx-golden.safetensors
+  test_data/gemma4-$FIXTURE_TAG-generate.safetensors
 )
-PROMPT_FIXTURE=test_data/gemma4-12b-generate.safetensors
+PROMPT_FIXTURE=test_data/gemma4-$FIXTURE_TAG-generate.safetensors
 
 die() { echo "gemma4 gates: $*" >&2; exit 1; }
 
@@ -154,6 +172,11 @@ gate_is_in() {
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root" || die "cannot enter the repository root"
+export PEGAINFER_GEMMA4_GOLDEN=$root/${FIXTURES[0]}
+export PEGAINFER_GEMMA4_WINDOW_GOLDEN=$root/${FIXTURES[1]}
+export PEGAINFER_GEMMA4_LONGCTX_GOLDEN=$root/${FIXTURES[2]}
+export PEGAINFER_GEMMA4_GENERATE=$root/${FIXTURES[3]}
+export PEGAINFER_GEMMA4_CHAT_GOLDEN=$root/$CHAT_GOLDEN
 
 [ -z "${PEGAINFER_KV_FP8+x}" ] || die \
   "PEGAINFER_KV_FP8 is ambient; PEGAINFER_GATE_STORAGE is the only storage switch"
@@ -317,6 +340,42 @@ print(f"preflight: {len(fixtures)} fixtures agree on revision {revision[:12]}")
 PY
 }
 
+# The generated kernels are compiled for one attention geometry; a gate that
+# declares `tlgeom` is dropped by name where the checkpoint has another.
+tlgeom_mismatch=""
+require_tlgeom() {
+  require_ckpt
+  local generator=pegainfer-gemma4/kernels/generate.py
+  tlgeom_mismatch=$(python3 - "$generator" "$ckpt" <<'PY'
+import json, os, re, sys
+
+generator, ckpt = sys.argv[1], sys.argv[2]
+source = open(generator).read()
+def const(name):
+    match = re.search(rf"^{name} = (\d+)$", source, re.M)
+    if not match:
+        raise SystemExit(f"{generator} no longer states {name}")
+    return int(match.group(1))
+
+heads, groups, head_dim = const("HEADS"), const("GROUPS"), const("HEAD_DIM")
+with open(os.path.join(ckpt, "config.json")) as fh:
+    config = json.load(fh)
+text = config.get("text_config", config)
+theirs = (
+    text["num_attention_heads"],
+    text["num_global_key_value_heads"],
+    text["global_head_dim"],
+)
+if theirs != (heads, groups and heads // groups, head_dim):
+    print(
+        f"the kernels are compiled for {heads} query heads over {heads // groups} "
+        f"at head dim {head_dim}; this checkpoint's global family is "
+        f"{theirs[0]} over {theirs[1]} at {theirs[2]}"
+    )
+PY
+  ) || die "the TileLang geometry preflight failed"
+}
+
 require_chatgolden() {
   [ -f "$CHAT_GOLDEN" ] || die "reference $CHAT_GOLDEN is missing (dump it on the test box first)"
 }
@@ -449,10 +508,24 @@ needs=" "
 for entry in "${selected[@]}"; do needs="$needs${entry%%|*} "; done
 needs=" ${needs//,/ } "
 demanded=""
-for want in gpu ckpt moeckpt prompts fixtures chatgolden; do
+for want in gpu ckpt moeckpt prompts fixtures chatgolden tlgeom; do
   case "$needs" in *" $want "*) "require_$want"; demanded="$demanded $want" ;; esac
 done
 echo "gemma4 gates: prerequisites$demanded"
+
+# A gate that declares `tlgeom` has nothing to compare on a checkpoint the
+# kernels were not compiled for, so it leaves the run by name.
+if [ -n "$tlgeom_mismatch" ]; then
+  kept=()
+  for entry in "${selected[@]}"; do
+    case ",${entry%%|*}," in
+      *,tlgeom,*) echo "gemma4 gates: not selected, $tlgeom_mismatch: ${entry##*|}" ;;
+      *) kept+=("$entry") ;;
+    esac
+  done
+  selected=("${kept[@]}")
+  [ ${#selected[@]} -gt 0 ] || die "every selected gate needed the kernels' own geometry"
+fi
 
 echo "gemma4 gates: source $(git rev-parse HEAD)$([ -n "$(git status --porcelain)" ] && echo ' (dirty)')"
 [ -z "$ckpt" ] || echo "gemma4 gates: checkpoint $ckpt"
