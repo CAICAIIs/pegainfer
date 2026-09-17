@@ -7,6 +7,8 @@ use cudarc::nccl::safe::Comm;
 use cudarc::nccl::safe::ReduceOp;
 use log::debug;
 use log::info;
+use pegainfer_core::ops::gemm_rows_into_checked;
+use pegainfer_core::ops::suppress_logits_bf16_in_place;
 use pegainfer_core::rope::RopeTableSpec;
 use pegainfer_core::rope::precompute_rope;
 use pegainfer_core::tensor::DeviceContext;
@@ -69,6 +71,10 @@ pub struct Qwen35Model {
     /// (e.g. `--max-batch 5` allocates bucket 8 but admits at most 5). See #470.
     pub(super) decode_admission_batch: usize,
     tp_comm: Option<Comm>,
+    /// -inf suppression for the tile-alignment pad rows, applied by
+    /// [`Qwen35Model::output_logits_into`] (absent when the selection width
+    /// needs no padding).
+    pad_logit_suppress: Option<crate::ops::SuppressIds>,
 }
 
 // SAFETY: A Qwen3.5 model instance is bound to one CUDA device and driven from
@@ -167,10 +173,10 @@ impl Qwen35Model {
         config
             .bound_selection_vocab(effective_vocab)
             .map_err(anyhow::Error::from)?;
-        if config.selection_vocab < config.vocab_size {
+        if config.selection_vocab != effective_vocab {
             info!(
-                "output projection: selection bounded to decodable vocab {} (checkpoint pads to {})",
-                config.selection_vocab, config.vocab_size
+                "output projection: selection width {} = decodable vocab {} + tile-alignment pad (checkpoint has {})",
+                config.selection_vocab, effective_vocab, config.vocab_size
             );
         }
 
@@ -308,6 +314,20 @@ impl Qwen35Model {
             page_size,
             num_pages,
         )?;
+        // The alignment pad rows are real checkpoint embeddings but not
+        // decodable tokens, so they must never win selection.
+        let pad_logit_suppress = if config.selection_vocab > config.decodable_vocab {
+            let ids: Vec<u32> = (config.decodable_vocab..config.selection_vocab)
+                .map(|id| id as u32)
+                .collect();
+            Some(crate::ops::SuppressIds::upload(
+                &ctx,
+                &ids,
+                config.selection_vocab,
+            )?)
+        } else {
+            None
+        };
 
         Ok(Self {
             ctx,
@@ -323,6 +343,7 @@ impl Qwen35Model {
             reserved_decode_slots: max_batch,
             decode_admission_batch,
             tp_comm: None,
+            pad_logit_suppress,
         })
     }
 
@@ -330,8 +351,37 @@ impl Qwen35Model {
         &self.config
     }
 
-    pub(super) fn output_projection(&self) -> &DeviceMatrix {
+    /// Only the GEMM tuning helper samples this directly; logits go through
+    /// [`Qwen35Model::output_logits_into`] so the pad-row mask cannot be skipped.
+    fn output_projection(&self) -> &DeviceMatrix {
         self.lm_head.as_ref().unwrap_or(&self.embed_tokens)
+    }
+
+    /// Write selectable logits for `normed` rows: the output-projection GEMM
+    /// followed by the tile-alignment pad-row mask.
+    ///
+    /// The two belong together — a site that ran the GEMM alone would leave the
+    /// pad rows selectable, which on the wire is an undecodable id fed back into
+    /// later decode steps rather than a failure — so this is the only way the
+    /// model produces logits.
+    pub(crate) fn output_logits_into(
+        &self,
+        normed: &HiddenStates,
+        logits: &mut HiddenStates,
+    ) -> Result<()> {
+        let vocab = self.config.selection_vocab;
+        gemm_rows_into_checked(
+            &self.ctx,
+            self.output_projection(),
+            0,
+            vocab,
+            normed,
+            logits,
+        )?;
+        if let Some(suppress) = &self.pad_logit_suppress {
+            suppress_logits_bf16_in_place(&self.ctx, logits, suppress)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn ensure_rope_cache_covers(&self, positions: usize) -> Result<()> {
