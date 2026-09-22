@@ -22,7 +22,7 @@
 | c16 | 12.80 | 79.2 | 673 | 1021 |
 | qps16 | 32.11 | 97.2 | 772 | 1134 |
 
-These are the split-KV side of the finding-4 differential, so they are the state of the tree once that change lands; the same cells read 9.41 / 11.25 / 13.06 / 32.11 ms on the FlashInfer path.
+These are the split-KV side of the finding-4 differential, so they are the state of the tree once that change lands; the same cells read 9.41 / 11.25 / 13.06 / 32.11 ms on the FlashInfer path. `docs/benchmarks/qwen35-4b-serving-a100-vllm027.md` carries the same-session comparison against vLLM 0.27.0 and the opt-in decode-overlap pose, which is where the ITL tails are won.
 
 ## Findings
 
