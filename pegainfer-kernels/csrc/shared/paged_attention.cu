@@ -823,36 +823,52 @@ split_decode_partial_hd256_kernel(
 
     const __nv_bfloat16* sk = &k_bufs[buf * kSplitDecodeTile * kSplitDecodeHeadDim];
     const __nv_bfloat16* sv = &v_bufs[buf * kSplitDecodeTile * kSplitDecodeHeadDim];
-    for (int j = 0; j < tn; ++j) {
-      float s = 0.0f;
+    // Two positions at a time. With the operands already in shared memory the
+    // per-position cost is an eight-deep FFMA chain behind five dependent
+    // shuffles, which is latency rather than throughput, and a second
+    // independent position gives the scheduler something to issue while the
+    // first chain waits.
+    for (int j = 0; j < tn; j += 2) {
+      const int last = min(j + 1, tn - 1);  // keeps the second read in bounds
+      const bool has_second = (j + 1) < tn;
+
+      float s0 = 0.0f;
+      float s1 = 0.0f;
 #pragma unroll
       for (int i = 0; i < kSplitDecodeVec; ++i) {
-        s += qf[i] * __bfloat162float(sk[j * kSplitDecodeHeadDim + head_base + i]);
+        s0 += qf[i] * __bfloat162float(sk[j * kSplitDecodeHeadDim + head_base + i]);
+        s1 += qf[i] * __bfloat162float(sk[last * kSplitDecodeHeadDim + head_base + i]);
       }
 #pragma unroll
       for (int o = 16; o > 0; o >>= 1) {
-        s += __shfl_xor_sync(0xffffffffu, s, o);
+        s0 += __shfl_xor_sync(0xffffffffu, s0, o);
+        s1 += __shfl_xor_sync(0xffffffffu, s1, o);
       }
-      s *= sm_scale;
+      s0 *= sm_scale;
+      s1 = has_second ? s1 * sm_scale : -INFINITY;
 
-      float p;
-      if (s > m_i) {
-        const float alpha = __expf(m_i - s);
+      const float pair_max = fmaxf(s0, s1);
+      if (pair_max > m_i) {
+        const float alpha = __expf(m_i - pair_max);
 #pragma unroll
         for (int i = 0; i < kSplitDecodeVec; ++i) {
           o_i[i] *= alpha;
         }
         l_i *= alpha;
-        m_i = s;
-        p = 1.0f;
-      } else {
-        p = __expf(s - m_i);
+        m_i = pair_max;
       }
-      l_i += p;
-
+      const float p0 = __expf(s0 - m_i);
+      const float p1 = has_second ? __expf(s1 - m_i) : 0.0f;
+      l_i += p0 + p1;
 #pragma unroll
       for (int i = 0; i < kSplitDecodeVec; ++i) {
-        o_i[i] += p * __bfloat162float(sv[j * kSplitDecodeHeadDim + head_base + i]);
+        o_i[i] += p0 * __bfloat162float(sv[j * kSplitDecodeHeadDim + head_base + i]);
+      }
+      if (has_second) {
+#pragma unroll
+        for (int i = 0; i < kSplitDecodeVec; ++i) {
+          o_i[i] += p1 * __bfloat162float(sv[last * kSplitDecodeHeadDim + head_base + i]);
+        }
       }
     }
     // Every warp is done with this buffer before tile + 2 copies into it.
