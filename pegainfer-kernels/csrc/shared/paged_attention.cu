@@ -684,6 +684,35 @@ constexpr int kSplitDecodeVec = 8;   // bf16 per lane per head-dim slice (32 * 8
 constexpr int kSplitDecodeGqa = 4;   // Qwen3.5-4B: 16 query heads over 4 kv heads
 constexpr int kSplitDecodeThreads = 32 * kSplitDecodeGqa;
 
+// KV positions staged per buffer. One cooperative copy serves all four warps
+// instead of each warp reading the same K and V through L1, and `cp.async`
+// copies global to shared without holding a register or stalling the warp, so
+// the next tile's copy overlaps the whole of the current tile's compute. At 8
+// the staging costs 16 KB of shared memory and leaves enough CTAs resident to
+// keep the compute side fed; 4 and 16 both measure worse, and 32 collapses
+// occupancy to two CTAs per SM and nearly doubles the c16 time.
+constexpr int kSplitDecodeTile = 8;
+
+__device__ __forceinline__ void split_decode_cp_async16(void* smem_dst, const void* gmem_src) {
+  const unsigned dst = static_cast<unsigned>(__cvta_generic_to_shared(smem_dst));
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(gmem_src));
+}
+
+__device__ __forceinline__ void split_decode_cp_commit() {
+  asm volatile("cp.async.commit_group;\n");
+}
+
+// `cp.async.wait_group` takes an immediate, and this file's entry points sit in
+// an `extern "C"` block where a template may not be declared, so the two depths
+// this kernel needs are two functions rather than one template.
+__device__ __forceinline__ void split_decode_cp_wait_all() {
+  asm volatile("cp.async.wait_group 0;\n");
+}
+
+__device__ __forceinline__ void split_decode_cp_wait_one() {
+  asm volatile("cp.async.wait_group 1;\n");
+}
+
 __global__ void __launch_bounds__(kSplitDecodeThreads)
 split_decode_partial_hd256_kernel(
     const __nv_bfloat16* __restrict__ q,        // [batch, num_qo_heads, head_dim]
@@ -698,6 +727,10 @@ split_decode_partial_hd256_kernel(
     float* __restrict__ partial_m,              // [splits, batch, num_qo_heads]
     float* __restrict__ partial_l,              // [splits, batch, num_qo_heads]
     int num_qo_heads, int num_kv_heads, int num_splits, float sm_scale) {
+  extern __shared__ __nv_bfloat16 split_decode_smem[];
+  __nv_bfloat16* k_bufs = split_decode_smem;                              // [2][tile][head_dim]
+  __nv_bfloat16* v_bufs = k_bufs + 2 * kSplitDecodeTile * kSplitDecodeHeadDim;
+
   const int split = blockIdx.x;
   const int kv_head = blockIdx.y;
   const int b = blockIdx.z;
@@ -744,75 +777,86 @@ split_decode_partial_hd256_kernel(
   }
 
   const int page_base = page_indptr[b];
+  const int tile_count =
+      (kv_end > kv_start) ? ((kv_end - kv_start + kSplitDecodeTile - 1) / kSplitDecodeTile) : 0;
 
-  // Every position's K and V are issued one position ahead, so a warp keeps two
-  // iterations' loads in flight instead of one. The loop around a global load is
-  // this kernel's whole cost: it runs at a 21% issue utilisation because each
-  // iteration consumes its own load before issuing the next, while a load-only
-  // control moves the same bytes from the same addresses 2.3x faster.
-  uint4 k_cur{};
-  uint4 v_cur{};
-  int64_t off_cur = 0;
-  if (kv_start < kv_end) {
-    const int page = kv_start / page_size;
-    const int slot = kv_start - page * page_size;
-    off_cur = (int64_t)page_indices[page_base + page] * stride_page +
-              ((int64_t)slot * num_kv_heads + kv_head) * kSplitDecodeHeadDim + head_base;
-    k_cur = *reinterpret_cast<const uint4*>(&k_pool[off_cur]);
-    v_cur = *reinterpret_cast<const uint4*>(&v_pool[off_cur]);
+  // One copy per tile, into the buffer whose parity is the tile index. The
+  // gather is per position because a tile can straddle pages, and the guard
+  // covers the short final tile.
+  auto split_decode_issue = [&](int tile) {
+    const int tile_start = kv_start + tile * kSplitDecodeTile;
+    const int tn = min(kSplitDecodeTile, kv_end - tile_start);
+    const int buf = tile & 1;
+    for (int c = threadIdx.x; c < tn * 32; c += kSplitDecodeThreads) {
+      const int row = c >> 5;
+      const int slice = c & 31;
+      const int token = tile_start + row;
+      const int page = token / page_size;
+      const int slot = token - page * page_size;
+      const int64_t off = (int64_t)page_indices[page_base + page] * stride_page +
+                          ((int64_t)slot * num_kv_heads + kv_head) * kSplitDecodeHeadDim +
+                          slice * kSplitDecodeVec;
+      const int at = (buf * kSplitDecodeTile + row) * kSplitDecodeHeadDim + slice * kSplitDecodeVec;
+      split_decode_cp_async16(&k_bufs[at], &k_pool[off]);
+      split_decode_cp_async16(&v_bufs[at], &v_pool[off]);
+    }
+    split_decode_cp_commit();
+  };
+
+  if (tile_count > 0) {
+    split_decode_issue(0);
   }
+  for (int tile = 0; tile < tile_count; ++tile) {
+    const int tile_start = kv_start + tile * kSplitDecodeTile;
+    const int tn = min(kSplitDecodeTile, kv_end - tile_start);
+    const int buf = tile & 1;
 
-  for (int j = kv_start; j < kv_end; ++j) {
-    // j is uniform across the warp, so the guard is a uniform branch.
-    uint4 k_next{};
-    uint4 v_next{};
-    int64_t off_next = off_cur;
-    if (j + 1 < kv_end) {
-      const int ntoken = j + 1;
-      const int npage = ntoken / page_size;
-      const int nslot = ntoken - npage * page_size;
-      off_next = (int64_t)page_indices[page_base + npage] * stride_page +
-                 ((int64_t)nslot * num_kv_heads + kv_head) * kSplitDecodeHeadDim + head_base;
-      k_next = *reinterpret_cast<const uint4*>(&k_pool[off_next]);
-      v_next = *reinterpret_cast<const uint4*>(&v_pool[off_next]);
+    // Issue the next tile before waiting on this one, so the copy overlaps the
+    // whole of the compute below rather than preceding it.
+    if (tile + 1 < tile_count) {
+      split_decode_issue(tile + 1);
+      split_decode_cp_wait_one();
+    } else {
+      split_decode_cp_wait_all();
     }
+    __syncthreads();
 
-    const __nv_bfloat16* kh = reinterpret_cast<const __nv_bfloat16*>(&k_cur);
-    float s = 0.0f;
-#pragma unroll
-    for (int i = 0; i < kSplitDecodeVec; ++i) {
-      s += qf[i] * __bfloat162float(kh[i]);
-    }
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) {
-      s += __shfl_xor_sync(0xffffffffu, s, o);
-    }
-    s *= sm_scale;
-
-    float p;
-    if (s > m_i) {
-      const float alpha = __expf(m_i - s);
+    const __nv_bfloat16* sk = &k_bufs[buf * kSplitDecodeTile * kSplitDecodeHeadDim];
+    const __nv_bfloat16* sv = &v_bufs[buf * kSplitDecodeTile * kSplitDecodeHeadDim];
+    for (int j = 0; j < tn; ++j) {
+      float s = 0.0f;
 #pragma unroll
       for (int i = 0; i < kSplitDecodeVec; ++i) {
-        o_i[i] *= alpha;
+        s += qf[i] * __bfloat162float(sk[j * kSplitDecodeHeadDim + head_base + i]);
       }
-      l_i *= alpha;
-      m_i = s;
-      p = 1.0f;
-    } else {
-      p = __expf(s - m_i);
-    }
-    l_i += p;
-
-    const __nv_bfloat16* vh = reinterpret_cast<const __nv_bfloat16*>(&v_cur);
 #pragma unroll
-    for (int i = 0; i < kSplitDecodeVec; ++i) {
-      o_i[i] += p * __bfloat162float(vh[i]);
-    }
+      for (int o = 16; o > 0; o >>= 1) {
+        s += __shfl_xor_sync(0xffffffffu, s, o);
+      }
+      s *= sm_scale;
 
-    k_cur = k_next;
-    v_cur = v_next;
-    off_cur = off_next;
+      float p;
+      if (s > m_i) {
+        const float alpha = __expf(m_i - s);
+#pragma unroll
+        for (int i = 0; i < kSplitDecodeVec; ++i) {
+          o_i[i] *= alpha;
+        }
+        l_i *= alpha;
+        m_i = s;
+        p = 1.0f;
+      } else {
+        p = __expf(s - m_i);
+      }
+      l_i += p;
+
+#pragma unroll
+      for (int i = 0; i < kSplitDecodeVec; ++i) {
+        o_i[i] += p * __bfloat162float(sv[j * kSplitDecodeHeadDim + head_base + i]);
+      }
+    }
+    // Every warp is done with this buffer before tile + 2 copies into it.
+    __syncthreads();
   }
 
 #pragma unroll
@@ -878,8 +922,18 @@ int paged_attention_decode_split_hd256_cuda(
     const __nv_bfloat16* v_base =
         reinterpret_cast<const __nv_bfloat16*>(kv_data) + v_offset_elems;
 
+    // Two buffers each of K and V, and the opt-in shared-memory size they need.
+    // Set once per process; a second call with the same value is harmless.
+    const int stage_smem = 4 * kSplitDecodeTile * kSplitDecodeHeadDim *
+                           static_cast<int>(sizeof(__nv_bfloat16));
+    cudaError_t smem_status = cudaFuncSetAttribute(
+        split_decode_partial_hd256_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, stage_smem);
+    if (smem_status != cudaSuccess) {
+      return static_cast<int>(smem_status);
+    }
+
     dim3 grid(num_splits, num_kv_heads, batch_size);
-    split_decode_partial_hd256_kernel<<<grid, kSplitDecodeThreads, 0, cu_stream>>>(
+    split_decode_partial_hd256_kernel<<<grid, kSplitDecodeThreads, stage_smem, cu_stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(q), k_base, v_base, stride_page, page_size,
         page_indices, page_indptr, kv_chunk_size_ptr,
         reinterpret_cast<float*>(partial_o), reinterpret_cast<float*>(partial_m),
