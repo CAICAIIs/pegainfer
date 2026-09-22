@@ -164,7 +164,7 @@ impl Qwen35Model {
                 &mut bufs.attn_out_full,
                 num_attention_heads,
                 bs,
-                super::decode_buffers::SPLIT_DECODE_SPLITS,
+                super::decode_buffers::split_decode_splits(bs),
             )?;
         } else {
             ops::paged_attention_batch_decode_hd256_into(

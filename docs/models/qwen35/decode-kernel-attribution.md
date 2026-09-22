@@ -109,15 +109,18 @@ That is −17% at bs1, −8% at bs4, and equal to −2% above. Deeper lookahead 
 
 Serving, same tree, zero failed requests, measured against the register form that shipped before both changes:
 
-| cell | register form | prefetch, then `cp.async` staging |
+| cell | register form | prefetch, `cp.async` staging, paired compute, per-bucket splits |
 | --- | --- | --- |
-| bs1 @1024, out 256, mean TPOT | 8.55 / 8.55 / 8.57 / 8.57 / 8.58 / 8.59 ms | **8.40 / 8.43 / 8.44 ms** |
-| c8 @1024, out 256, mean TPOT | 10.65 / 10.67 ms | **10.55 / 10.56 ms** |
-| c16 @1024, out 256, mean TPOT | 12.80 / 12.82 ms | **12.61 / 12.62 ms** |
-| c16 output throughput | 1019 / 1021 tok/s | **1027 / 1036 tok/s** |
-| qps16 | 32.10 / 32.11 ms | 32.00 / 32.14 ms |
+| bs1 @1024, out 256, mean TPOT | 8.55 / 8.55 / 8.57 / 8.57 / 8.58 / 8.59 ms | **8.38 / 8.42 / 8.40 / 8.41 / 8.41 / 8.42 ms** |
+| c8 @1024, out 256, mean TPOT | 10.65 / 10.67 ms | **10.42 / 10.47 ms** |
+| c8 output throughput | 647 / 654 tok/s | **661 / 665 tok/s** |
+| c16 @1024, out 256, mean TPOT | 12.80 / 12.82 ms | **12.55 / 12.55 ms** |
+| c16 output throughput | 1019 / 1021 tok/s | **1033 / 1038 tok/s** |
+| qps16 | 32.10 / 32.11 ms | 31.99 / 32.00 ms |
 
-That is −1.7% at bs1, −1.0% at c8 and −1.4% at c16, above this card's run-to-run spread on those cells, and it moves bs1 from 4.4% behind vLLM 0.27 (8.21 ms) to 2.6% behind.
+That is −1.8% at bs1, −1.9% at c8 and −2.0% at c16, which is above this card's run-to-run spread on those cells, and it moves bs1 from 4.4% behind vLLM 0.27 (8.21 ms) to 2.4% behind.
+
+The split count is per bucket rather than a constant, because each bucket's curve flattens somewhere else — 32 splits at batch 1 (27.98 µs against 34.98 at 16), 16 at batch 8 (57.26 against 60.58 at 32) and 16 at batch 16 (96.26 against 98.47) — and the threshold now covers the wide buckets a rate-limited client reaches, where FlashInfer's grid grows one CTA per request while the split form still reaches 932 GB/s at batch 64 against the 1235 GB/s floor. That last part is worth −1.1% at c8 and −0.4% at c16 on its own; qps16, whose decode width reaches 57, is unmoved.
 
 Interleaving two positions in the compute takes the partial kernel to 28.02 µs at bs1 and 98.63 at c16 against 29.98 and 100.31 for the one-position loop. With the operands already in shared memory the per-position cost is an eight-deep FFMA chain behind five dependent shuffles, which is latency rather than throughput, and the second position gives the scheduler something to issue while the first chain waits. The serving cells do not resolve it — bs1 8.38 / 8.42 / 8.40 ms against 8.40 / 8.43 / 8.44, c8 10.59 / 10.53 against 10.56 / 10.55, c16 12.62 / 12.59 against 12.62 / 12.61 — because 1.96 µs a layer-step at bs1 is 0.19% of an 8.4 ms step. It is kept on the kernel-path measurement, not on a serving claim.
 

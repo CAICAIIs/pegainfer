@@ -17,17 +17,33 @@ use super::config::LocalGeometry;
 /// single request, 64 for sixteen. Splitting the KV range instead wins at every
 /// bucket this threshold admits, measured on one tree with two runs a side:
 /// bs1 9.41/9.36 → 8.57/8.57 ms, c8 11.25/11.27 → 10.65/10.67, c16 13.06/13.08
-/// → 12.80/12.82 mean TPOT, qps16 unchanged. Above it the split kernel's own
-/// arithmetic cost dominates and the FlashInfer path stays. See
-/// `docs/models/qwen35/decode-kernel-attribution.md`.
-pub(crate) const SPLIT_DECODE_MAX_BATCH: usize = 16;
+/// → 12.80/12.82 mean TPOT, qps16 unchanged. It also covers the wide buckets a
+/// rate-limited client reaches, where FlashInfer's grid grows one CTA per
+/// request and the split form still reaches 932 GB/s at batch 64 against a
+/// 1235 GB/s load-only floor. See `docs/models/qwen35/decode-kernel-attribution.md`.
+pub(crate) const SPLIT_DECODE_MAX_BATCH: usize = 64;
 
-/// KV splits per (kv head, request) CTA group. Fixed rather than derived from
-/// KV length because the grid shape has to be constant across a captured
-/// CUDA Graph bucket; an over-split request simply leaves later CTAs empty, and
-/// 32 is where the bs1 curve flattens (100.5 µs at 8 splits, 56.4 at 16, 37.7 at
-/// 32 on the standalone harness).
-pub(crate) const SPLIT_DECODE_SPLITS: usize = 32;
+/// KV splits per (kv head, request) CTA group, for a decode bucket.
+///
+/// Fixed per bucket rather than derived from KV length because the grid shape
+/// has to be constant across a captured CUDA Graph bucket; an over-split request
+/// simply leaves later CTAs empty. The counts are where each bucket's curve
+/// flattens on the standalone harness: 32 splits is best at batch 1
+/// (27.98 µs against 34.98 at 16), 16 is best at batch 8 (57.26 against 60.58 at
+/// 32) and batch 16 (96.26 against 98.47), and 8 is best at batch 64 (288.03
+/// against 296.35 at 16).
+pub(crate) fn split_decode_splits(batch: usize) -> usize {
+    if batch <= 2 {
+        32
+    } else if batch <= 16 {
+        16
+    } else {
+        8
+    }
+}
+
+/// Upper bound on [`split_decode_splits`], for sizing the partial buffers.
+pub(crate) const SPLIT_DECODE_MAX_SPLITS: usize = 32;
 
 /// Pre-allocated GPU buffers for Qwen3.5 batch decode (N requests, 1 token each).
 pub(crate) struct BatchDecodeBuffers35 {
@@ -130,18 +146,18 @@ impl BatchDecodeBuffers35 {
             attn_out_full: HiddenStates::zeros(ctx, q_dim, bs)?,
 
             split_partial_o: ctx.stream.alloc_zeros(
-                SPLIT_DECODE_SPLITS
+                SPLIT_DECODE_MAX_SPLITS
                     * bs.min(SPLIT_DECODE_MAX_BATCH)
                     * geometry.local_num_attention_heads()
                     * 256,
             )?,
             split_partial_m: ctx.stream.alloc_zeros(
-                SPLIT_DECODE_SPLITS
+                SPLIT_DECODE_MAX_SPLITS
                     * bs.min(SPLIT_DECODE_MAX_BATCH)
                     * geometry.local_num_attention_heads(),
             )?,
             split_partial_l: ctx.stream.alloc_zeros(
-                SPLIT_DECODE_SPLITS
+                SPLIT_DECODE_MAX_SPLITS
                     * bs.min(SPLIT_DECODE_MAX_BATCH)
                     * geometry.local_num_attention_heads(),
             )?,
