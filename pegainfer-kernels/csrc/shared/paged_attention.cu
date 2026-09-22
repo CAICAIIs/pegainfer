@@ -744,19 +744,40 @@ split_decode_partial_hd256_kernel(
   }
 
   const int page_base = page_indptr[b];
-  int cur_page = -1;
-  int64_t page_off = 0;
-  for (int j = kv_start; j < kv_end; ++j) {
-    const int page = j / page_size;
-    if (page != cur_page) {
-      cur_page = page;
-      page_off = (int64_t)page_indices[page_base + page] * stride_page;
-    }
-    const int slot = j - page * page_size;
-    const int64_t off = page_off + ((int64_t)slot * num_kv_heads + kv_head) * kSplitDecodeHeadDim;
 
-    const uint4 kv = *reinterpret_cast<const uint4*>(&k_pool[off + head_base]);
-    const __nv_bfloat16* kh = reinterpret_cast<const __nv_bfloat16*>(&kv);
+  // Every position's K and V are issued one position ahead, so a warp keeps two
+  // iterations' loads in flight instead of one. The loop around a global load is
+  // this kernel's whole cost: it runs at a 21% issue utilisation because each
+  // iteration consumes its own load before issuing the next, while a load-only
+  // control moves the same bytes from the same addresses 2.3x faster.
+  uint4 k_cur{};
+  uint4 v_cur{};
+  int64_t off_cur = 0;
+  if (kv_start < kv_end) {
+    const int page = kv_start / page_size;
+    const int slot = kv_start - page * page_size;
+    off_cur = (int64_t)page_indices[page_base + page] * stride_page +
+              ((int64_t)slot * num_kv_heads + kv_head) * kSplitDecodeHeadDim + head_base;
+    k_cur = *reinterpret_cast<const uint4*>(&k_pool[off_cur]);
+    v_cur = *reinterpret_cast<const uint4*>(&v_pool[off_cur]);
+  }
+
+  for (int j = kv_start; j < kv_end; ++j) {
+    // j is uniform across the warp, so the guard is a uniform branch.
+    uint4 k_next{};
+    uint4 v_next{};
+    int64_t off_next = off_cur;
+    if (j + 1 < kv_end) {
+      const int ntoken = j + 1;
+      const int npage = ntoken / page_size;
+      const int nslot = ntoken - npage * page_size;
+      off_next = (int64_t)page_indices[page_base + npage] * stride_page +
+                 ((int64_t)nslot * num_kv_heads + kv_head) * kSplitDecodeHeadDim + head_base;
+      k_next = *reinterpret_cast<const uint4*>(&k_pool[off_next]);
+      v_next = *reinterpret_cast<const uint4*>(&v_pool[off_next]);
+    }
+
+    const __nv_bfloat16* kh = reinterpret_cast<const __nv_bfloat16*>(&k_cur);
     float s = 0.0f;
 #pragma unroll
     for (int i = 0; i < kSplitDecodeVec; ++i) {
@@ -783,12 +804,15 @@ split_decode_partial_hd256_kernel(
     }
     l_i += p;
 
-    const uint4 vv = *reinterpret_cast<const uint4*>(&v_pool[off + head_base]);
-    const __nv_bfloat16* vh = reinterpret_cast<const __nv_bfloat16*>(&vv);
+    const __nv_bfloat16* vh = reinterpret_cast<const __nv_bfloat16*>(&v_cur);
 #pragma unroll
     for (int i = 0; i < kSplitDecodeVec; ++i) {
       o_i[i] += p * __bfloat162float(vh[i]);
     }
+
+    k_cur = k_next;
+    v_cur = v_next;
+    off_cur = off_next;
   }
 
 #pragma unroll
