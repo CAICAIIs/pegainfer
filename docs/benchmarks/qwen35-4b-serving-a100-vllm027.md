@@ -47,27 +47,28 @@ Every row completed with zero failed requests on both engines.
 - **Prefill admission is what the overlap pose costs.** qps16 TTFT goes 772 → 1024 ms and c16 stays 23% behind vLLM. vLLM holds both a low TTFT and a low TPOT, so it is overlapping without starving prefill. This is a scheduler question, not a kernel one.
 - **The c8 tail is a separate loss.** 31.4 ms p99 against vLLM's 26.9 under the same pose, while c16 and qps16 are won. Whatever blocks decode during a prefill at concurrency 8 is not what blocks it at 16.
 
-## The prefill budget is a latency/throughput dial, not a free win
+## The prefill budget is a latency/throughput dial, and it now ships at 4096
 
-`--max-prefill-tokens` sets how many prompt tokens one step may prefill, and so how many admitted prompts ride in a single unified step. At the 1024 default a 1024-token prompt consumes the whole budget and exactly one prompt is prefilled per step. Measured with the default pose, three runs at 4096 against two at 1024:
+`--max-prefill-tokens` sets how many prompt tokens one step may prefill, and so how many admitted prompts ride in a single unified step. How finely prefill is chopped turns out to be the structural difference against vLLM on these cells: at the old 1024 default a 1024-token prompt consumes the whole budget and exactly one prompt is prefilled per step, so a ramp costs one step per request and c16 spends sixteen steps admitting sixteen requests. Per layer-step our GDN prefill is already the faster of the two — 247 µs against FLA's 433 — and the whole cost is in how many steps the same work is spread over.
 
-| cell | metric | `--max-prefill-tokens 1024` | `--max-prefill-tokens 4096` |
+Two runs a side, default pose, zero failed requests:
+
+| cell | metric | 1024 | **4096 (new default)** |
 | --- | --- | --- | --- |
-| c8 | TPOT / ITL p99 / output tok/s | 10.65–10.67 / 65.6–71.2 / 648–654 | **10.28–10.33** / **10.7–12.2** / **669–671** |
-| c16 | TPOT / ITL p99 / output tok/s | 12.80–12.82 / 79.2–79.7 / 1019–1021 | **12.33–12.36** / **12.9–16.9** / **1063–1075** |
-| qps16 | TPOT / ITL p99 / TTFT / output tok/s | 32.10–32.11 / 95.9–97.2 / 772–776 / 1134 | **29.98–30.03** / 261.6–265.3 / **414–420** / **1284–1287** |
+| c8 | mean TPOT | 10.42 / 10.47 ms | **10.14 / 10.11 ms** |
+| c8 | ITL p99 | 64.9 / 65.8 ms | **10.2 / 10.2 ms** |
+| c8 | output throughput | 665 / 661 tok/s | **679 / 683 tok/s** |
+| c16 | mean TPOT | 12.55 / 12.55 ms | **12.09 / 12.09 ms** |
+| c16 | ITL p99 | 79.7 / 79.1 ms | **13.0 / 13.2 ms** |
+| c16 | output throughput | 1038 / 1033 tok/s | **1089 / 1082 tok/s** |
+| qps16 | mean TPOT | 31.99 / 32.00 ms | **29.89 / 29.97 ms** |
+| qps16 | TTFT | 764 / 759 ms | **418 / 419 ms** |
+| qps16 | output throughput | 1140 / 1140 tok/s | **1289 / 1287 tok/s** |
+| qps16 | ITL p99 | 95.9 / 97.0 ms | 260.7 / 261.5 ms |
 
-The scheduler trace says why the qps16 tail triples while total time falls. Raising the budget cuts the step count and the total step time, and concentrates the same prefill into fewer, longer steps:
+Every metric this snapshot is about improves, and the c8 and c16 tails improve sixfold with them. The one regression is qps16's ITL p99, and it is the same mechanism viewed from the other side: that cell really does queue several prompts, and a step carrying five of them is longer than a step carrying two. The scheduler trace at 4096 shows the step count falling 203 → 172 and the total step time 7130 → 6291 ms while the longest step rises 97.5 → 267.4 ms, so the whole-run total and the tail move in opposite directions. `--max-prefill-tokens 1024` restores the old behaviour where that tail matters more than the throughput.
 
-| qps16, `PEGAINFER_ITL_DEBUG=1` | 1024 | 4096 |
-| --- | --- | --- |
-| steps | 203 | 172 |
-| total step time | 7130 ms | **6291 ms** |
-| unified steps | 61 | 22 |
-| prompts prefilled per unified step | up to 3 | up to 6 |
-| longest step | 97.5 ms | 267.4 ms |
-
-So the trade is real in both directions and the p99 is set by the longest step, not by the total. A rule that caps the chunk once the decode batch is full does not separate the two regimes here: the decode width in this cell reaches 57 against a 64-slot capacity, so the cap never fires. Making the wider budget safe needs a latency- or work-aware admission bound, which is a scheduler design change rather than a default flip. The default therefore stays at 1024.
+Against vLLM 0.27 this moves c8 to parity (10.15 against 10.07 ms) with an ITL p99 2.5x better, c16 to −8.6% TPOT with a p99 6.8x better, and qps16 to −25% TPOT, half the TTFT and −7.8% throughput.
 
 ## Claim boundary
 
