@@ -11,6 +11,7 @@ pub(crate) use pegainfer_core::ops::extract_vec;
 pub(crate) use pegainfer_core::ops::gemm;
 pub(crate) use pegainfer_core::ops::gemm_into;
 pub(crate) use pegainfer_core::ops::gemm_lt_tune;
+pub(crate) use pegainfer_core::ops::gemm_rows_into;
 pub use pegainfer_core::ops::rms_norm_batch_offset_into;
 pub(crate) use pegainfer_core::ops::rms_norm_gated_batch_into;
 pub use pegainfer_core::ops::rms_norm_offset_into;
