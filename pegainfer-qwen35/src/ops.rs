@@ -10,6 +10,7 @@ pub(crate) use pegainfer_core::ops::extract_vec;
 pub(crate) use pegainfer_core::ops::gemm;
 pub(crate) use pegainfer_core::ops::gemm_into;
 pub(crate) use pegainfer_core::ops::gemm_lt_tune;
+pub(crate) use pegainfer_core::ops::gemm_rows_into;
 pub(crate) use pegainfer_core::ops::paged_attention_batch_decode_hd256_into;
 pub(crate) use pegainfer_core::ops::paged_attention_batch_decode_split_hd256_into;
 pub(crate) use pegainfer_core::ops::paged_attention_batch_decode_via_prefill_hd256_into;

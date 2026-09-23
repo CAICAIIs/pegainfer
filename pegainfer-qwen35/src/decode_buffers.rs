@@ -73,11 +73,10 @@ pub(crate) struct BatchDecodeBuffers35 {
     pub(crate) split_partial_m: CudaSlice<f32>,
     pub(crate) split_partial_l: CudaSlice<f32>,
 
-    // Linear attention [dim, batch]
-    pub(crate) qkv: HiddenStates,
-    pub(crate) z: HiddenStates,
-    pub(crate) b_proj: HiddenStates,
-    pub(crate) a_proj: HiddenStates,
+    // Linear attention [dim, batch]. The two projections are the fused ones:
+    // `qkvz` holds the qkv band below the z band, `ba` holds beta below alpha.
+    pub(crate) qkvz: HiddenStates,
+    pub(crate) ba: HiddenStates,
     pub(crate) qkv_conv: HiddenStates,
     pub(crate) gdr_out: HiddenStates,
     pub(crate) normed_gated: HiddenStates,
@@ -125,7 +124,6 @@ impl BatchDecodeBuffers35 {
         let qkv_dim = geometry.local_linear_qkv_dim();
         let z_dim = geometry.local_linear_z_dim();
         let b_dim = geometry.local_linear_num_value_heads();
-        let a_dim = b_dim;
         let intermediate = geometry.local_intermediate_size();
 
         Ok(Self {
@@ -162,10 +160,8 @@ impl BatchDecodeBuffers35 {
                     * geometry.local_num_attention_heads(),
             )?,
 
-            qkv: HiddenStates::zeros(ctx, qkv_dim, bs)?,
-            z: HiddenStates::zeros(ctx, z_dim, bs)?,
-            b_proj: HiddenStates::zeros(ctx, b_dim, bs)?,
-            a_proj: HiddenStates::zeros(ctx, a_dim, bs)?,
+            qkvz: HiddenStates::zeros(ctx, qkv_dim + z_dim, bs)?,
+            ba: HiddenStates::zeros(ctx, 2 * b_dim, bs)?,
             qkv_conv: HiddenStates::zeros(ctx, qkv_dim, bs)?,
             gdr_out: HiddenStates::zeros(ctx, z_dim, bs)?,
             normed_gated: HiddenStates::zeros(ctx, z_dim, bs)?,
@@ -208,10 +204,8 @@ impl BatchDecodeBuffers35 {
         self.v_attn.seq_len = bs;
         self.attn_out_full.seq_len = bs;
 
-        self.qkv.seq_len = bs;
-        self.z.seq_len = bs;
-        self.b_proj.seq_len = bs;
-        self.a_proj.seq_len = bs;
+        self.qkvz.seq_len = bs;
+        self.ba.seq_len = bs;
         self.qkv_conv.seq_len = bs;
         self.gdr_out.seq_len = bs;
         self.normed_gated.seq_len = bs;
