@@ -1,6 +1,6 @@
 # Qwen3.5 decode kernel attribution vs vLLM 0.27 (A100)
 
-> **TL;DR:** nsys kernel-level attribution of the remaining serving gap (1×A100-40GB, upstream/main `8f455a18`, vLLM 0.27.0, 1024-token prompts, `--cuda-graph-trace=node`, steady-decode session capture, both engines re-captured on the same day). Five findings. (1) The GDN decode deficit is closed by #1054: `gated_delta_rule_decode_batch_kernel` now runs 48.5 µs per layer-step against vLLM's FLA `fused_recurrent` 42.7 µs, a 1.14× ratio. (2) The decode GEMM family is at per-kernel parity with vLLM on every shape — `gate_up` 82.5 vs 82.4 µs, the M=2560 family 33.5 vs 33.7 µs, `lm_head` 915 vs 921 µs, the prefill family 478 vs 454 ms — and the residual gap is vLLM's projection fusion, which issues one M=12288 GEMM per linear layer (fused qkv+z) and one M=10240 GEMM per full-attention layer (fused q+k+v) where we issue five separate projections. (3) Full-attention paged decode is the largest single block: 154.1 µs per layer-step against vLLM's `flash_fwd_splitkv` 64.9 µs plus a 6.9 µs combine kernel, because FlashInfer's batch-decode grid is fixed at `(batch, kv_heads)` — 4 CTAs at bs1, 64 at c16 — while FA2 splits the KV range into a `(m_blocks, splits, batch × kv_heads)` grid of 192 CTAs at c16. (4) A split-KV HD256 decode kernel serves every decode bucket up to 16 and improves all three of bs1, c8 and c16 over two runs a side with zero failed requests (bs1 9.41/9.36 → 8.57/8.57 ms, c8 11.25/11.27 → 10.65/10.67, c16 13.06/13.08 → 12.80/12.82 mean TPOT; qps16 unchanged); a load-only control puts the c16 memory floor for the same access pattern at 54 µs per layer-step against the 154.1 µs the FlashInfer kernel spends and the 71.8 µs vLLM spends, so the rest of the c16 gap is arithmetic and needs a tensor-core kernel. (5) The decode GEMM alignment audit is clean: all eight shapes carry M and K on multiples of 128, so the #1046 class of defect has no second instance.
+> **TL;DR:** nsys kernel-level attribution of the remaining serving gap (1×A100-40GB, upstream/main `8f455a18`, vLLM 0.27.0, 1024-token prompts, `--cuda-graph-trace=node`, steady-decode session capture, both engines re-captured on the same day). Five findings. (1) The GDN decode deficit is closed by #1054: `gated_delta_rule_decode_batch_kernel` now runs 48.5 µs per layer-step against vLLM's FLA `fused_recurrent` 42.7 µs, a 1.14× ratio. (2) The decode GEMM family is at per-kernel parity with vLLM on every shape it shares — `gate_up` 82.5 vs 82.4 µs, the M=2560 family 33.5 vs 33.7 µs, `lm_head` 915 vs 921 µs — and what remains of the family's window delta is the projection arrangement rather than kernel selection: per c16 step we spend 7032 µs of decode GEMM against vLLM's 6565, and the difference is 492 µs for a separate M=4096 z GEMM plus 160 µs for separate M=1024 k/v GEMMs that vLLM folds into its qkv+z and q+k+v kernels, 83 µs for issuing 48 M=32 beta/alpha GEMMs where it issues 24 fused ones, and 113 µs in cublasLt split-K reductions; the two fused qkv groups themselves are 281 µs/step cheaper in total, because its M=12288 and M=10240 kernels absorb the z and k/v work our separate M=8192 kernels do not carry. Fusing the linear-attention half (qkv+z and beta+alpha) is #1073 and measures −2.7% at bs1, −3.0% at c8, −2.5% at c16 and −1.0% at qps16 mean TPOT over two runs a side. (3) Full-attention paged decode is the largest single block: 154.1 µs per layer-step against vLLM's `flash_fwd_splitkv` 64.9 µs plus a 6.9 µs combine kernel, because FlashInfer's batch-decode grid is fixed at `(batch, kv_heads)` — 4 CTAs at bs1, 64 at c16 — while FA2 splits the KV range into a `(m_blocks, splits, batch × kv_heads)` grid of 192 CTAs at c16. (4) A split-KV HD256 decode kernel serves every decode bucket up to 64 and improves all three of bs1, c8 and c16 with zero failed requests (bs1 9.41/9.36 → 8.57/8.57 ms, c8 11.25/11.27 → 10.65/10.67, c16 13.06/13.08 → 12.80/12.82 mean TPOT before the staging and split-count work that followed); a load-only control puts the c16 memory floor for the same access pattern at 54 µs per layer-step against the 154.1 µs the FlashInfer kernel spends and the 71.8 µs vLLM spends, so the rest of the c16 gap is arithmetic and needs a tensor-core kernel. (5) The decode GEMM alignment audit is clean: all eight shapes carry M and K on multiples of 128, so the #1046 class of defect has no second instance.
 >
 > **Last touched:** 2026-09
 
@@ -17,12 +17,12 @@
 
 | cell | TPOT | ITL p99 | TTFT | output tok/s |
 | --- | --- | --- | --- | --- |
-| bs1 @1024 | 8.57 | — | 87 | — |
-| c8 | 10.65 | 65.6 | 381 | 654 |
-| c16 | 12.80 | 79.2 | 673 | 1021 |
-| qps16 | 32.11 | 97.2 | 772 | 1134 |
+| bs1 @1024 | 8.16 | — | 78 | 118.6 |
+| c8 | 9.81 | 10.0 | 384 | 706.9 |
+| c16 | 11.79 | 12.2 | 672 | 1107.4 |
+| qps16 | 29.71 | 264.1 | 415.0 | 1292.6 |
 
-These are the split-KV side of the finding-4 differential, so they are the state of the tree once that change lands; the same cells read 9.41 / 11.25 / 13.06 / 32.11 ms on the FlashInfer path. `docs/benchmarks/qwen35-4b-serving-a100-vllm027.md` carries the same-session comparison against vLLM 0.27.0 and the opt-in decode-overlap pose, which is where the ITL tails are won.
+The split-KV side of the finding-4 differential reads 9.41 / 11.25 / 13.06 / 32.11 ms on the FlashInfer path before it, then 8.57 / 10.65 / 12.80 / 32.11 once it landed, then the staging and split-count work brought bs1 to 8.41 / c8 10.15 / c16 12.07 / qps16 30.02, and #1073 brings the row above. `docs/benchmarks/qwen35-4b-serving-a100-vllm027.md` carries the same-session comparison against vLLM 0.27.0 and the opt-in decode-overlap pose, which is where the ITL tails are won.
 
 ## Findings
 
@@ -65,7 +65,37 @@ Head to head on the kernels both engines run, matched by grid shape:
 | `128x64_64x3` `(1940,1,1)` | lm_head (vLLM's separate pick) | — | 261 × 921.0 µs |
 | `256x128_64x3` | prefill family | 478 ms | 454 ms |
 
-`gate_up` is within 0.2% of vLLM, the M=2560 family within 0.6%, `lm_head` within 0.7%, and the prefill family within 5%. Within this family the two engines diverge on the class of kernel, not on the kernel: the totals are 1302 ms against 1071 ms over the window, and the grid table shows why. vLLM issues 24 fused qkv+z GEMMs and 8 fused q+k+v GEMMs per step where we issue 24 qkv + 24 z + 8 q + 8 k + 8 v. Fusing those two groups removes 40 launches per decode step and folds 16 small M=1024 GEMMs into a full-width one.
+`gate_up` is within 0.2% of vLLM, the M=2560 family within 0.6%, `lm_head` within 0.7%, and the prefill family within 5%. Within this family the two engines diverge on the class of kernel, not on the kernel: vLLM issues 24 fused qkv+z GEMMs and 8 fused q+k+v GEMMs per step where we issue 24 qkv + 24 z + 8 q + 8 k + 8 v.
+
+What that arrangement costs is visible only per shape, because the window totals move with each engine's step count and prefill mix. Summing one c16 step's decode GEMMs on both sides, ours is 7032 µs against vLLM's 6565:
+
+| group | per-step kernels | PegaInfer | vLLM 0.27 |
+| --- | --- | --- | --- |
+| qkv+z, M=12288 | 24 fused | — | 24 × 51.85 = 1244 µs |
+| qkv + z apart, M=8192 + M=4096 | 24 + 24 | 24 × 38.21 + 24 × 20.52 = 1410 µs | — |
+| q, k, v apart, M=8192 + M=1024 ×2 | 8 + 16 | 8 × 38.21 + 16 × 10.03 = 466 µs | — |
+| q+k+v fused, M=10240 | 8 fused | — | 8 × 43.74 = 350 µs |
+| beta+alpha apart, M=32 | 48 | 48 × 3.73 = 179 µs | — |
+| beta+alpha fused, M=64 | 24 fused | — | 24 × 4.05 = 97 µs |
+| gate_up, M=18432 | 32 | 32 × 82.52 = 2641 µs | 32 × 82.41 = 2637 µs |
+| out/o projection, M=2560 | 32 | 32 × 33.53 = 1073 µs | 32 × 33.99 = 1088 µs |
+| lm_head | 1 | 921 µs | 921 µs |
+| cublasLt split-K reduction | 131.5 vs 88.2 | 343 µs | 230 µs |
+
+The two fused groups are worth 0.47 ms of the 1.14 ms/step difference on the strengths of this table. The qkv work alone says the opposite — our 32 M=8192 kernels cost 1223 µs where vLLM's fused 12288 and 10240 pair costs 1594 — and that is the point: its fused kernels absorb the z and k/v work ours leaves in separate launches, so the arrangement is 281 µs/step cheaper in total. The beta/alpha pair adds 83 µs, and the split-K reductions our tuned algos pick more often add 113 µs, which is a separate lead. Launch count alone is not the mechanism: 40 fewer launches per step would be about 0.05 ms, which is inside this card's spread.
+
+**Fusing the linear-attention half is #1073.** One M=12288 GEMM per linear layer (qkv+z) and one M=64 GEMM (beta+alpha), with the consumers reading the band they want out of the fused output. Same tree, one variable, interleaved sessions in a/b/b/a order, two runs a side, default flags, zero failed requests:
+
+| cell, mean TPOT | four separate projections | fused | delta |
+| --- | --- | --- | --- |
+| bs1 @1024, out 256 | 8.38 / 8.40 ms | **8.18 / 8.14 ms** | −2.7% |
+| c8 @1024, out 256 | 10.11 / 10.10 ms | **9.80 / 9.81 ms** | −3.0% |
+| c16 @1024, out 256 | 12.09 / 12.09 ms | **11.80 / 11.78 ms** | −2.5% |
+| qps16 | 30.01 / 29.99 ms | **29.72 / 29.69 ms** | −1.0% |
+| c8 output throughput | 687.6 / 689.8 tok/s | **706.5 / 707.3 tok/s** | +2.7% |
+| c16 output throughput | 1081.6 / 1080.6 tok/s | **1110.4 / 1104.5 tok/s** | +2.4% |
+
+The band is what the consumers had to learn: a band's slot stride is the fused tensor's row width, not the band's own width, so conv1d decode, the GDN decode's beta and alpha, and the gated RMSNorm's gate each take the band as `Columns` and each has a unit test that fails if the band's own width is used as the stride. Prefill keeps its own buffers and reads the row range it wants out of the fused weight with `gemm_rows_into`, so no prefill kernel and no Triton AOT kernel changed.
 
 ### 3. Full-attention paged decode is the largest single block, and the cause is grid shape
 
@@ -140,13 +170,13 @@ The PegaInfer window holds 270 steps where vLLM's holds 255 for the same 256-tok
 
 ## Improvement queue (ordered by expected value)
 
-The per-step split of the two c16 captures says where the difference sits, and the newest capture, on the tree with every change above, is the one to work from. The window total fell from 3962 to **3673 ms against vLLM's 3326** over 259 steps rather than 270, so the per-step difference is about 1.14 ms and the wall clock says 0.95. By family, the deltas are **GEMM +223 ms**, prefill GDN +86, conv1d +14, and roughly −190 across elementwise, activation and decode attention together. The GEMM family is therefore about 0.86 of the 1.14 ms/step, which is where the remaining work is.
+The per-step split of the two c16 captures says where the difference sits, and the newest capture, on the tree with every change above, is the one to work from. The window total fell from 3962 to **3673 ms against vLLM's 3326** over 259 steps rather than 270, so the per-step difference is about 1.14 ms and the wall clock says 0.95. That window delta is not a per-step fact: dividing it by its own step count mixes in the four extra steps and the prefill mix, which is why the GEMM family's +223 ms window delta decomposes per step into +0.08 ms of kernel time and +0.21 ms of prefill tile selection rather than a single kernel-level deficit.
 
-Within that family, the projection arrangement is the actionable part: vLLM issues 24 fused qkv+z GEMMs and 8 fused q+k+v GEMMs per step where we issue 24 qkv + 24 z + 8 q + 8 k + 8 v. The split count and tile sweeps are closed — an eight-position `cp.async` buffer with the paired compute loop is the best configuration measured at every batch (bs1 26.91 µs, bs8 54.72, bs16 95.40, against 38.6 / 57.26 / 96.26 for the register form).
+Within that family, the projection arrangement was the actionable part, and its linear half is done (#1073). The split count and tile sweeps are closed — an eight-position `cp.async` buffer with the paired compute loop is the best configuration measured at every batch (bs1 26.91 µs, bs8 54.72, bs16 95.40, against 38.6 / 57.26 / 96.26 for the register form).
 
 1. **More instruction-level parallelism in the split-KV partial kernel.** Prefetching both operands one position ahead took bs1 from 38.6 to 32.1 µs, an eight-position `cp.async` double buffer took it to 30.0 µs, and interleaving two positions in the compute took it to 28.0 µs, against 126.3 µs for the register form these replaced. The distance left to the load-only control is 54 µs at c16 against 98.6 now, and what remains is the per-position dependent chain rather than the loads, so the next step is wider interleaving — four positions — rather than more lookahead.
-2. **Fuse the decode projections.** One M=12288 GEMM per linear layer (qkv+z) and one M=10240 GEMM per full-attention layer (q+k+v) removes 40 launches per step, worth about 0.35 ms/step at c16. The band-view mechanism this needs already exists and is proven (`Columns`, exercised by `pegainfer-kernels/tests/fused_projection_bands.rs`), and the prefill attention op already accepts bands; the cost is that every consumer of `qkv`, `z`, `b_proj` and `a_proj` reads `HiddenStates::hidden_dim` as its row width, so each one needs a row stride, including the Triton AOT GDN kernels.
-3. **The prefill GEMM shapes — measured, and there is no tuning headroom.** Our prefill runs three tile families (256x128, 128x256 and 128x128) where vLLM runs two, for +0.21 ms/step, and the prefill path is the untuned one because `gemm_lt_tune` covers only N ≤ 32. An exhaustive cublasLt sweep over every tile, stage, split-K and swizzle the library can build says the heuristic is already at the top: for gate_up at N=1024 the heuristic returns 166.571 µs and the exhaustive best is 166.912, and for down_proj at the same N the heuristic's 189.440 µs beats every combination the sweep re-timed. The kernels are also at 258 TFLOPS, 83% of the A100's bf16 peak, so what separates us from vLLM here is the chunk sizes and step mix rather than algorithm selection. Raising the tuned limit from 32 to 64 to cover the wide buckets a rate-limited client reaches bought 0.4% on qps16, c8 and c16 unchanged, and was reverted: `GEMM_LT_MAX_N` is by design the shared-SM overlap's batch ceiling (`MAX_SHARED_SM_DECODE_BATCH` derives from it, with the rationale in `weights.rs`), so raising it also widens what that pose accepts, which is a behaviour change that 0.4% on one cell does not pay for.
+2. **Fuse the full-attention projections.** The linear half (qkv+z, beta+alpha) is #1073: −2.7% at bs1, −3.0% at c8, −2.5% at c16, −1.0% at qps16. What is left is one M=10240 GEMM per full-attention layer in place of q, k and v, worth the 160 µs/step the separate k/v kernels cost and the 8 launches they carry. It is a separate change because it re-reads bands inside the attention path — `qk_norm_partial_rope`, the K/V scatter and the output gate — where #1073 only had to teach three kernels a slot stride.
+3. **Prefill.** Two separate gaps, both measured: our prefill GEMM runs three tile families (256x128, 128x256 and 128x128) where vLLM runs two, and spends 566 ms of the window against its 504 for the same tokens; and our `gdr_*` Triton AOT chunkwise kernels total 0.57 ms/step against FLA's 0.29. An exhaustive cublasLt sweep over every tile, stage, split-K and swizzle the library can build says the prefill heuristic is already at the top: for gate_up at N=1024 the heuristic returns 166.571 µs and the exhaustive best is 166.912, and for down_proj at the same N the heuristic's 189.440 µs beats every combination the sweep re-timed. The kernels are also at 258 TFLOPS, 83% of the A100's bf16 peak, so what separates us from vLLM here is the chunk sizes and step mix rather than algorithm selection. Raising the tuned limit from 32 to 64 to cover the wide buckets a rate-limited client reaches bought 0.4% on qps16, c8 and c16 unchanged, and was reverted: `GEMM_LT_MAX_N` is by design the shared-SM overlap's batch ceiling (`MAX_SHARED_SM_DECODE_BATCH` derives from it, with the rationale in `weights.rs`), so raising it also widens what that pose accepts, which is a behaviour change that 0.4% on one cell does not pay for.
 4. **GDN prefill.** Our `gdr_*` Triton AOT chunkwise kernels total 166 ms against FLA's 93.6 for the same work, +0.25 ms/step, and they also gate how fast a ramp can clear.
 5. **QPS16 TTFT.** It follows the step time: at qps16 our per-request decode takes 128 × 32.1 ms against vLLM's 128 × 24.1 ms, the client's 16-deep window drains that much slower and the measured TTFT gap compounds it. Fixing the step fixes this.
 

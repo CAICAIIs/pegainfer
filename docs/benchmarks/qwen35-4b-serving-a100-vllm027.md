@@ -2,7 +2,7 @@
 
 **Created**: 2026-09
 
-**TL;DR**: Same-session, same-client comparison of PegaInfer `upstream/main` + #1072 against vLLM 0.27.0 on 1x A100-40GB, four cells, zero failed requests. PegaInfer wins single-request TTFT by 2.3x and — under the opt-in `--decode-overlap stream` + `--qwen35-scheduler-policy auto` pose — qps16 mean TPOT (20.89 vs 24.06 ms), qps16 ITL p99 (39.0 vs 97.0) and c16 ITL p99 (34.2 vs 85.5). It still loses mean TPOT on every cell (4–13%), output throughput everywhere (6–19%), the c8 ITL tail, and time to first token at c16 and qps16 (23% and 4.5x). The pose is neutral at bs1, so the losses that remain are step time and prefill admission, not the decode-overlap mechanism. The prefill budget is a separate dial measured here: 4096 instead of the 1024 default improves TPOT, TTFT and throughput on all three cells and cuts the c8 and c16 tails five- to six-fold, but triples the qps16 p99 because the whole-run total falls while the longest step grows.
+**TL;DR**: Same-session, same-client comparison of PegaInfer `upstream/main` + #1072 + #1073 against vLLM 0.27.0 on 1x A100-40GB, four cells, zero failed requests. PegaInfer beats vLLM's mean TPOT at bs1 (8.16 against 8.21 ms) and c8 (9.81 against 10.07), stays 6.1% behind at c16 (11.79 against 11.12) and 23% behind at qps16 (29.71 against 24.06), wins single-request TTFT by 2.5x, and — under the opt-in `--decode-overlap stream` + `--qwen35-scheduler-policy auto` pose, measured on the tree before #1073 — wins qps16 mean TPOT (20.89 against 24.06 ms), qps16 ITL p99 (39.0 against 97.0) and c16 ITL p99 (34.2 against 85.5). Output throughput is within 2% of vLLM at bs1, c8 and c16 and 7.3% behind at qps16. The prefill budget is a separate dial measured here: 4096 instead of the 1024 default improves TPOT, TTFT and throughput on all three cells and cuts the c8 and c16 tails five- to six-fold, but triples the qps16 p99 because the whole-run total falls while the longest step grows.
 
 ## Setup
 
@@ -10,7 +10,7 @@
 | --- | --- |
 | GPU | 1x NVIDIA A100-SXM4-40GB (sm_80), one engine at a time on device 1 |
 | Model | Qwen3.5-4B, BF16, TP1, text-only serving, `/mnt/data/models/Qwen3.5-4B` |
-| PegaInfer | `upstream/main` `8f455a18` + #1072 (split-KV decode for buckets ≤ 16), release build `--features qwen35` |
+| PegaInfer | `upstream/main` `8f455a18` + #1072 (split-KV decode) + #1073 (fused linear-attention projections), release build `--features qwen35` |
 | vLLM | 0.27.0 (`~/vllm-omni-venv`), FLASH_ATTN + FLA Triton GDN + FlashInfer sampler, piecewise CUDA graphs |
 | PegaInfer flags | default, and `--decode-overlap stream --max-batch 32 --qwen35-scheduler-policy auto` |
 | vLLM flags | `--dtype bfloat16 --max-model-len 8192 --gpu-memory-utilization 0.90 --no-enable-prefix-caching` |
@@ -19,32 +19,32 @@
 
 ## Results
 
-Mean TPOT, and the tail and first-token metrics beside it. Lower is better everywhere except output tok/s.
+Mean TPOT, and the tail and first-token metrics beside it. Lower is better everywhere except output tok/s. The default column is the current tree (#1072 and #1073, two runs a side); the auto+stream column was measured on the tree before #1073 and is kept as the record of that pose.
 
 | cell | metric | vLLM 0.27 | PegaInfer default | PegaInfer auto+stream |
 | --- | --- | --- | --- | --- |
-| bs1 @1024/256 | TPOT | **8.21** | 8.57 | 8.55 |
-| | TTFT | 198.3 | **87** | **88** |
-| c8 @1024/256 | TPOT | **10.07** | 10.65 | 10.40 |
-| | ITL p99 | **26.9** | 65.6 | 31.4 |
-| | TTFT | 359.0 | 381 | 391 |
-| | output tok/s | **696** | 654 | 652 |
-| c16 @1024/256 | TPOT | **11.12** | 12.80 | 12.59 |
-| | ITL p99 | 85.5 | 79.2 | **34.2** |
-| | TTFT | **550.6** | 673 | 699 |
-| | output tok/s | **1197** | 1021 | 990 |
-| qps16 | TPOT | 24.06 | 32.11 | **20.89** |
-| | ITL p99 | 97.0 | 97.2 | **39.0** |
-| | TTFT | **228.2** | 772 | 1024 |
-| | output tok/s | **1394** | 1134 | 1110 |
+| bs1 @1024/256 | TPOT | 8.21 | **8.16** | 8.55 |
+| | TTFT | 198.3 | **78** | 88 |
+| c8 @1024/256 | TPOT | 10.07 | **9.81** | 10.40 |
+| | ITL p99 | 26.9 | **10.0** | 31.4 |
+| | TTFT | 359.0 | 384 | 391 |
+| | output tok/s | 696 | **707** | 652 |
+| c16 @1024/256 | TPOT | **11.12** | 11.79 | 12.59 |
+| | ITL p99 | 85.5 | **12.2** | 34.2 |
+| | TTFT | **550.6** | 672 | 699 |
+| | output tok/s | **1197** | 1107 | 990 |
+| qps16 | TPOT | **24.06** | 29.71 | 20.89 |
+| | ITL p99 | 97.0 | 264.1 | **39.0** |
+| | TTFT | **228.2** | 415 | 1024 |
+| | output tok/s | **1394** | 1293 | 1110 |
 
 Every row completed with zero failed requests on both engines.
 
 ## What the numbers say
 
-- **Step time is the deficit that never goes away.** At c16 PegaInfer needs 12.59 ms per decode step against vLLM's 11.12, and output throughput tracks that ratio exactly at the same concurrency. The kernel-level attribution for it is in `models/qwen35/decode-kernel-attribution.md`: full-attention paged decode is the largest single block, and the GEMM families are already at per-kernel parity, so the remaining distance is a tensor-core attention kernel plus the projection fusion vLLM does.
+- **Step time is the deficit that never goes away, and the projection arrangement was the first half of it.** At c16 PegaInfer needs 11.79 ms per decode step against vLLM's 11.12, and output throughput tracks that ratio at the same concurrency. The kernel-level attribution is in `models/qwen35/decode-kernel-attribution.md`: full-attention paged decode is the largest single block, and the decode GEMM family is at per-kernel parity on every shape both engines run, so what was left there was vLLM's shape arrangement. #1073 fuses the linear-attention projections the way vLLM does and takes 0.30 ms off every decode step (−2.7% bs1, −3.0% c8, −2.5% c16, −1.0% qps16); the full-attention q+k+v fusion is the same change applied to the other four layers in eight.
 - **The overlap pose is where the tails live.** `--decode-overlap stream --qwen35-scheduler-policy auto` takes c16 ITL p99 from 79.2 to 34.2 ms and qps16 ITL p99 from 97.2 to 39.0, both better than vLLM, and turns qps16 mean TPOT into a win. It is neutral at bs1 (8.55/8.59 ms against 8.57) and costs about 3% of c16 throughput. It is opt-in today, so the default posture leaves those three wins on the table.
-- **Prefill admission is what the overlap pose costs.** qps16 TTFT goes 772 → 1024 ms and c16 stays 23% behind vLLM. vLLM holds both a low TTFT and a low TPOT, so it is overlapping without starving prefill. This is a scheduler question, not a kernel one.
+- **Prefill admission is what the overlap pose costs.** qps16 TTFT goes 772 → 1024 ms and c16 stays 22% behind vLLM. vLLM holds both a low TTFT and a low TPOT, so it is overlapping without starving prefill. This is a scheduler question, not a kernel one.
 - **The c8 tail is a separate loss.** 31.4 ms p99 against vLLM's 26.9 under the same pose, while c16 and qps16 are won. Whatever blocks decode during a prefill at concurrency 8 is not what blocks it at 16.
 
 ## The prefill budget is a latency/throughput dial, and it now ships at 4096
@@ -72,10 +72,12 @@ Against vLLM 0.27 this moves c8 to parity (10.15 against 10.07 ms) with an ITL p
 
 ## Claim boundary
 
-Two runs per PegaInfer configuration and one run per vLLM cell, one GPU, default flags unless the pose column says otherwise, zero failed requests on every row. These are single-host snapshot numbers: the c16 and qps16 rows are not parity claims and the run-to-run spread on this card is around 0.5% on mean TPOT at c16. bs1 TTFT is measured at `max-concurrency 1` and includes the engine's own startup of that request only.
+Two runs per PegaInfer configuration and one run per vLLM cell, zero failed requests on every row. The default column is four runs a side across two cards: two interleaved a/b/b/a sessions on device 1, and two more a side on device 0 against the same baseline binary, which reproduced the fusion's delta at every cell (bs1 −2.6%, c8 −3.0%, c16 −3.7%, qps16 −1.1%) with the absolute rows agreeing to 0.05 ms between the cards. The vLLM column is one same-session run per cell on device 1. These are single-host snapshot numbers: the c16 and qps16 rows are not parity claims and the run-to-run spread on this card is around 0.5% on mean TPOT at c16. bs1 TTFT is measured at `max-concurrency 1` and includes the engine's own startup of that request only.
 
 ## Next step
 
-The step-time gap is the binding constraint at c8 and c16. It needs the HD256 attention path replaced with a tensor-core kernel (vLLM runs flash-attention's `flash_fwd_splitkv`; the memory floor for the same access pattern on this card is 54 µs per layer-step against the 154 µs the current FlashInfer kernel spends) and the decode projections fused the way vLLM fuses them (one M=12288 GEMM per linear layer and one M=10240 GEMM per full-attention layer, 40 fewer launches per step).
+The step-time gap is the binding constraint at c16 and qps16. Three items are open and independent:
 
-Two scheduler items are open and independent of the kernels. The overlap pose holds the c16 and qps16 tails and turns qps16 mean TPOT into a win, but costs qps16 TTFT (1024 ms against vLLM's 228); holding both needs a prefill-admission policy that does not starve prefill while it protects decode. And the prefill-budget section above shows that the width of a unified step trades the whole-run total against the p99 tail, so the budget wants a latency or work bound rather than a larger constant.
+- **The full-attention projections.** #1073 fused the linear-attention half (qkv+z, beta+alpha) and took 0.30 ms off every decode step. The same change applied to `q`, `k` and `v` in the eight full-attention layers is worth the 160 µs/step those separate kernels cost and is the largest single remaining GEMM item. The HD256 attention kernel itself is the other half: vLLM runs flash-attention's `flash_fwd_splitkv`, and replacing our own split-KV kernel with a tensor-core form needs the per-position dependent chain broken first — the memory floor for the same access pattern at c16 is 54 µs per layer-step against 98.6 now.
+- **Prefill.** Our prefill GEMM spends 566 ms of the c16 window against vLLM's 504 for the same tokens, and the `gdr_*` chunkwise kernels spend 0.57 ms/step against FLA's 0.29. Both bound how fast an admission ramp clears, which is what qps16 TTFT is made of.
+- **Two scheduler items, independent of the kernels.** The overlap pose holds the c16 and qps16 tails and turns qps16 mean TPOT into a win, but costs qps16 TTFT (1024 ms against vLLM's 228); holding both needs a prefill-admission policy that does not starve prefill while it protects decode. And the prefill-budget section above shows that the width of a unified step trades the whole-run total against the p99 tail, so the budget wants a latency or work bound rather than a larger constant.
