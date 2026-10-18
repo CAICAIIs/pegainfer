@@ -17,11 +17,11 @@ use super::config::LocalGeometry;
 /// single request, 64 for sixteen. Splitting the KV range instead wins at every
 /// bucket this threshold admits, measured on one tree with two runs a side:
 /// bs1 9.41/9.36 → 8.57/8.57 ms, c8 11.25/11.27 → 10.65/10.67, c16 13.06/13.08
-/// → 12.80/12.82 mean TPOT, qps16 unchanged. It also covers the wide buckets a
-/// rate-limited client reaches, where FlashInfer's grid grows one CTA per
-/// request and the split form still reaches 932 GB/s at batch 64 against a
-/// 1235 GB/s load-only floor. See `docs/models/qwen35/decode-kernel-attribution.md`.
-pub(crate) const SPLIT_DECODE_MAX_BATCH: usize = 64;
+/// → 12.80/12.82 mean TPOT, qps16 unchanged. The wider buckets keep FlashInfer:
+/// on an sm_90 card at 1024 in and 256 out, routing them through the split form
+/// measured 10.23/10.25 against 9.65/9.67 ms mean TPOT at c32 and 16.56/16.58
+/// against 14.98/15.14 at c64. See `docs/models/qwen35/decode-kernel-attribution.md`.
+pub(crate) const SPLIT_DECODE_MAX_BATCH: usize = 16;
 
 /// Query heads per kv head the split-KV kernel is built for, one warp each. A
 /// checkpoint with another GQA group (the 27B sizes run 6) keeps the FlashInfer
@@ -34,17 +34,10 @@ pub(crate) const SPLIT_DECODE_GQA_GROUP: usize = 4;
 /// has to be constant across a captured CUDA Graph bucket; an over-split request
 /// simply leaves later CTAs empty. The counts are where each bucket's curve
 /// flattens on the standalone harness: 32 splits is best at batch 1
-/// (27.98 µs against 34.98 at 16), 16 is best at batch 8 (57.26 against 60.58 at
-/// 32) and batch 16 (96.26 against 98.47), and 8 is best at batch 64 (288.03
-/// against 296.35 at 16).
+/// (27.98 µs against 34.98 at 16), and 16 is best at batch 8 (57.26 against
+/// 60.58 at 32) and batch 16 (96.26 against 98.47).
 pub(crate) fn split_decode_splits(batch: usize) -> usize {
-    if batch <= 2 {
-        32
-    } else if batch <= 16 {
-        16
-    } else {
-        8
-    }
+    if batch <= 2 { 32 } else { 16 }
 }
 
 /// Upper bound on [`split_decode_splits`], for sizing the partial buffers.
