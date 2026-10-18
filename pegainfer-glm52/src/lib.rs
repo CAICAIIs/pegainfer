@@ -24,6 +24,7 @@ mod layer;
 mod mla_decode;
 mod mla_front;
 mod model;
+pub mod model_line;
 mod moe_decode;
 mod moe_ep;
 mod moe_ep8;
@@ -42,6 +43,7 @@ mod weights;
 use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Context as _;
@@ -50,14 +52,18 @@ use anyhow::ensure;
 use bytesize::ByteSize;
 pub(crate) use config::GLM52_LAYERS;
 pub(crate) use config::GLM52_ROUTED_EXPERTS;
-pub use config::probe_config_json;
-use pegainfer_core::engine::EngineHandle;
-use pegainfer_core::engine::KvCapacity;
-use pegainfer_core::engine::LoadSnapshot;
-use pegainfer_kv_offload::HostConfig;
-use pegainfer_kv_offload::KvArena;
-use pegainfer_kv_offload::OffloadEngine;
-use pegainfer_kv_offload::OffloadHost;
+pub(crate) use config::probe_config_json;
+use pegainfer_frontend::engine::EngineHandle;
+use pegainfer_frontend::engine::KvCapacity;
+use pegainfer_frontend::engine::SchedulerMetrics;
+use pegainfer_kv_store::ArenaSpec;
+use pegainfer_kv_store::BlockPool;
+use pegainfer_kv_store::KvStore;
+use pegainfer_kv_store::KvStoreBuilder;
+use pegainfer_kv_store::OffloadMirror;
+use pegainfer_kv_store::OffloadRankSpec;
+use pegainfer_kv_store::P2pConfig;
+use pegainfer_kv_store::PegaflowHost;
 use runner::Glm52PrefillBatch;
 use runner::Glm52RankPlacement;
 use runner::Glm52RankWorker;
@@ -70,12 +76,14 @@ use weights::Glm52RankLoadBundle;
 use weights::Glm52WeightManifest;
 
 use crate::config::GLM52_MAX_CONTEXT;
+use crate::config::GLM52_VOCAB;
 use crate::model::GLM52_MODEL_LEN_ALIGN;
 use crate::model::glm52_arena_bytes;
 use crate::model::glm52_pool_blocks;
 
-pub const GLM52_PREFILL_CHUNK_ALIGN: usize = GLM52_MODEL_LEN_ALIGN;
-pub const GLM52_DEFAULT_PREFILL_CHUNK_SIZE: usize = 16_384;
+const GLM52_PREFILL_CHUNK_ALIGN: usize = GLM52_MODEL_LEN_ALIGN;
+#[cfg(test)]
+const GLM52_DEFAULT_PREFILL_CHUNK_SIZE: usize = 16_384;
 
 /// Optional speculative decoder used by the GLM5.2 engine.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -110,7 +118,7 @@ impl Glm52Drafter {
 
 /// Parse a `--glm52-ranks` value (`start..end`, e.g. `4..8`) into the global
 /// DP rank range a process hosts.
-pub fn parse_rank_range(spec: &str) -> Result<Range<usize>> {
+fn parse_rank_range(spec: &str) -> Result<Range<usize>> {
     let (start, end) = spec
         .split_once("..")
         .with_context(|| format!("rank range `{spec}` must be start..end (e.g. 4..8)"))?;
@@ -127,63 +135,63 @@ pub fn parse_rank_range(spec: &str) -> Result<Range<usize>> {
 /// TP4 prefill-only configuration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Glm52PrefillOnlyOptions {
-    pub chunk_size: usize,
+    chunk_size: usize,
 }
 
 /// GLM5.2 parallel shape. EP8 is the production layout today; TP4 is the
 /// GB300 bring-up target.
 #[derive(Clone, Debug)]
 pub struct Glm52LaunchOptions {
-    pub tp_size: usize,
-    pub dp_size: usize,
+    tp_size: usize,
+    dp_size: usize,
     /// Optional speculative decoder. DSpark enables lossless speculative
     /// sampling from an external checkpoint; native MTP uses the checkpoint's
     /// layer-78 decoder and supports EP decode (single- or multi-process —
     /// the MTP round rides the same fixed chain and DeepEP context as the
     /// target steps) and TP4 prefill-only.
-    pub drafter: Glm52Drafter,
+    drafter: Glm52Drafter,
     /// Per-request context cap (`prompt + max_tokens - 1 <= max_model_len`).
     /// `None` sizes it from the post-weight-load free VRAM (fleet minimum);
     /// an explicit value is still validated against that budget so an
     /// impossible cap fails at launch, not at the first long request.
-    pub max_model_len: Option<usize>,
+    max_model_len: Option<usize>,
     /// Enables TP4 prefill-only serving.
-    pub prefill_only: Option<Glm52PrefillOnlyOptions>,
+    prefill_only: Option<Glm52PrefillOnlyOptions>,
     /// vLLM-style kill switch: disable prefix matching outright (every
     /// prefill recomputes the full prompt). Prefix caching is also forced
     /// off while a speculative decoder is on: DSpark needs aux-hidden
     /// captures for every prefix row, while native MTP needs target hidden
     /// states and uninterrupted MTP KV continuity.
-    pub no_prefix_cache: bool,
+    no_prefix_cache: bool,
     /// `Some` adds the pegaflow host tier under the prefix cache: sealed KV
     /// blocks flow to one shared pinned pool on request release, and a
     /// prompt whose prefix fell out of HBM restores from it at admission.
     /// Requires the prefix cache (rejected at launch alongside any
     /// speculative decoder or `no_prefix_cache`).
-    pub kv_offload: Option<Glm52KvOffloadOptions>,
+    kv_offload: Option<Glm52KvOffloadOptions>,
     /// Launch-time MoE sharding topology. `Ep8` (default) is the
     /// high-throughput configuration: 32 whole experts per rank, DeepEP
     /// dispatch/combine, buckets 1-8. `Tp4` is GB300 **prefill-only**
     /// tensor parallel (NCCL all-reduce; requires `--glm52-prefill-only`).
-    pub moe_topo: Glm52MoeTopo,
+    moe_topo: Glm52MoeTopo,
     /// Stage checkpoint bytes through pinned double buffers. Intended for
     /// warm page-cache starts; cold network filesystems should leave it off.
-    pub weight_staging: bool,
+    weight_staging: bool,
     /// Export rank 0's already pre-captured whole-step decode graph during
     /// startup. EP and TP4 export bucket 1. The requested PNG gets a
     /// complete sibling `.dot` for machine inspection.
-    pub dump_graph_png: Option<PathBuf>,
+    dump_graph_png: Option<PathBuf>,
     /// The global DP ranks THIS process hosts (default: the whole topology
     /// — the single-node engine). A partial range is the multi-process
     /// cross-node shape: every node runs the same binary over its own ranks,
     /// and the collective DeepEP communicator is the only coupling
     /// (`docs/models/glm52/free-running-dp.md` §3).
-    pub ranks: Option<Range<usize>>,
+    ranks: Option<Range<usize>>,
     /// Bootstrap rendezvous address, required exactly when `ranks` is a
     /// partial range. The process hosting rank 0 binds it and serves the
     /// DeepEP unique id; every other process connects to fetch it. A
     /// one-time handshake — there is no runtime control plane.
-    pub rendezvous: Option<String>,
+    rendezvous: Option<String>,
 }
 
 /// Launch-time MoE sharding topology (the expert slab is repacked during
@@ -209,7 +217,7 @@ pub enum Glm52MoeTopo {
 
 impl Glm52MoeTopo {
     #[must_use]
-    pub fn default_dp_size(self) -> usize {
+    fn default_dp_size(self) -> usize {
         match self {
             Self::Tp4 => 1,
             _ => self.device_count(),
@@ -230,7 +238,7 @@ impl Glm52MoeTopo {
     /// Number of independently scheduled request partitions. Tensor-
     /// replicated workers execute one mirrored partition in lock-step.
     #[must_use]
-    pub fn logical_rank_count(self) -> usize {
+    fn logical_rank_count(self) -> usize {
         if self.uses_tensor_replicated_moe() {
             1
         } else {
@@ -241,7 +249,7 @@ impl Glm52MoeTopo {
     /// The `--tp-size` this topology requires (server validation mirrors the
     /// launch-time ensure).
     #[must_use]
-    pub fn expected_tp_size(self) -> usize {
+    fn expected_tp_size(self) -> usize {
         match self {
             Self::Tp4 => 4,
             _ => 1,
@@ -273,7 +281,7 @@ impl Glm52MoeTopo {
     /// (TP4) — the server needs it to size the frontend partition count
     /// for a hosted rank range.
     #[must_use]
-    pub fn uses_tensor_replicated_moe(self) -> bool {
+    fn uses_tensor_replicated_moe(self) -> bool {
         matches!(self, Self::Tp4)
     }
 }
@@ -370,26 +378,26 @@ mod topology_tests {
 #[derive(Clone, Debug)]
 pub struct Glm52KvOffloadOptions {
     /// Host pinned-memory pool size in bytes, shared by all ranks.
-    pub pinned_pool_bytes: usize,
+    pinned_pool_bytes: usize,
     /// Back the pool with hugepages (the box must hold a reservation —
     /// check `HugePages_Total`).
-    pub use_hugepages: bool,
+    use_hugepages: bool,
     /// `Some` joins the cross-instance P2P mesh: saved block hashes register
     /// with the MetaServer and missing prefixes are pulled from peer
     /// instances over RDMA — the P/D disaggregation data plane.
-    pub p2p: Option<Glm52P2pOptions>,
+    p2p: Option<Glm52P2pOptions>,
 }
 
-/// Cross-instance P2P KV sharing (see `pegainfer_kv_offload::P2pConfig`).
+/// Cross-instance P2P KV sharing (see `pegainfer_kv_store::P2pConfig`).
 #[derive(Clone, Debug)]
 pub struct Glm52P2pOptions {
     /// MetaServer gRPC address, e.g. `http://10.0.0.100:50056`.
-    pub metaserver_addr: String,
+    metaserver_addr: String,
     /// This engine's routable `IP:port` (doubles as the embedded transfer
     /// service's bind address). Must be reachable by every peer.
-    pub advertise_addr: String,
+    advertise_addr: String,
     /// RDMA NIC device names to register the pinned pool on.
-    pub rdma_nics: Vec<String>,
+    rdma_nics: Vec<String>,
 }
 
 /// GLM5.2 kernels (FlashMLA SM100, DeepGEMM MQA and routed experts, …)
@@ -418,7 +426,7 @@ fn ensure_blackwell_devices(local_gpus: usize) -> Result<()> {
     Ok(())
 }
 
-pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHandle> {
+fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHandle> {
     let Glm52LaunchOptions {
         tp_size,
         dp_size,
@@ -441,7 +449,7 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
         ranks.start,
         ranks.end
     );
-    // The (slots, drafts) startup pair must fit the 48-row step budget —
+    // The (slots, drafts) startup pair must fit the step-row budget —
     // an over-committed pair would silently cap verify spans under full
     // occupancy and collapse speculation (#812's original failure mode).
     // Only native MTP rides verify spans; without a drafter every slot is a
@@ -456,6 +464,11 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
         slots * (1 + draft_len) <= model::GLM52_MAX_STEP_ROWS,
         "GLM5.2 GLM52_DECODE_SLOTS={slots} x (1 + GLM52_MTP_DRAFTS={draft_len}) exceeds the \
          {}-row step budget; 32 slots need GLM52_MTP_DRAFTS=2",
+        model::GLM52_MAX_STEP_ROWS
+    );
+    log::info!(
+        "GLM5.2 decode profile: slots={slots} mtp_draft_span={draft_len} ({} of {} step rows)",
+        slots * (1 + draft_len),
         model::GLM52_MAX_STEP_ROWS
     );
     // Probe only the GPUs this process hosts (local ordinals 0..N), not the
@@ -965,7 +978,7 @@ fn start_engine(
         )),
     );
 
-    let eos_token_ids = read_eos_token_ids(model_path)?;
+    let eos_token_ids = pegainfer_core::eos::eos_token_ids(model_path, GLM52_VOCAB)?;
     // Exactly-known VRAM that lands AFTER the workers' free-VRAM measurement
     // (post-FinishKv): the DeepEP/DeepGEMM buffers created in SetupComm, and
     // — when DSpark is on — the draft weights reserve plus its cap-scaled
@@ -1005,7 +1018,20 @@ fn start_engine(
             return Err(err);
         }
     };
-    let post_comm_startup = || -> Result<Option<Vec<OffloadEngine>>> {
+    let mirrored_early = moe_topo.uses_tensor_replicated_moe();
+    let local_ranks_early = if mirrored_early {
+        1
+    } else {
+        loaded.workers.len()
+    };
+    // The rank pools are built BEFORE the engines spawn: the store's rank
+    // table freezes at build, and BlockPool is a pure CPU object with no
+    // thread affinity. Each engine and the store share the same Arc.
+    let pools: Vec<Arc<BlockPool>> = (0..local_ranks_early)
+        .map(|_| Arc::new(BlockPool::new(GLM52_MODEL_LEN_ALIGN, pool_blocks)))
+        .collect();
+    let store_runtime = store_runtime_handle();
+    let post_comm_startup = || -> Result<Arc<KvStore>> {
         if prefill_only.is_some() {
             preflight_prefill_kernels(&loaded.workers)?;
         }
@@ -1014,13 +1040,43 @@ fn start_engine(
         }
         ensure_post_build_headroom(&loaded.workers)?;
         let device_ordinals: Vec<usize> = (0..startup.ranks.len()).collect();
-        let offload = kv_offload
-            .map(|opts| build_offload_engines(&opts, rank_arenas, &device_ordinals))
-            .transpose()?;
-        Ok(offload)
+        // A mirrored (TP) topology is one logical rank: worker 0's arena is
+        // the primary (the save side) and every other worker's is a mirror —
+        // MLA KV is tensor-replicated, so a tier load must land on ALL of
+        // them or ranks 1.. attend over never-written pages and the o_proj
+        // all-reduce merges the garbage identically on every rank (#847).
+        let (store_arenas, store_mirrors) = if mirrored_early {
+            let mut workers = rank_arenas.into_iter();
+            let primary = workers.next().context("TP arenas")?;
+            let mirrors = workers
+                .enumerate()
+                .map(|(index, arenas)| OffloadMirror {
+                    device_id: device_ordinals[1 + index] as i32,
+                    arenas,
+                })
+                .collect();
+            (vec![primary], vec![mirrors])
+        } else {
+            let ranks = rank_arenas.len();
+            (rank_arenas, (0..ranks).map(|_| Vec::new()).collect())
+        };
+        build_kv_store(
+            kv_offload.as_ref(),
+            store_arenas,
+            store_mirrors,
+            drafter.is_mtp(),
+            &device_ordinals[..local_ranks_early],
+            &pools,
+            if mirrored_early {
+                0
+            } else {
+                startup.ranks.start
+            },
+            &store_runtime,
+        )
     };
-    let offload = match post_comm_startup() {
-        Ok(started) => started,
+    let store = match post_comm_startup() {
+        Ok(store) => store,
         Err(err) => {
             for worker in &loaded.workers {
                 let _ = worker.request_shutdown();
@@ -1028,7 +1084,6 @@ fn start_engine(
             return Err(err);
         }
     };
-    let logical_ranks = moe_topo.logical_rank_count();
     let kv_total_blocks = pool_blocks - 1;
     // One autonomous engine per LOCAL logical rank (a mirrored topology
     // collapses to a single engine driving every worker). Each engine owns
@@ -1038,9 +1093,9 @@ fn start_engine(
     let local_ranks = if mirrored { 1 } else { loaded.workers.len() };
     let (load_txs, load_rxs): (Vec<_>, Vec<_>) = (0..local_ranks)
         .map(|_| {
-            watch::channel(LoadSnapshot {
+            watch::channel(SchedulerMetrics {
                 kv_total_blocks: kv_total_blocks as u64,
-                ..LoadSnapshot::default()
+                ..SchedulerMetrics::default()
             })
         })
         .unzip();
@@ -1061,23 +1116,10 @@ fn start_engine(
             .map(|worker| vec![worker])
             .collect()
     };
-    let offload_groups: Vec<Option<Vec<OffloadEngine>>> = if mirrored {
-        vec![offload]
-    } else {
-        match offload {
-            Some(engines) => engines
-                .into_iter()
-                .map(|engine| Some(vec![engine]))
-                .collect(),
-            None => (0..local_ranks).map(|_| None).collect(),
-        }
-    };
     let mut submit_txs = Vec::with_capacity(local_ranks);
     let mut startup_rxs = Vec::with_capacity(local_ranks);
     let mut join_handles = Vec::with_capacity(local_ranks);
-    for (engine_index, (engine_workers, engine_offload)) in
-        worker_groups.into_iter().zip(offload_groups).enumerate()
-    {
+    for (engine_index, engine_workers) in worker_groups.into_iter().enumerate() {
         let rank = if mirrored {
             0
         } else {
@@ -1092,11 +1134,12 @@ fn start_engine(
             eos_token_ids: eos_token_ids.clone(),
             drafter: drafter.clone(),
             prefill_chunk_size: prefill_only.map(|prefill| prefill.chunk_size),
-            pool_blocks,
+            pool: Arc::clone(&pools[engine_index]),
+            kv_offload: kv_offload.is_some(),
+            store: Arc::clone(&store),
+            runtime: store_runtime.clone(),
             max_model_len,
             no_prefix_cache,
-            offload: engine_offload,
-            logical_ranks,
             moe_topo,
             load_tx: load_txs[engine_index].clone(),
             graph_dump_request: if engine_index == 0 {
@@ -1129,7 +1172,7 @@ fn start_engine(
     // healthy engines exit their loops and shut their workers down
     // concurrently, then join them.
     let abort_engines =
-        |submit_txs: Vec<mpsc::UnboundedSender<pegainfer_core::engine::SubmittedRequest>>,
+        |submit_txs: Vec<mpsc::UnboundedSender<pegainfer_frontend::engine::SubmittedRequest>>,
          join_handles: Vec<std::thread::JoinHandle<()>>| {
             drop(submit_txs);
             for handle in join_handles {
@@ -1183,7 +1226,7 @@ fn start_engine(
                 total_blocks: kv_total_blocks,
                 block_size: GLM52_MODEL_LEN_ALIGN,
             })
-            .with_load_watches(load_rxs),
+            .with_metrics_watches(load_rxs),
     )
 }
 
@@ -1293,7 +1336,7 @@ fn build_rank_models(
     rendezvous: Option<&str>,
     floor_blocks: usize,
     post_finish_reserve_bytes: usize,
-) -> Result<(Vec<Vec<KvArena>>, usize)> {
+) -> Result<(Vec<Vec<ArenaSpec>>, usize)> {
     let build_started = Instant::now();
     let prefill_only = prefill_chunk_size.is_some();
     let responses = workers
@@ -1453,110 +1496,140 @@ fn build_rank_models(
 /// The namespace folds the layout facts that make blocks interchange-safe
 /// (per-token packing, page size, layer count); pool capacity deliberately
 /// stays out (a block's bytes don't depend on it).
-fn build_offload_engines(
-    opts: &Glm52KvOffloadOptions,
-    rank_arenas: Vec<Vec<KvArena>>,
+/// Build the process-wide [`KvStore`]: every logical rank's pool, and — with
+/// offload configured — one shared [`PegaflowHost`] plus a per-rank pegaflow
+/// instance registration. All DP ranks share one namespace (replicated
+/// non-expert weights make their KV interchangeable), folding the layout
+/// facts that make blocks interchange-safe.
+fn build_kv_store(
+    opts: Option<&Glm52KvOffloadOptions>,
+    rank_arenas: Vec<Vec<ArenaSpec>>,
+    rank_mirrors: Vec<Vec<OffloadMirror>>,
+    native_mtp: bool,
     device_ordinals: &[usize],
-) -> Result<Vec<OffloadEngine>> {
-    let mla_page_size = pegainfer_kernels::ops::GLM52_FLASHMLA_SPARSE_PAGE_SIZE;
-    let mla_bytes_per_token = rank_arenas
-        .first()
-        .and_then(|arenas| arenas.iter().find(|arena| is_mla_arena_name(&arena.name)))
-        .context("GLM5.2 KV offload has no MLA arena")?
-        .bytes_per_block
-        / mla_page_size;
+    pools: &[Arc<BlockPool>],
+    ranks_start: usize,
+    runtime: &tokio::runtime::Handle,
+) -> Result<Arc<KvStore>> {
+    // The store's rank table is keyed by GLOBAL logical rank — the engines
+    // query it with `ranks.start + local_index` on a multi-process fleet.
+    let mut builder = KvStoreBuilder::new(runtime.clone());
+    let Some(opts) = opts else {
+        for (local, pool) in pools.iter().enumerate() {
+            builder = builder.rank(ranks_start + local, Arc::clone(pool));
+        }
+        return Ok(Arc::new(builder.build()));
+    };
+
+    // One page-granular arena per rank; the page layout constants ARE the
+    // block byte layout, so the registration only cross-checks that every
+    // rank's arena carries them.
     ensure!(
-        rank_arenas.iter().all(|arenas| arenas
-            .iter()
-            .filter(|arena| is_mla_arena_name(&arena.name))
-            .all(|arena| arena.bytes_per_block == mla_page_size * mla_bytes_per_token)),
-        "GLM5.2 KV offload ranks disagree on MLA cache layout"
+        rank_arenas.iter().all(|arenas| {
+            arenas.len() == 1
+                && arenas[0].name == "glm52.page"
+                && arenas[0].segment_bytes == crate::model::GLM52_KV_PAGE_CONTENT_BYTES
+                && arenas[0].block_stride_bytes == crate::model::GLM52_KV_PAGE_STRIDE
+        }),
+        "GLM5.2 KV offload expects one page-first arena per rank \
+         (segment {} B, stride {} B)",
+        crate::model::GLM52_KV_PAGE_CONTENT_BYTES,
+        crate::model::GLM52_KV_PAGE_STRIDE,
     );
-    let host = OffloadHost::new(HostConfig {
-        pinned_pool_bytes: opts.pinned_pool_bytes,
-        use_hugepages: opts.use_hugepages,
-        runtime_threads: 2,
-        p2p: opts
-            .p2p
-            .as_ref()
-            .map(|p2p| pegainfer_kv_offload::P2pConfig {
-                metaserver_addr: p2p.metaserver_addr.clone(),
-                advertise_addr: p2p.advertise_addr.clone(),
-                rdma_nics: p2p.rdma_nics.clone(),
-            }),
-    })
-    .map_err(|err| anyhow::anyhow!("GLM5.2 KV offload host: {err}"))?;
-    let native_mtp = rank_arenas
-        .first()
-        .is_some_and(|arenas| arenas.iter().any(|arena| arena.name == "glm52.L78.mla"));
+    let mut host_builder = PegaflowHost::builder(opts.pinned_pool_bytes)
+        .use_hugepages(opts.use_hugepages)
+        .runtime_threads(2);
+    if let Some(p2p) = &opts.p2p {
+        host_builder = host_builder.p2p(P2pConfig {
+            metaserver_addr: p2p.metaserver_addr.clone(),
+            advertise_addr: p2p.advertise_addr.clone(),
+            rdma_nics: p2p.rdma_nics.clone(),
+        });
+    }
+    let host = host_builder
+        .build()
+        .map_err(|err| anyhow::anyhow!("GLM5.2 KV offload host: {err}"))?;
+    // The stride is the layout identity: one page carries every layer's MLA
+    // + index-K slices and the L78 MTP mirror slices (drafter or not), so
+    // agreeing on (layer count, token page, stride) is agreeing on every
+    // byte of a block's SHAPE. The mtp flag is the content half: a
+    // drafterless producer reserves the L78 slices but never writes them,
+    // and a native-MTP consumer restoring such a page would propose from
+    // zeros — the two configs must not see each other's blocks.
     let namespace = format!(
-        "pegainfer-glm52-l{GLM52_LAYERS}-p{}-mla{}-idxk{}-mtp{}",
-        mla_page_size,
-        mla_bytes_per_token,
-        config::GLM52_INDEX_HEAD_DIM + 4,
+        "pegainfer-glm52-l{GLM52_LAYERS}-p{}-page{}-mtp{}",
+        pegainfer_kernels::ops::GLM52_FLASHMLA_SPARSE_PAGE_SIZE,
+        crate::model::GLM52_KV_PAGE_STRIDE,
         usize::from(native_mtp),
     );
-    let engines = rank_arenas
+    ensure!(
+        rank_arenas.len() == pools.len() && device_ordinals.len() == pools.len(),
+        "GLM5.2 KV offload: {} arena sets, {} pools, {} devices must agree",
+        rank_arenas.len(),
+        pools.len(),
+        device_ordinals.len()
+    );
+    ensure!(
+        rank_mirrors.len() == pools.len(),
+        "GLM5.2 KV offload: {} mirror sets for {} pools",
+        rank_mirrors.len(),
+        pools.len()
+    );
+    let ranks = rank_arenas.len();
+    let arenas_per_rank = rank_arenas.first().map_or(0, Vec::len);
+    let mirrors_per_rank = rank_mirrors.first().map_or(0, Vec::len);
+    for (local, ((arenas, mirrors), &device_ordinal)) in rank_arenas
         .into_iter()
+        .zip(rank_mirrors)
         .zip(device_ordinals)
         .enumerate()
-        .map(|(rank, (arenas, &device_ordinal))| {
-            OffloadEngine::with_arenas_on(
-                std::sync::Arc::clone(&host),
-                format!("glm52-rank{rank}"),
-                &namespace,
-                device_ordinal as i32,
-                &arenas,
-                false,
+    {
+        let rank = ranks_start + local;
+        builder = builder
+            .rank_with_offload(
+                rank,
+                Arc::clone(&pools[local]),
+                &host,
+                OffloadRankSpec {
+                    instance_id: format!("glm52-rank{rank}"),
+                    namespace: namespace.clone(),
+                    device_id: device_ordinal as i32,
+                    arenas,
+                    page_first: false,
+                    mirrors,
+                },
             )
-            .map_err(|err| anyhow::anyhow!("GLM5.2 KV offload rank {rank} registration: {err}"))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let arenas_per_rank = GLM52_LAYERS
-        + (0..GLM52_LAYERS)
-            .filter(|&layer| config::glm52_layer_has_full_indexer(layer))
-            .count()
-        + usize::from(native_mtp) * 2;
+            .map_err(|err| {
+                anyhow::anyhow!("GLM5.2 KV offload rank {rank} registration: {err:#}")
+            })?;
+    }
     log::info!(
         "GLM5.2 KV offload up: {} pinned host pool (hugepages: {}), namespace {namespace}, \
-         {} rank instances x {arenas_per_rank} arenas",
+         {ranks} rank instances x {arenas_per_rank} arenas ({mirrors_per_rank} mirrors each)",
         ByteSize(opts.pinned_pool_bytes as u64),
         opts.use_hugepages,
-        engines.len(),
     );
-    Ok(engines)
+    Ok(Arc::new(builder.build()))
 }
 
-fn is_mla_arena_name(name: &str) -> bool {
-    name.rsplit_once('.')
-        .is_some_and(|(_, arena_kind)| arena_kind == "mla")
-}
-
-/// EOS ids from the checkpoint's generation_config.json (`eos_token_id` is a
-/// number or an array of numbers).
-fn read_eos_token_ids(model_path: &Path) -> Result<Vec<u32>> {
-    let path = model_path.join("generation_config.json");
-    let content = std::fs::read_to_string(&path)
-        .map_err(|err| anyhow::anyhow!("read {}: {err}", path.display()))?;
-    let json: serde_json::Value = serde_json::from_str(&content)
-        .map_err(|err| anyhow::anyhow!("parse {}: {err}", path.display()))?;
-    let field = json
-        .get("eos_token_id")
-        .ok_or_else(|| anyhow::anyhow!("{} missing eos_token_id", path.display()))?;
-    let as_u32 = |value: &serde_json::Value| -> Result<u32> {
-        value
-            .as_u64()
-            .and_then(|v| u32::try_from(v).ok())
-            .ok_or_else(|| anyhow::anyhow!("eos_token_id entry {value} is not a u32"))
-    };
-    let ids = match field {
-        serde_json::Value::Array(entries) => {
-            entries.iter().map(as_u32).collect::<Result<Vec<_>>>()?
-        }
-        other => vec![as_u32(other)?],
-    };
-    ensure!(!ids.is_empty(), "eos_token_id list is empty");
-    Ok(ids)
+/// The store's watcher/resolver runtime: the ambient tokio runtime when the
+/// loader runs under one (pegainfer-server's `spawn_blocking` keeps the
+/// context), else a small dedicated runtime living for the process.
+fn store_runtime_handle() -> tokio::runtime::Handle {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        return handle;
+    }
+    static FALLBACK: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    FALLBACK
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("kv-store fallback runtime")
+        })
+        .handle()
+        .clone()
 }
 
 fn validate_startup(

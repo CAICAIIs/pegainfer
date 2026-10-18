@@ -8,6 +8,8 @@ use pegainfer_kernels::ops::NumericPolicy;
 use pegainfer_kernels::ops::numeric_policy;
 #[cfg(feature = "kernel-call-trace")]
 use pegainfer_kernels::tensor::KernelCall;
+#[cfg(feature = "kernel-call-trace")]
+use pegainfer_kv_cache::RequestKv;
 
 #[cfg(feature = "kernel-call-trace")]
 use crate::batch_decode_buffers::BatchDecodeBuffers;
@@ -57,7 +59,8 @@ pub fn trace_decode_kernel_calls(
         budget.num_kv_heads,
         budget.head_dim,
         budget.block_size,
-    );
+    )
+    .expect("kv layout geometry");
 
     // Build dummy RequestKvs with the target kv_len.
     //
@@ -87,12 +90,13 @@ pub fn trace_decode_kernel_calls(
         model.local_q_dim(),
         model.local_kv_dim(),
         model.local_intermediate_size(),
-        model.config().vocab_size,
+        model.config().logits_rows,
         batch_size,
         layout.page_size,
         kv_mgr.pool().padding_block_id(),
         model.local_num_attention_heads(),
         model.config().max_position_embeddings,
+        model.fused_decode_qkv(),
     )?;
     // This trace path bypasses the serving executor (which warms the pinned shapes at startup);
     // warm here, outside `collect_result` below so it isn't recorded as a kernel call.
@@ -102,11 +106,11 @@ pub fn trace_decode_kernel_calls(
             model.local_q_dim(),
             model.local_kv_dim(),
             model.local_intermediate_size(),
-            model.config().vocab_size,
+            model.config().logits_rows,
         )?;
     }
     let token_ids = vec![0_u32; batch_size];
-    let views: Vec<_> = rkvs.iter().map(|r| r.decode_view()).collect();
+    let views: Vec<_> = rkvs.iter().map(RequestKv::decode_view).collect();
     let ((), calls) = call_trace::collect_result(|| {
         model.batch_decode(
             &token_ids,

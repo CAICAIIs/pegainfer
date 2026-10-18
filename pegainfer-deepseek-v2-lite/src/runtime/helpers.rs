@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use anyhow::bail;
-use pegainfer_engine::engine::FinishReason;
+use pegainfer_frontend::engine::FinishReason;
 use sha2::Digest;
 use sha2::Sha256;
 
@@ -42,10 +42,10 @@ pub(super) fn duration_micros(duration: Duration) -> u64 {
 pub(super) fn append_generated_token(
     generated: &mut Vec<u32>,
     token: u32,
-    eos_token_id: u32,
+    eos_token_ids: &[u32],
     ignore_eos: bool,
 ) -> Option<FinishReason> {
-    if !ignore_eos && token == eos_token_id {
+    if !ignore_eos && eos_token_ids.contains(&token) {
         return Some(FinishReason::Stop);
     }
     generated.push(token);

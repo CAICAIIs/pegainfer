@@ -130,7 +130,7 @@ const HIDDEN: usize = 6144;
 /// the Python generator, including the f64 -> f32 -> bf16 double rounding
 /// (numpy `.astype(np.float32)` then torch's bf16 cast); a direct f64 -> bf16
 /// rounds a handful of values differently and fails the digest.
-pub(super) fn seeded_hidden(seed: u64, count: usize) -> Vec<bf16> {
+fn seeded_hidden(seed: u64, count: usize) -> Vec<bf16> {
     (0..count)
         .map(|i| {
             let mut z = seed.wrapping_add((i as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
@@ -153,12 +153,12 @@ fn bf16_digest(data: &[bf16]) -> String {
 
 /// Copy layer-0 attention tensors out of the checkpoint shards. Owned copies
 /// (~250 MB total) keep the borrow story trivial; this is a test-only path.
-pub(super) struct Layer0Tensors {
+struct Layer0Tensors {
     by_name: BTreeMap<String, Vec<u8>>,
 }
 
 impl Layer0Tensors {
-    pub(super) fn load(model_path: &Path) -> Result<Self> {
+    fn load(model_path: &Path) -> Result<Self> {
         let index: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
             model_path.join("model.safetensors.index.json"),
         )?)?;
@@ -186,14 +186,14 @@ impl Layer0Tensors {
         Ok(Self { by_name })
     }
 
-    pub(super) fn bytes(&self, name: &str) -> Result<&[u8]> {
+    fn bytes(&self, name: &str) -> Result<&[u8]> {
         self.by_name
             .get(name)
             .map(Vec::as_slice)
             .with_context(|| format!("layer-0 tensor {name} not loaded"))
     }
 
-    pub(super) fn proj(&self, stem: &str, n: usize, k: usize) -> Result<Glm52ProjBytes<'_>> {
+    fn proj(&self, stem: &str, n: usize, k: usize) -> Result<Glm52ProjBytes<'_>> {
         Ok(Glm52ProjBytes {
             weight: self.bytes(&format!("{stem}.weight"))?,
             scale: self.bytes(&format!("{stem}.weight_scale_inv"))?,
@@ -203,7 +203,7 @@ impl Layer0Tensors {
     }
 }
 
-pub(super) fn load_layer0(ctx: &DeviceContext, model_path: &Path) -> Result<Glm52MlaLayerWeights> {
+fn load_layer0(ctx: &DeviceContext, model_path: &Path) -> Result<Glm52MlaLayerWeights> {
     let t = Layer0Tensors::load(model_path)?;
     let p = "model.layers.0.self_attn";
     Glm52MlaLayerWeights::from_host(
@@ -242,6 +242,9 @@ fn run_mla_oracle_gate(topk: usize, sm_parts_cap: Option<usize>) -> Result<()> {
     let contract = Glm52FlashMlaSparseDecode {
         batch_size: 1,
         num_blocks: ORACLE_CTX.div_ceil(GLM52_FLASHMLA_SPARSE_PAGE_SIZE),
+        // Dedicated single-layer cache: tight page stride, no layer offset.
+        kv_layer_offset_bytes: 0,
+        kv_block_stride_bytes: crate::model::GLM52_KV_PAGE_MLA_BYTES,
         topk,
         num_sm_parts: sm_parts_cap.map_or(device_sm_parts, |cap| device_sm_parts.min(cap)),
         sm_scale: GLM52_SM_SCALE,

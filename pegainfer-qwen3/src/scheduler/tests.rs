@@ -1,301 +1,56 @@
-use std::collections::HashMap;
+//! Mechanics tests: admission arithmetic, chunk selection, prefetch policy,
+//! and speculative-span resolution — all pure functions of executor state.
+//! End-to-end request flow through the engine contract is tested in
+//! `crate::frontend_adapter`.
+
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::Duration;
-use std::time::Instant;
 
-use anyhow::Result;
-use pegainfer_core::engine::EngineControlError;
-use pegainfer_core::engine::LoadLoraAdapterRequest;
-use pegainfer_core::engine::UnloadLoraAdapterRequest;
+use pegainfer_frontend::engine::EosPolicy;
+use pegainfer_frontend::engine::FinishReason;
+use pegainfer_frontend::engine::StopCause;
+use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_kv_cache::BlockPool;
 
+use super::test_support::FakeExecutor;
+use super::test_support::request;
 use super::*;
-use crate::executor::DecodePlan;
-use crate::executor::DecodeRequestResult;
-use crate::executor::PrefillPlan;
 use crate::executor::PrefillRequestResult;
 use crate::executor::PrefillResult;
-use crate::executor::PrefillStepItem;
-use crate::executor::UnifiedPlan;
-use crate::executor::UnifiedResult;
+use crate::speculative::VerifyRequestResult;
 
-struct FakeExecutor {
-    block_size: usize,
-    max_request_blocks: usize,
-    max_context_tokens: usize,
-    available_blocks: usize,
-    held_tokens: HashMap<RequestId, usize>,
-    // Prompt progress of requests mid-chunked-prefill (mirrors the real
-    // executor's kv_position so multi-chunk scheduling is exercised).
-    prefill_positions: HashMap<RequestId, usize>,
-    fail_decode_once: bool,
-    decode_delay: Duration,
-    loaded_lora_adapters: HashSet<String>,
-    dropped: Arc<Mutex<Vec<u64>>>,
-    prefetch_offers: Arc<Mutex<Vec<u64>>>,
-    stop_token: Option<u32>,
-}
-
-impl FakeExecutor {
-    fn new(max_request_blocks: usize, dropped: Arc<Mutex<Vec<u64>>>) -> Self {
-        Self {
-            block_size: 16,
-            max_request_blocks,
-            max_context_tokens: usize::MAX,
-            available_blocks: max_request_blocks,
-            held_tokens: HashMap::new(),
-            prefill_positions: HashMap::new(),
-            fail_decode_once: false,
-            decode_delay: Duration::ZERO,
-            loaded_lora_adapters: HashSet::new(),
-            dropped,
-            prefetch_offers: Arc::new(Mutex::new(Vec::new())),
-            stop_token: None,
-        }
-    }
-
-    fn with_stop_token(mut self, token: u32) -> Self {
-        self.stop_token = Some(token);
-        self
-    }
-
-    fn with_decode_failure(mut self) -> Self {
-        self.fail_decode_once = true;
-        self
-    }
-
-    fn with_decode_delay(mut self, delay: Duration) -> Self {
-        self.decode_delay = delay;
-        self
-    }
-
-    fn with_lora_adapters(mut self, names: &[&str]) -> Self {
-        self.loaded_lora_adapters = names.iter().map(|name| (*name).to_string()).collect();
-        self
-    }
-
-    /// Advance a request's prompt by one chunk, mirroring the real
-    /// executor: clamp the scheduler's budget to the tokens remaining
-    /// and report the new authoritative position.
-    fn fake_prefill_result(&mut self, req: &PrefillStepItem) -> PrefillRequestResult {
-        let start = self
-            .prefill_positions
-            .get(&req.request_id)
-            .copied()
-            .unwrap_or(0);
-        let chunk = (req.prompt_tokens.len() - start).min(req.chunk_budget);
-        let prefill_pos = start + chunk;
-        let completed = prefill_pos == req.prompt_tokens.len();
-        if completed {
-            self.prefill_positions.remove(&req.request_id);
-        } else {
-            self.prefill_positions.insert(req.request_id, prefill_pos);
-        }
-        PrefillRequestResult {
-            request_id: req.request_id,
-            first_token: 100 + req.request_id.get() as u32,
-            first_token_logprob: None,
-            prompt_logprobs: None,
-            cached_tokens: 0,
-            completed,
-            prefill_pos,
-        }
-    }
-
-    fn ensure_request_tokens(&mut self, request_id: RequestId, token_count: usize) -> Result<()> {
-        let current_tokens = self.held_tokens.get(&request_id).copied().unwrap_or(0);
-        let current_blocks = blocks_needed(current_tokens, self.block_size);
-        let needed_blocks = blocks_needed(token_count, self.block_size);
-        let grow = needed_blocks.saturating_sub(current_blocks);
-        if grow > self.available_blocks {
-            anyhow::bail!("fake KV capacity exhausted");
-        }
-        self.available_blocks -= grow;
-        self.held_tokens.insert(request_id, token_count);
-        Ok(())
-    }
-}
-
-impl ModelExecutor for FakeExecutor {
-    fn block_size(&self) -> usize {
-        self.block_size
-    }
-
-    fn max_request_blocks(&self) -> usize {
-        self.max_request_blocks
-    }
-
-    fn max_context_tokens(&self) -> usize {
-        self.max_context_tokens
-    }
-
-    fn max_decode_batch_size(&self) -> usize {
-        64
-    }
-
-    fn available_blocks(&self) -> usize {
-        self.available_blocks
-    }
-
-    fn is_stop_token(&self, token_id: u32) -> bool {
-        self.stop_token == Some(token_id)
-    }
-
-    fn drop_request(&mut self, request_id: RequestId) -> Result<()> {
-        if let Some(tokens) = self.held_tokens.remove(&request_id) {
-            self.available_blocks += blocks_needed(tokens, self.block_size);
-        }
-        self.prefill_positions.remove(&request_id);
-        self.dropped.lock().unwrap().push(request_id.get());
-        Ok(())
-    }
-
-    fn begin_kv_prefetch(
-        &mut self,
-        request_id: RequestId,
-        _prompt_tokens: &[u32],
-        _lora_adapter: Option<&str>,
-        _reserve_floor: usize,
-    ) -> bool {
-        self.prefetch_offers.lock().unwrap().push(request_id.get());
-        false
-    }
-
-    fn list_lora_adapters(&self) -> Vec<String> {
-        let mut names: Vec<_> = self.loaded_lora_adapters.iter().cloned().collect();
-        names.sort();
-        names
-    }
-
-    fn unload_lora_adapter(&mut self, request: &UnloadLoraAdapterRequest) -> Result<()> {
-        anyhow::ensure!(
-            self.loaded_lora_adapters.remove(&request.lora_name),
-            "LoRA adapter is not loaded: {}",
-            request.lora_name
-        );
-        Ok(())
-    }
-
-    fn execute_prefill(&mut self, plan: PrefillPlan<'_>) -> Result<PrefillResult> {
-        for req in plan.requests {
-            self.ensure_request_tokens(req.request_id, req.prompt_tokens.len())?;
-        }
-        Ok(PrefillResult {
-            requests: plan
-                .requests
-                .iter()
-                .map(|req| self.fake_prefill_result(req))
-                .collect(),
-            dflash_context_captured_requests: Vec::new(),
-        })
-    }
-
-    fn execute_decode(&mut self, plan: DecodePlan<'_>) -> Result<crate::executor::DecodeResult> {
-        if !self.decode_delay.is_zero() {
-            std::thread::sleep(self.decode_delay);
-        }
-        if self.fail_decode_once {
-            self.fail_decode_once = false;
-            anyhow::bail!("fake decode KV capacity exhausted");
-        }
-
-        for req in plan.requests {
-            let current_tokens = self
-                .held_tokens
-                .get(&req.request_id)
-                .copied()
-                .ok_or_else(|| anyhow::anyhow!("missing fake request state"))?;
-            self.ensure_request_tokens(req.request_id, current_tokens + 1)?;
-        }
-
-        Ok(crate::executor::DecodeResult {
-            requests: plan
-                .requests
-                .iter()
-                .map(|req| DecodeRequestResult {
-                    request_id: req.request_id,
-                    token: 200 + req.request_id.get() as u32,
-                    logprob: None,
-                })
-                .collect(),
-        })
-    }
-
-    fn execute_unified(&mut self, plan: UnifiedPlan<'_>) -> Result<UnifiedResult> {
-        for req in plan.prefill_requests {
-            self.ensure_request_tokens(req.request_id, req.prompt_tokens.len())?;
-        }
-        for req in plan.decode_requests {
-            let current_tokens = self
-                .held_tokens
-                .get(&req.request_id)
-                .copied()
-                .ok_or_else(|| anyhow::anyhow!("missing fake request state"))?;
-            self.ensure_request_tokens(req.request_id, current_tokens + 1)?;
-        }
-
-        Ok(UnifiedResult {
-            prefill_requests: plan
-                .prefill_requests
-                .iter()
-                .map(|req| self.fake_prefill_result(req))
-                .collect(),
-            decode_requests: plan
-                .decode_requests
-                .iter()
-                .map(|req| DecodeRequestResult {
-                    request_id: req.request_id,
-                    token: 200 + req.request_id.get() as u32,
-                    logprob: None,
-                })
-                .collect(),
-        })
+fn active_state(request_id: u64, generated_count: usize, max_tokens: usize) -> ActiveRequestState {
+    ActiveRequestState {
+        request_id: RequestId::new(request_id),
+        lora_adapter: None,
+        last_token: 1,
+        generated_count,
+        max_tokens,
+        prompt_len: 16,
+        params: SamplingParams::default(),
+        stop_policy: StopPolicy::default(),
+        logprobs: None,
     }
 }
 
 #[test]
 fn kv_budget_distinguishes_written_tokens_from_lifetime_blocks() {
-    let (pending_req, _pending_rx) = request(16, 1);
-    let pending = PendingRequest::from_scheduler_request(RequestId(7), pending_req);
+    let pending = PendingRequest::from_request(RequestId::new(7), request(16, 1));
     assert_eq!(max_request_tokens(&pending), 16);
     assert_eq!(blocks_needed(max_request_tokens(&pending), 16), 1);
     assert_eq!(pending_lifetime_blocks(&pending, 16), 1);
 
-    let (pending_req, _pending_rx) = request(16, 17);
-    let pending = PendingRequest::from_scheduler_request(RequestId(8), pending_req);
+    let pending = PendingRequest::from_request(RequestId::new(8), request(16, 17));
     assert_eq!(max_request_tokens(&pending), 32);
     assert_eq!(blocks_needed(max_request_tokens(&pending), 16), 2);
     assert_eq!(pending_lifetime_blocks(&pending, 16), 3);
 
-    let (token_tx, _token_rx) = TokenSink::standalone();
-    let after_prefill = ActiveRequestState {
-        request_id: RequestId(8),
-        lora_adapter: None,
-        token_tx,
-        last_token: 100,
-        generated_count: 1,
-        max_tokens: 17,
-        prompt_len: 16,
-        params: SamplingParams::default(),
-        logprobs: 0,
-    };
+    let after_prefill = active_state(8, 1, 17);
     assert_eq!(current_active_tokens(&after_prefill), 16);
     assert_eq!(max_active_tokens(&after_prefill), 32);
     assert_eq!(active_lifetime_blocks(&after_prefill, 16), 3);
 
-    let (token_tx, _token_rx) = TokenSink::standalone();
-    let after_one_decode = ActiveRequestState {
-        request_id: RequestId(9),
-        lora_adapter: None,
-        token_tx,
-        last_token: 200,
-        generated_count: 2,
-        max_tokens: 17,
-        prompt_len: 16,
-        params: SamplingParams::default(),
-        logprobs: 0,
-    };
+    let after_one_decode = active_state(9, 2, 17);
     assert_eq!(current_active_tokens(&after_one_decode), 17);
     assert_eq!(max_active_tokens(&after_one_decode), 32);
     assert_eq!(active_lifetime_blocks(&after_one_decode, 16), 3);
@@ -306,21 +61,14 @@ fn admission_splits_deferred_into_pending_deferred_and_rejected() {
     // block_size 16, per-request cap 4 blocks (max 64 tokens). One active
     // request is mid-flight and will grow into 2 more blocks, so it
     // pre-reserves them out of the budget.
-    let (token_tx, _rx) = TokenSink::standalone();
     let active = [ActiveRequestState {
-        request_id: RequestId(0),
-        lora_adapter: None,
-        token_tx,
-        last_token: 1,
         generated_count: 1, // current tokens = prompt_len (16) -> 1 block
         max_tokens: 18,     // lifetime tokens = 16 + 18 = 34 -> 3 blocks; future growth = 2
-        prompt_len: 16,
-        params: SamplingParams::default(),
-        logprobs: 0,
+        ..active_state(0, 1, 18)
     }];
 
     let mk = |id: u64, prompt_len, max_tokens| {
-        PendingRequest::from_scheduler_request(RequestId(id), request(prompt_len, max_tokens).0)
+        PendingRequest::from_request(RequestId::new(id), request(prompt_len, max_tokens))
     };
     let deferred = vec![
         mk(1, 16, 1), // one-token completion on a page boundary: admitted
@@ -330,10 +78,21 @@ fn admission_splits_deferred_into_pending_deferred_and_rejected() {
     ];
 
     // available 4 blocks - 2 reserved for active growth = budget of 2.
-    let outcome =
-        admit_deferred_requests(deferred, &active, &[], 16, 4, 4, usize::MAX, 64, 32, |_| 0);
+    let outcome = admit_deferred_requests(
+        deferred,
+        &active,
+        &[],
+        &[],
+        16,
+        4,
+        4,
+        usize::MAX,
+        64,
+        32,
+        |_| 0,
+    );
 
-    let ids = |reqs: &[PendingRequest]| reqs.iter().map(|r| r.request_id.get()).collect::<Vec<_>>();
+    let ids = |reqs: &[PendingRequest]| reqs.iter().map(|r| r.request_id.raw()).collect::<Vec<_>>();
     assert_eq!(
         ids(&outcome.pending),
         vec![1, 2],
@@ -347,7 +106,7 @@ fn admission_splits_deferred_into_pending_deferred_and_rejected() {
     let rejected_ids = outcome
         .rejected
         .iter()
-        .map(|(r, _)| r.request_id.get())
+        .map(|(r, _)| r.request_id.raw())
         .collect::<Vec<_>>();
     assert_eq!(
         rejected_ids,
@@ -360,7 +119,7 @@ fn admission_splits_deferred_into_pending_deferred_and_rejected() {
 fn requests_exceeding_context_window_are_rejected() {
     let active: [ActiveRequestState; 0] = [];
     let mk = |id: u64, prompt_len, max_tokens| {
-        PendingRequest::from_scheduler_request(RequestId(id), request(prompt_len, max_tokens).0)
+        PendingRequest::from_request(RequestId::new(id), request(prompt_len, max_tokens))
     };
 
     let deferred = vec![
@@ -369,13 +128,24 @@ fn requests_exceeding_context_window_are_rejected() {
         mk(3, 40, 1),  // request 3: 40 prompt + 1 max = 41 total: overflows by 9 tokens → rejected
     ];
 
-    let outcome =
-        admit_deferred_requests(deferred, &active, &[], 16, 1000, 1000, 32, 64, 64, |_| 0);
+    let outcome = admit_deferred_requests(
+        deferred,
+        &active,
+        &[],
+        &[],
+        16,
+        1000,
+        1000,
+        32,
+        64,
+        64,
+        |_| 0,
+    );
 
     let pending_ids = outcome
         .pending
         .iter()
-        .map(|r| r.request_id.get())
+        .map(|r| r.request_id.raw())
         .collect::<Vec<_>>();
     assert_eq!(
         pending_ids,
@@ -386,7 +156,7 @@ fn requests_exceeding_context_window_are_rejected() {
     let rejected_ids = outcome
         .rejected
         .iter()
-        .map(|(r, _)| r.request_id.get())
+        .map(|(r, _)| r.request_id.raw())
         .collect::<Vec<_>>();
     assert_eq!(rejected_ids, vec![2, 3]);
     for (_, reason) in &outcome.rejected {
@@ -399,26 +169,13 @@ fn requests_exceeding_context_window_are_rejected() {
 
 #[test]
 fn admission_respects_decode_batch_capacity() {
-    let mut active = Vec::new();
-    for id in 0..64 {
-        let (token_tx, _rx) = TokenSink::standalone();
-        active.push(ActiveRequestState {
-            request_id: RequestId(id),
-            lora_adapter: None,
-            token_tx,
-            last_token: 1,
-            generated_count: 1,
-            max_tokens: 2,
-            prompt_len: 16,
-            params: SamplingParams::default(),
-            logprobs: 0,
-        });
-    }
-    let pending = PendingRequest::from_scheduler_request(RequestId(64), request(16, 1).0);
+    let active: Vec<ActiveRequestState> = (0..64).map(|id| active_state(id, 1, 2)).collect();
+    let pending = PendingRequest::from_request(RequestId::new(64), request(16, 1));
 
     let outcome = admit_deferred_requests(
         vec![pending],
         &active,
+        &[],
         &[],
         16,
         1024,
@@ -435,16 +192,61 @@ fn admission_respects_decode_batch_capacity() {
     );
     assert_eq!(
         outcome.deferred[0].request_id,
-        RequestId(64),
+        RequestId::new(64),
         "capacity-starved request should stay deferred"
     );
     assert!(outcome.rejected.is_empty());
 }
 
 #[test]
+fn inflight_prefill_reservation_is_unchanged_by_its_result() {
+    let executor = FakeExecutor::new(64, Arc::new(Mutex::new(Vec::new())));
+    // 40 prompt + 20 output tokens: 4 lifetime blocks.
+    let launched = |prefill_pos: usize, step_chunk: usize| PendingRequest {
+        prefill_pos,
+        step_chunk,
+        ..PendingRequest::from_request(RequestId::new(1), request(40, 20))
+    };
+    // A middle chunk returns to `prefilling`; the last one promotes to decode.
+    for (req, owed) in [(launched(0, 32), 2), (launched(32, 8), 1)] {
+        let floor = admitted_future_blocks(&executor, &[], &[], std::slice::from_ref(&req));
+        assert_eq!(floor, owed, "the launched chunk is already allocated");
+
+        let prefill_pos = req.prefill_pos + req.step_chunk;
+        let result = PrefillResult {
+            requests: vec![PrefillRequestResult {
+                request_id: req.request_id,
+                first_token: 100,
+                first_token_logprob: None,
+                prompt_logprobs: None,
+                cached_tokens: 0,
+                completed: prefill_pos == req.prompt_tokens.len(),
+                prefill_pos,
+            }],
+            dflash_context_captured_requests: Vec::new(),
+        };
+        let artifacts = plan::ExecutionArtifacts::Prefill {
+            pending: vec![req],
+            result,
+        };
+        let effects = resolve::resolve_step(&executor, &[], artifacts);
+        let (active, prefilling) = match effects.pending.into_iter().next() {
+            Some(effects::PendingEffect::ContinuePrefill { req }) => (Vec::new(), vec![req]),
+            Some(effects::PendingEffect::Promote { state, .. }) => (vec![state], Vec::new()),
+            _ => panic!("a launched chunk resolves to continue or promote"),
+        };
+        assert_eq!(
+            admitted_future_blocks(&executor, &active, &prefilling, &[]),
+            floor,
+            "applying the result neither frees nor double counts the reservation"
+        );
+    }
+}
+
+#[test]
 fn prefill_chunking_caps_step_tokens_and_keeps_fifo_progress() {
     let mk = |id: u64, prompt_len, max_tokens| {
-        PendingRequest::from_scheduler_request(RequestId(id), request(prompt_len, max_tokens).0)
+        PendingRequest::from_request(RequestId::new(id), request(prompt_len, max_tokens))
     };
 
     // A prompt larger than the budget is split: the head request gets a
@@ -452,11 +254,11 @@ fn prefill_chunking_caps_step_tokens_and_keeps_fifo_progress() {
     let mut prefilling = vec![mk(1, 64, 1), mk(2, 16, 1)];
     let taken = take_prefill_chunks(&mut prefilling, 32, false);
     assert_eq!(taken.len(), 1);
-    assert_eq!(taken[0].request_id, RequestId(1));
+    assert_eq!(taken[0].request_id, RequestId::new(1));
     assert_eq!(taken[0].step_chunk, 32, "chunk is capped at the budget");
     assert_eq!(
         prefilling[0].request_id,
-        RequestId(2),
+        RequestId::new(2),
         "follow-up waits for the next step once the budget is spent"
     );
 
@@ -469,7 +271,7 @@ fn prefill_chunking_caps_step_tokens_and_keeps_fifo_progress() {
         vec![16, 16],
         "16 + 16 fills the 32-token budget"
     );
-    assert_eq!(prefilling[0].request_id, RequestId(5));
+    assert_eq!(prefilling[0].request_id, RequestId::new(5));
 
     // A partially-prefilled head request only consumes its remainder.
     let mut head = mk(6, 64, 1);
@@ -484,19 +286,23 @@ fn prefill_chunking_caps_step_tokens_and_keeps_fifo_progress() {
     assert!(prefilling.is_empty());
 }
 
-// TokenEvent does not expose per-step chunk assignments, so gate them here.
+// The wire protocol does not expose per-step chunk assignments, so gate them
+// here.
 #[test]
 fn request_local_chunks_are_independent_of_earlier_requests() {
     let mk = |id: u64, prompt_len| {
-        PendingRequest::from_scheduler_request(RequestId(id), request(prompt_len, 1).0)
+        PendingRequest::from_request(RequestId::new(id), request(prompt_len, 1))
     };
     let simulate = |mut prefilling: Vec<PendingRequest>, request_local: bool| {
         let mut target_chunks = Vec::new();
-        while prefilling.iter().any(|req| req.request_id == RequestId(3)) {
+        while prefilling
+            .iter()
+            .any(|req| req.request_id == RequestId::new(3))
+        {
             let taken = take_prefill_chunks(&mut prefilling, 32, request_local);
             let mut continued = Vec::new();
             for mut req in taken {
-                if req.request_id == RequestId(3) {
+                if req.request_id == RequestId::new(3) {
                     target_chunks.push(req.step_chunk);
                 }
                 req.prefill_pos += req.step_chunk;
@@ -525,62 +331,62 @@ fn request_local_chunks_are_independent_of_earlier_requests() {
 }
 
 #[test]
-fn echo_requests_run_only_when_their_prompt_fits_the_prefill_bound() {
-    let mk_echo = |id: u64, prompt_len| {
-        let (req, _rx) = request(prompt_len, 1);
-        let mut pending = PendingRequest::from_scheduler_request(RequestId(id), req);
-        pending.echo = true;
+fn prompt_logprobs_requests_run_only_when_their_prompt_fits_the_prefill_bound() {
+    let mk_prompt_logprobs = |id: u64, prompt_len| {
+        let mut pending = PendingRequest::from_request(RequestId::new(id), request(prompt_len, 1));
+        pending.prompt_logprobs = Some(0);
         pending
     };
     let mk = |id: u64, prompt_len| {
-        PendingRequest::from_scheduler_request(RequestId(id), request(prompt_len, 1).0)
+        PendingRequest::from_request(RequestId::new(id), request(prompt_len, 1))
     };
 
-    // Oversized echo is rejected by admission. If a caller bypasses
+    // Oversized prompt-scoring work is rejected by admission. If a caller bypasses
     // admission, the chunk picker must still keep it out of the profiled
     // prefill shape instead of running it whole.
-    let mut prefilling = vec![mk_echo(1, 64), mk(2, 16)];
+    let mut prefilling = vec![mk_prompt_logprobs(1, 64), mk(2, 16)];
     let taken = take_prefill_chunks(&mut prefilling, 32, false);
     assert_eq!(taken.len(), 1);
-    assert_eq!(taken[0].request_id, RequestId(2));
+    assert_eq!(taken[0].request_id, RequestId::new(2));
     assert_eq!(taken[0].step_chunk, 16);
     assert_eq!(
         prefilling[0].request_id,
-        RequestId(1),
-        "oversized echo stays queued if admission was bypassed"
+        RequestId::new(1),
+        "oversized prompt-scoring work stays queued if admission was bypassed"
     );
 
-    // An echo that doesn't fit behind earlier work is skipped, not split;
+    // A prompt-scoring request that doesn't fit behind earlier work is skipped, not split;
     // later requests may still fill the leftover budget, and the step set
     // stays sorted by request id.
-    let mut prefilling = vec![mk(3, 24), mk_echo(4, 16), mk(5, 8)];
+    let mut prefilling = vec![mk(3, 24), mk_prompt_logprobs(4, 16), mk(5, 8)];
     let taken = take_prefill_chunks(&mut prefilling, 32, false);
     assert_eq!(
         taken
             .iter()
-            .map(|r| (r.request_id.get(), r.step_chunk))
+            .map(|r| (r.request_id.raw(), r.step_chunk))
             .collect::<Vec<_>>(),
         vec![(3, 24), (5, 8)],
-        "echo skipped, leftover budget goes to the next non-echo request"
+        "prompt scoring skipped, leftover budget goes to the next ordinary request"
     );
-    assert_eq!(prefilling[0].request_id, RequestId(4));
+    assert_eq!(prefilling[0].request_id, RequestId::new(4));
 }
 
 #[test]
-fn oversized_echo_request_is_rejected_at_admission() {
+fn oversized_prompt_logprobs_request_is_rejected_at_admission() {
     let active: [ActiveRequestState; 0] = [];
-    let mk_echo = |id: u64, prompt_len| {
-        let (mut req, _rx) = request(prompt_len, 1);
-        req.echo = true;
-        PendingRequest::from_scheduler_request(RequestId(id), req)
+    let mk_prompt_logprobs = |id: u64, prompt_len| {
+        let mut req = request(prompt_len, 1);
+        req.prompt_logprobs = Some(0);
+        PendingRequest::from_request(RequestId::new(id), req)
     };
     let mk = |id: u64, prompt_len| {
-        PendingRequest::from_scheduler_request(RequestId(id), request(prompt_len, 1).0)
+        PendingRequest::from_request(RequestId::new(id), request(prompt_len, 1))
     };
 
     let outcome = admit_deferred_requests(
-        vec![mk_echo(1, 33), mk(2, 64)],
+        vec![mk_prompt_logprobs(1, 33), mk(2, 64)],
         &active,
+        &[],
         &[],
         16,
         1024,
@@ -595,19 +401,19 @@ fn oversized_echo_request_is_rejected_at_admission() {
         outcome
             .pending
             .iter()
-            .map(|r| r.request_id.get())
+            .map(|r| r.request_id.raw())
             .collect::<Vec<_>>(),
         vec![2],
-        "non-echo oversized prompts can still be admitted and chunked"
+        "Ordinary oversized prompts can still be admitted and chunked"
     );
     assert_eq!(outcome.rejected.len(), 1);
-    assert_eq!(outcome.rejected[0].0.request_id, RequestId(1));
+    assert_eq!(outcome.rejected[0].0.request_id, RequestId::new(1));
     assert!(
         matches!(
             outcome.rejected[0].1,
             RejectReason::EchoPrefillTokens { limit: 32 }
         ),
-        "oversized echo should be rejected against the profiled prefill bound"
+        "oversized prompt-scoring work should be rejected against the profiled prefill bound"
     );
 }
 
@@ -615,12 +421,13 @@ fn oversized_echo_request_is_rejected_at_admission() {
 fn page_boundary_lifetime_blocks_gate_admission() {
     let active: [ActiveRequestState; 0] = [];
     let mk = |id: u64, prompt_len, max_tokens| {
-        PendingRequest::from_scheduler_request(RequestId(id), request(prompt_len, max_tokens).0)
+        PendingRequest::from_request(RequestId::new(id), request(prompt_len, max_tokens))
     };
 
     let under_reserved = admit_deferred_requests(
         vec![mk(1, 16, 17)],
         &active,
+        &[],
         &[],
         16,
         2,
@@ -644,6 +451,7 @@ fn page_boundary_lifetime_blocks_gate_admission() {
         vec![mk(2, 16, 17)],
         &active,
         &[],
+        &[],
         16,
         3,
         3,
@@ -654,7 +462,7 @@ fn page_boundary_lifetime_blocks_gate_admission() {
     );
     assert_eq!(
         exactly_reserved.pending[0].request_id,
-        RequestId(2),
+        RequestId::new(2),
         "ceil((prompt + max_tokens) / block_size) admits the request"
     );
     assert!(exactly_reserved.rejected.is_empty());
@@ -740,353 +548,41 @@ fn lifetime_blocks_never_under_reserve_kvbm_peak_draw() {
     }
 }
 
-/// Engine streams now open with `TokenEvent::Scheduled` (#246); these
-/// tests assert on the token/terminal events, so skip past it.
-fn recv_skipping_scheduled(
-    rx: &mut pegainfer_core::engine::TokenStreamReceiver,
-) -> Option<TokenEvent> {
-    loop {
-        match rx.blocking_recv() {
-            Some((_, TokenEvent::Scheduled { .. })) => {}
-            Some((_, event)) => return Some(event),
-            None => return None,
-        }
-    }
-}
-
-fn pending(request_id: u64, echo: bool) -> PendingRequest {
-    let (token_tx, _token_rx) = TokenSink::standalone();
-    PendingRequest {
-        request_id: RequestId::new(request_id),
-        lora_adapter: None,
-        prompt_tokens: vec![1; 32],
-        params: SamplingParams::default(),
-        max_tokens: 1,
-        token_tx,
-        logprobs: 0,
-        echo,
-        queued_at_unix_s: None,
-        prefetch_offered: false,
-        prefill_pos: 0,
-        step_chunk: 0,
-        cached_tokens: 0,
-    }
-}
-
 #[test]
-fn echo_requests_are_never_offered_to_prefetch() {
+fn prompt_logprobs_requests_are_never_offered_to_prefetch() {
     let dropped = Arc::new(Mutex::new(Vec::new()));
     let mut executor = FakeExecutor::new(64, dropped);
     let offers = Arc::clone(&executor.prefetch_offers);
 
-    let mut deferred = vec![pending(1, true), pending(2, false)];
+    let mk = |id: u64, wants_prompt_logprobs: bool| {
+        let mut req = request(32, 1);
+        req.prompt_logprobs = wants_prompt_logprobs.then_some(0);
+        PendingRequest::from_request(RequestId::new(id), req)
+    };
+    let mut deferred = vec![mk(1, true), mk(2, false)];
     let mut loading = Vec::new();
     offer_prefetch(&mut executor, &mut deferred, &mut loading, 0);
 
-    // The plain request is probed; the echo request is skipped entirely, so
+    // The plain request is probed; the prompt-scoring request is skipped entirely, so
     // its prefill forwards the whole prompt without parking unspendable KV.
     assert_eq!(*offers.lock().unwrap(), vec![2]);
-    let echo = deferred.iter().find(|r| r.request_id.get() == 1).unwrap();
-    assert!(!echo.prefetch_offered, "echo request must stay un-probed");
-    let plain = deferred.iter().find(|r| r.request_id.get() == 2).unwrap();
+    let scored = deferred.iter().find(|r| r.request_id.raw() == 1).unwrap();
+    assert!(
+        !scored.prefetch_offered,
+        "prompt-scoring request must stay un-probed"
+    );
+    let plain = deferred.iter().find(|r| r.request_id.raw() == 2).unwrap();
     assert!(
         plain.prefetch_offered,
         "plain request must be marked probed"
     );
 }
 
-fn request(
-    prompt_len: usize,
-    max_tokens: usize,
-) -> (GenerateRequest, pegainfer_core::engine::TokenStreamReceiver) {
-    let (token_tx, token_rx) = TokenSink::standalone();
-    (
-        GenerateRequest {
-            trace_parent: None,
-            request_id: None,
-            queued_at_unix_s: None,
-            data_parallel_rank: None,
-            prompt_tokens: vec![1; prompt_len],
-            params: SamplingParams::default(),
-            max_tokens,
-            lora_adapter: None,
-            kv_transfer_params: None,
-            token_tx,
-            logprobs: 0,
-            echo: false,
-        },
-        token_rx,
-    )
-}
-
-fn request_with_lora(
-    prompt_len: usize,
-    max_tokens: usize,
-    lora_adapter: Option<&str>,
-) -> (GenerateRequest, pegainfer_core::engine::TokenStreamReceiver) {
-    let (mut request, token_rx) = request(prompt_len, max_tokens);
-    request.lora_adapter = lora_adapter.map(ToString::to_string);
-    (request, token_rx)
-}
-
-fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        if predicate() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    false
-}
-
-#[test]
-fn unknown_lora_request_is_rejected_without_blocking_base_request() {
-    let dropped = Arc::new(Mutex::new(Vec::new()));
-    let executor = FakeExecutor::new(4, Arc::clone(&dropped));
-    let handle = start_with_executor(executor, 42, DEFAULT_MAX_PREFILL_TOKENS);
-
-    let (unknown, mut unknown_rx) = request_with_lora(16, 1, Some("missing-adapter"));
-    let (base, mut base_rx) = request_with_lora(16, 1, None);
-    handle.submit(unknown).expect("submit unknown adapter");
-    handle.submit(base).expect("submit base");
-
-    match unknown_rx.blocking_recv() {
-        Some((
-            _,
-            TokenEvent::Rejected {
-                message,
-                prompt_tokens,
-                completion_tokens,
-            },
-        )) => {
-            assert!(message.contains("LoRA adapter is not loaded: missing-adapter"));
-            assert_eq!(prompt_tokens, 16);
-            assert_eq!(completion_tokens, 0);
-        }
-        _ => panic!("unknown adapter request should be rejected"),
-    }
-
-    assert!(
-        matches!(
-            recv_skipping_scheduled(&mut base_rx),
-            Some(TokenEvent::Token { id: 101, .. })
-        ),
-        "base request should still run after unknown adapter rejection"
-    );
-    assert!(
-        matches!(
-            recv_skipping_scheduled(&mut base_rx),
-            Some(TokenEvent::Finished { .. })
-        ),
-        "base request should finish"
-    );
-}
-
-#[test]
-fn decode_error_drops_request_state_and_scheduler_recovers() {
-    let dropped = Arc::new(Mutex::new(Vec::new()));
-    let executor = FakeExecutor::new(4, Arc::clone(&dropped)).with_decode_failure();
-    let handle = start_with_executor(executor, 42, DEFAULT_MAX_PREFILL_TOKENS);
-
-    let (will_fail, mut fail_rx) = request(16, 2);
-    handle.submit(will_fail).expect("submit will_fail");
-    assert!(
-        matches!(
-            recv_skipping_scheduled(&mut fail_rx),
-            Some(TokenEvent::Token { id: 100, .. })
-        ),
-        "first token should be emitted before decode failure"
-    );
-    match recv_skipping_scheduled(&mut fail_rx) {
-        Some(TokenEvent::Error {
-            message,
-            prompt_tokens,
-            completion_tokens,
-        }) => {
-            assert!(message.contains("fake decode KV capacity exhausted"));
-            assert_eq!(prompt_tokens, 16);
-            assert_eq!(completion_tokens, 1);
-        }
-        _ => panic!("decode failure should surface as TokenEvent::Error"),
-    }
-    assert!(
-        wait_until(Duration::from_secs(1), || dropped
-            .lock()
-            .unwrap()
-            .contains(&0)),
-        "failed request state should be dropped"
-    );
-
-    let (after_failure, mut after_rx) = request(16, 1);
-    handle.submit(after_failure).expect("submit after_failure");
-    assert!(
-        matches!(
-            recv_skipping_scheduled(&mut after_rx),
-            Some(TokenEvent::Token { id: 101, .. })
-        ),
-        "scheduler should accept new work after a decode error"
-    );
-    assert!(
-        matches!(
-            recv_skipping_scheduled(&mut after_rx),
-            Some(TokenEvent::Finished { .. })
-        ),
-        "request after failure should finish"
-    );
-}
-
-#[test]
-fn retiring_multiple_active_requests_tolerates_unsorted_indices() {
-    let dropped = Arc::new(Mutex::new(Vec::new()));
-    let mut executor = FakeExecutor::new(8, Arc::clone(&dropped));
-    let mut active = Vec::new();
-
-    for request_id in [RequestId(10), RequestId(1), RequestId(7)] {
-        let (token_tx, _token_rx) = TokenSink::standalone();
-        active.push(ActiveRequestState {
-            request_id,
-            lora_adapter: None,
-            token_tx,
-            last_token: 100,
-            generated_count: 1,
-            max_tokens: 2,
-            prompt_len: 16,
-            params: SamplingParams::default(),
-            logprobs: 0,
-        });
-        executor
-            .ensure_request_tokens(request_id, 16)
-            .expect("seed fake request state");
-    }
-
-    apply_effects(
-        &mut executor,
-        &mut active,
-        &mut Vec::new(),
-        &mut super::phase_trace::PhaseTracker::default(),
-        effects::StepEffects {
-            scheduled: Vec::new(),
-            prompt_echoes: Vec::new(),
-            pending: Vec::new(),
-            decode: vec![
-                effects::DecodeEffect::EmitAndFinish {
-                    request_id: RequestId(1),
-                    token: 201,
-                    logprob: None,
-                    finish_reason: pegainfer_core::engine::FinishReason::Length,
-                    completion_tokens: 2,
-                },
-                effects::DecodeEffect::EmitAndFinish {
-                    request_id: RequestId(10),
-                    token: 210,
-                    logprob: None,
-                    finish_reason: pegainfer_core::engine::FinishReason::Length,
-                    completion_tokens: 2,
-                },
-                effects::DecodeEffect::EmitAndFinish {
-                    request_id: RequestId(7),
-                    token: 207,
-                    logprob: None,
-                    finish_reason: pegainfer_core::engine::FinishReason::Length,
-                    completion_tokens: 2,
-                },
-            ],
-        },
-    );
-
-    assert!(
-        active.is_empty(),
-        "all finished requests should retire without index drift"
-    );
-    let mut dropped = dropped.lock().unwrap().clone();
-    dropped.sort_unstable();
-    assert_eq!(dropped, vec![1, 7, 10]);
-}
-
-#[test]
-fn lora_control_unloads_adapter_when_idle() {
-    let dropped = Arc::new(Mutex::new(Vec::new()));
-    let executor = FakeExecutor::new(4, Arc::clone(&dropped)).with_lora_adapters(&["adapter-a"]);
-    let handle = start_with_executor_with_lora_control(executor, 42, DEFAULT_MAX_PREFILL_TOKENS);
-
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .expect("build runtime");
-    runtime
-        .block_on(handle.unload_lora_adapter(UnloadLoraAdapterRequest {
-            lora_name: "adapter-a".to_string(),
-            lora_int_id: None,
-        }))
-        .expect("unload adapter");
-    assert_eq!(
-        runtime
-            .block_on(handle.list_lora_adapters())
-            .expect("list adapters"),
-        Vec::<String>::new()
-    );
-}
-
-#[test]
-fn lora_control_waits_until_scheduler_idle() {
-    let dropped = Arc::new(Mutex::new(Vec::new()));
-    let executor =
-        FakeExecutor::new(4, Arc::clone(&dropped)).with_decode_delay(Duration::from_millis(80));
-    let handle = start_with_executor_with_lora_control(executor, 42, DEFAULT_MAX_PREFILL_TOKENS);
-
-    let (long_running, mut token_rx) = request(16, 3);
-    handle.submit(long_running).expect("submit long_running");
-    assert!(
-        matches!(
-            recv_skipping_scheduled(&mut token_rx),
-            Some(TokenEvent::Token { id: 100, .. })
-        ),
-        "first token should be emitted before decode"
-    );
-
-    let load_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let load_done_thread = Arc::clone(&load_done);
-    let load_handle = handle;
-    let load_thread = thread::spawn(move || {
-        let result = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("build runtime")
-            .block_on(load_handle.load_lora_adapter(LoadLoraAdapterRequest {
-                lora_name: "adapter-a".to_string(),
-                lora_path: "/tmp/adapter-a".into(),
-                load_inplace: false,
-            }));
-        load_done_thread.store(true, std::sync::atomic::Ordering::SeqCst);
-        result
-    });
-
-    std::thread::sleep(Duration::from_millis(20));
-    assert!(
-        !load_done.load(std::sync::atomic::Ordering::SeqCst),
-        "load_lora_adapter should wait while generation is active"
-    );
-
-    while !matches!(
-        recv_skipping_scheduled(&mut token_rx),
-        Some(TokenEvent::Finished { .. })
-    ) {}
-
-    let error = load_thread
-        .join()
-        .expect("join load thread")
-        .expect_err("adapter load should be a stub error");
-    assert!(matches!(error, EngineControlError::OperationFailed(_)));
-}
-
 // ── Speculative span resolution (multi-token emission) ──────────────────────
 // resolve_speculative_outputs walks an accepted span [t_0, .., t_m] and decides,
 // per request, whether to emit-and-continue or truncate at a stop token / the
 // max-output budget. These were GPU-test-only; the truth table below pins the
-// branch behaviour with the existing FakeExecutor (only is_stop_token matters).
-
-use pegainfer_core::engine::FinishReason;
-
-use crate::speculative::VerifyRequestResult;
+// branch behaviour with the FakeExecutor (only is_stop_token matters).
 
 fn spec_active(
     id: u64,
@@ -1094,26 +590,26 @@ fn spec_active(
     max_tokens: usize,
     ignore_eos: bool,
 ) -> ActiveRequestState {
-    let (token_tx, _rx) = TokenSink::standalone();
     ActiveRequestState {
-        request_id: RequestId(id),
-        lora_adapter: None,
-        token_tx,
-        last_token: 1,
-        generated_count,
-        max_tokens,
-        prompt_len: 16,
         params: SamplingParams {
             ignore_eos,
             ..SamplingParams::default()
         },
-        logprobs: 0,
+        stop_policy: StopPolicy::new(
+            if ignore_eos {
+                EosPolicy::Ignore
+            } else {
+                EosPolicy::ModelDefault
+            },
+            Vec::new(),
+        ),
+        ..active_state(id, generated_count, max_tokens)
     }
 }
 
 fn spec_result(id: u64, accepted: Vec<u32>) -> VerifyRequestResult {
     VerifyRequestResult {
-        request_id: RequestId(id),
+        request_id: RequestId::new(id),
         matched_draft_tokens: accepted.len().saturating_sub(1),
         accepted_tokens: accepted,
     }
@@ -1129,13 +625,13 @@ fn speculative_full_span_accept_continues() {
     let effects = resolve::resolve_speculative_outputs(&exec, &active, &results);
     match &effects[..] {
         [
-            effects::DecodeEffect::EmitManyAndContinue {
+            effects::DecodeEffect::ContinueMany {
                 request_id,
                 tokens,
                 completion_tokens,
             },
         ] => {
-            assert_eq!(*request_id, RequestId(1));
+            assert_eq!(*request_id, RequestId::new(1));
             assert_eq!(tokens, &vec![10, 11, 12, 13]);
             assert_eq!(
                 *completion_tokens,
@@ -1143,62 +639,54 @@ fn speculative_full_span_accept_continues() {
                 "completion = prior generated + span len"
             );
         }
-        _ => panic!("expected EmitManyAndContinue"),
+        _ => panic!("expected ContinueMany"),
     }
 }
 
 #[test]
-fn speculative_stop_token_midspan_finishes_and_suppresses_eos() {
+fn speculative_stop_token_midspan_finishes_and_retains_the_trigger() {
     let exec = FakeExecutor::new(64, Arc::new(Mutex::new(Vec::new()))).with_stop_token(SPEC_EOS);
     let active = [spec_active(1, 5, 100, false)];
-    // EOS lands at span position 2; tokens before it are emitted, EOS is not.
+    // EOS lands at span position 2; the trigger is retained and the suffix is not.
     let results = [spec_result(1, vec![10, 11, SPEC_EOS, 13])];
     let effects = resolve::resolve_speculative_outputs(&exec, &active, &results);
     match &effects[..] {
         [
-            effects::DecodeEffect::EmitManyAndFinish {
+            effects::DecodeEffect::FinishMany {
                 tokens,
                 finish_reason,
-                completion_tokens,
+                stop_cause,
                 ..
             },
         ] => {
-            assert_eq!(
-                tokens,
-                &vec![10, 11],
-                "EOS itself is suppressed from emission"
-            );
+            assert_eq!(tokens, &vec![10, 11, SPEC_EOS],);
             assert!(matches!(finish_reason, FinishReason::Stop));
-            assert_eq!(
-                *completion_tokens,
-                5 + 3,
-                "the EOS still counts toward completion length"
-            );
+            assert_eq!(*stop_cause, Some(StopCause::Eos(SPEC_EOS)));
         }
-        _ => panic!("expected EmitManyAndFinish(Stop)"),
+        _ => panic!("expected FinishMany(Stop)"),
     }
 }
 
 #[test]
-fn speculative_stop_token_at_span_start_emits_nothing() {
+fn speculative_stop_token_at_span_start_retains_the_token() {
     let exec = FakeExecutor::new(64, Arc::new(Mutex::new(Vec::new()))).with_stop_token(SPEC_EOS);
     let active = [spec_active(1, 5, 100, false)];
     let results = [spec_result(1, vec![SPEC_EOS, 11, 12])];
     let effects = resolve::resolve_speculative_outputs(&exec, &active, &results);
     match &effects[..] {
         [
-            effects::DecodeEffect::EmitManyAndFinish {
+            effects::DecodeEffect::FinishMany {
                 tokens,
                 finish_reason,
-                completion_tokens,
+                stop_cause,
                 ..
             },
         ] => {
-            assert!(tokens.is_empty(), "stop at position 0 emits no tokens");
+            assert_eq!(tokens, &vec![SPEC_EOS]);
             assert!(matches!(finish_reason, FinishReason::Stop));
-            assert_eq!(*completion_tokens, 5 + 1);
+            assert_eq!(*stop_cause, Some(StopCause::Eos(SPEC_EOS)));
         }
-        _ => panic!("expected EmitManyAndFinish(Stop)"),
+        _ => panic!("expected FinishMany(Stop)"),
     }
 }
 
@@ -1211,10 +699,9 @@ fn speculative_max_tokens_truncates_midspan() {
     let effects = resolve::resolve_speculative_outputs(&exec, &active, &results);
     match &effects[..] {
         [
-            effects::DecodeEffect::EmitManyAndFinish {
+            effects::DecodeEffect::FinishMany {
                 tokens,
                 finish_reason,
-                completion_tokens,
                 ..
             },
         ] => {
@@ -1224,12 +711,8 @@ fn speculative_max_tokens_truncates_midspan() {
                 "the budget-hitting token is emitted, the rest dropped"
             );
             assert!(matches!(finish_reason, FinishReason::Length));
-            assert_eq!(
-                *completion_tokens, 10,
-                "completion stops exactly at max_tokens"
-            );
         }
-        _ => panic!("expected EmitManyAndFinish(Length)"),
+        _ => panic!("expected FinishMany(Length)"),
     }
 }
 
@@ -1240,14 +723,43 @@ fn speculative_ignore_eos_does_not_stop() {
     let results = [spec_result(1, vec![SPEC_EOS, SPEC_EOS])];
     let effects = resolve::resolve_speculative_outputs(&exec, &active, &results);
     match &effects[..] {
-        [effects::DecodeEffect::EmitManyAndContinue { tokens, .. }] => {
+        [effects::DecodeEffect::ContinueMany { tokens, .. }] => {
             assert_eq!(
                 tokens,
                 &vec![SPEC_EOS, SPEC_EOS],
                 "ignore_eos passes stop tokens through"
             );
         }
-        _ => panic!("expected EmitManyAndContinue"),
+        _ => panic!("expected ContinueMany"),
+    }
+}
+
+#[test]
+fn speculative_request_stop_truncates_the_span_when_eos_is_ignored() {
+    let exec = FakeExecutor::new(64, Arc::new(Mutex::new(Vec::new()))).with_stop_token(SPEC_EOS);
+
+    let mut request = spec_active(1, 0, 100, true);
+    request.stop_policy = StopPolicy::new(EosPolicy::Ignore, vec![12]);
+
+    let active = [request];
+    let results = [spec_result(1, vec![10, 11, 12, 13])];
+
+    let effects = resolve::resolve_speculative_outputs(&exec, &active, &results);
+
+    match &effects[..] {
+        [
+            effects::DecodeEffect::FinishMany {
+                tokens,
+                finish_reason,
+                stop_cause,
+                ..
+            },
+        ] => {
+            assert_eq!(tokens, &vec![10, 11, 12]);
+            assert_eq!(*finish_reason, FinishReason::Stop);
+            assert_eq!(*stop_cause, Some(StopCause::Token(12)));
+        }
+        _ => panic!("expected request stop to finish the speculative span"),
     }
 }
 
@@ -1262,11 +774,11 @@ fn speculative_resolves_each_request_independently() {
     let effects = resolve::resolve_speculative_outputs(&exec, &active, &results);
     assert!(matches!(
         &effects[0],
-        effects::DecodeEffect::EmitManyAndContinue { request_id, .. } if *request_id == RequestId(1)
+        effects::DecodeEffect::ContinueMany { request_id, .. } if *request_id == RequestId::new(1)
     ));
     assert!(matches!(
         &effects[1],
-        effects::DecodeEffect::EmitManyAndFinish { request_id, finish_reason: FinishReason::Stop, .. }
-            if *request_id == RequestId(2)
+        effects::DecodeEffect::FinishMany { request_id, finish_reason: FinishReason::Stop, .. }
+            if *request_id == RequestId::new(2)
     ));
 }

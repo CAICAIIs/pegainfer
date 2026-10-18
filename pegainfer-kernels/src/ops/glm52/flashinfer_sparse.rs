@@ -24,12 +24,17 @@ pub struct Glm52FlashInferSparseDecode {
     pub sm_scale: f32,
 }
 
+/// Cubin-validated per-launch batch sizes, largest first. Bigger batches are
+/// decomposed greedily into these and issued as consecutive same-stream
+/// launches (rows are independent; the multi-CTA counters self-reset, so the
+/// shared workspace serializes safely).
+const GLM52_FLASHINFER_SPARSE_LAUNCH_BATCHES: [usize; 4] = [8, 4, 2, 1];
+
 impl Glm52FlashInferSparseDecode {
     fn validate(self) -> Result<()> {
         ensure!(
-            matches!(self.batch_size, 1 | 2 | 4 | 8),
-            "GLM5.2 FlashInfer sparse batch {} is not a decode bucket",
-            self.batch_size
+            self.batch_size >= 1,
+            "GLM5.2 FlashInfer sparse batch must be at least 1"
         );
         ensure!(
             self.heads == GLM52_FLASHINFER_SPARSE_HEADS,
@@ -127,27 +132,40 @@ pub fn glm52_flashinfer_sparse_mla_fp8_launch(
     let (seq_lens_ptr, _g3) = seq_lens.device_ptr(&ctx.stream);
     let (out_ptr, _g4) = out.device_ptr_mut(&ctx.stream);
     let (workspace_ptr, _g5) = workspace.device_ptr_mut(&ctx.stream);
-    let result = unsafe {
-        ffi::glm52_flashinfer_sparse_mla_fp8_cuda(
-            query_ptr as *const u8,
-            cache_ptr as *const u8,
-            indices_ptr as *const i32,
-            seq_lens_ptr as *const i32,
-            out_ptr as *mut ffi::Half,
-            workspace_ptr as *mut u8,
-            workspace_bytes,
-            contract.batch_size as i32,
-            contract.heads as i32,
-            contract.num_blocks as i32,
-            contract.topk as i32,
-            contract.sm_scale,
-            ctx.stream.cu_stream(),
-        )
-    };
-    ensure!(
-        result == 0,
-        "GLM5.2 FlashInfer sparse MLA launch failed with error {result}{}",
-        crate::ops::ffi_exception_message(result)
-    );
+    let mut start = 0usize;
+    while start < contract.batch_size {
+        let chunk = GLM52_FLASHINFER_SPARSE_LAUNCH_BATCHES
+            .into_iter()
+            .find(|&c| c <= contract.batch_size - start)
+            .expect("launch batches end at 1");
+        let query_off = start * contract.heads * GLM52_FLASHINFER_SPARSE_QK_HEAD_DIM;
+        let out_off = start * contract.heads * GLM52_FLASHINFER_SPARSE_V_HEAD_DIM;
+        let result = unsafe {
+            ffi::glm52_flashinfer_sparse_mla_fp8_cuda(
+                (query_ptr as usize + query_off) as *const u8,
+                cache_ptr as *const u8,
+                (indices_ptr as usize + start * contract.topk * size_of::<i32>()) as *const i32,
+                (seq_lens_ptr as usize + start * size_of::<i32>()) as *const i32,
+                (out_ptr as usize + out_off * size_of::<bf16>()) as *mut ffi::Half,
+                workspace_ptr as *mut u8,
+                workspace_bytes,
+                chunk as i32,
+                contract.heads as i32,
+                contract.num_blocks as i32,
+                contract.topk as i32,
+                contract.sm_scale,
+                ctx.stream.cu_stream(),
+            )
+        };
+        ensure!(
+            result == 0,
+            "GLM5.2 FlashInfer sparse MLA launch failed with error {result}{} \
+             (rows {start}..{} of {})",
+            crate::ops::ffi_exception_message(result),
+            start + chunk,
+            contract.batch_size
+        );
+        start += chunk;
+    }
     Ok(())
 }

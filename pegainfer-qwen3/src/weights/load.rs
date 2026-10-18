@@ -6,6 +6,9 @@ use std::time::Instant;
 use anyhow::Result;
 use log::debug;
 use log::info;
+use pegainfer_core::ops;
+use pegainfer_core::rope::RopeTableSpec;
+use pegainfer_core::rope::precompute_rope;
 use pegainfer_core::tensor::DeviceContext;
 use pegainfer_core::weight_loader::FusedPart;
 use pegainfer_core::weight_loader::SlotId;
@@ -15,7 +18,6 @@ use pegainfer_core::weight_loader::WeightPrefetch;
 use pegainfer_core::weight_loader::deserialize_shards;
 use pegainfer_core::weight_loader::load_shard_info;
 use pegainfer_core::weight_loader::mmap_shards;
-use pegainfer_core::weight_loader::precompute_rope;
 
 use super::Attention;
 use super::MLP;
@@ -24,6 +26,7 @@ use super::Qwen3Model;
 use super::TransformerBlock;
 use crate::config::Config;
 use crate::config::TensorParallelConfig;
+use crate::projection_fusion::select_decode_projection_path;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ModelRuntimeConfig {
@@ -32,6 +35,8 @@ pub(crate) struct ModelRuntimeConfig {
     pub(crate) device_ordinal: usize,
     pub(crate) max_loras: usize,
     pub(crate) max_lora_rank: usize,
+    pub(crate) decode_overlap: crate::DecodeOverlap,
+    pub(crate) dflash_enabled: bool,
 }
 
 impl Default for ModelRuntimeConfig {
@@ -42,6 +47,8 @@ impl Default for ModelRuntimeConfig {
             device_ordinal: 0,
             max_loras: crate::Qwen3LoraOptions::DEFAULT_MAX_LORAS,
             max_lora_rank: crate::Qwen3LoraOptions::DEFAULT_MAX_LORA_RANK,
+            decode_overlap: crate::DecodeOverlap::Off,
+            dflash_enabled: false,
         }
     }
 }
@@ -66,9 +73,56 @@ impl Qwen3Model {
         debug!("Initializing GPU device {}", runtime.device_ordinal);
         let ctx = DeviceContext::new_with_device(runtime.device_ordinal)?;
 
-        let config = Config::from_file(model_path)?;
+        let mut config = Config::from_file(model_path)?;
+        let effective_vocab = pegainfer_core::decodable_vocab::decodable_vocab_width(model_path)?;
+        anyhow::ensure!(
+            effective_vocab <= config.vocab_size,
+            "tokenizer defines ids up to {} but checkpoint vocab_size is {}",
+            effective_vocab - 1,
+            config.vocab_size
+        );
+        config.decodable_vocab = effective_vocab;
+        config.logits_rows = pegainfer_core::decodable_vocab::aligned_logits_rows(
+            effective_vocab,
+            config.vocab_size,
+        );
+        if config.decodable_vocab < config.vocab_size {
+            info!(
+                "output projection: selection bounded to decodable vocab {}, projecting {} aligned rows (checkpoint pads to {})",
+                config.decodable_vocab, config.logits_rows, config.vocab_size
+            );
+        }
+        let tail_ids = (config.decodable_vocab..config.logits_rows)
+            .map(u32::try_from)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let logits_tail_suppress = (!tail_ids.is_empty())
+            .then(|| ops::SuppressIds::upload(&ctx, &tail_ids, config.logits_rows))
+            .transpose()?;
         let tensor_parallel = runtime.tensor_parallel.unwrap_or_default();
         tensor_parallel.validate_for(&config)?;
+        let (cc_major, cc_minor) = ctx.ctx.compute_capability()?;
+        let device_sm = cc_major * 10 + cc_minor;
+        let q_dim = config.local_q_dim(tensor_parallel);
+        let kv_dim = config.local_kv_dim(tensor_parallel);
+        let (decode_projection_path, decode_projection_reason) = select_decode_projection_path(
+            tensor_parallel,
+            pegainfer_kernels::ops::numeric_policy(),
+            runtime.decode_overlap,
+            runtime.dflash_enabled,
+            device_sm,
+            config.hidden_size,
+            q_dim,
+            kv_dim,
+            config.num_hidden_layers,
+        );
+        if tensor_parallel.rank == 0 {
+            info!(
+                "decode projection path: resolved={decode_projection_path:?}, \
+                 reason={decode_projection_reason}, sm={device_sm}, hidden={}, q_dim={q_dim}, \
+                 kv_dim={kv_dim}, layers={}",
+                config.hidden_size, config.num_hidden_layers
+            );
+        }
 
         let (shard_paths, weight_map) = load_shard_info(model_path)?;
         debug!("Loading {} safetensor shard(s)", shard_paths.len());
@@ -208,9 +262,12 @@ impl Qwen3Model {
         debug!("Precomputing RoPE cache on GPU");
         let (cos_cache, sin_cache) = precompute_rope(
             &ctx,
-            config.head_dim,
-            config.max_position_embeddings,
-            config.rope_theta,
+            &RopeTableSpec {
+                rotary_dim: config.head_dim,
+                frequency_dim: config.head_dim,
+                max_seq_len: config.max_position_embeddings,
+                theta: config.rope_theta,
+            },
         )?;
 
         loader.finish()?;
@@ -256,12 +313,14 @@ impl Qwen3Model {
             config,
             embed_tokens,
             lm_head,
+            logits_tail_suppress,
             layers,
             norm,
             cos_cache,
             sin_cache,
             enable_cuda_graph: runtime.enable_cuda_graph,
             tensor_parallel,
+            decode_projection_path,
             tp_comm: None,
             lora_adapters: HashMap::new(),
             packed_lora: PackedLoraRegistry::empty(runtime.max_loras, num_hidden_layers),

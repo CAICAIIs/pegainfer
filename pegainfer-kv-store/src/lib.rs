@@ -90,10 +90,11 @@ mod stats;
 mod store;
 mod tier;
 
-pub use pegainfer_engine::engine::KvPrefix;
+pub use pegainfer_frontend::engine::KvPrefix;
 
 pub use crate::builder::ArenaSpec;
 pub use crate::builder::KvStoreBuilder;
+pub use crate::builder::OffloadMirror;
 pub use crate::builder::OffloadRankSpec;
 pub use crate::host::P2pConfig;
 pub use crate::host::PegaflowHost;
@@ -107,9 +108,10 @@ pub use crate::policy::SaveCursor;
 pub use crate::pool::BlockPool;
 pub use crate::pool::KvBlockGuard;
 pub use crate::pool::LoadReservation;
-pub use crate::pool::PrefixProbe;
-pub use crate::pool::RegisteredBlock;
+pub use crate::pool::PAD_TOKEN_ID;
+pub(crate) use crate::pool::PrefixProbe;
 pub use crate::pool::RequestKv;
-pub use crate::stats::DegradeReason;
+pub use crate::pool::resolved_page_ids;
+pub(crate) use crate::stats::DegradeReason;
 pub use crate::stats::KvStoreStats;
 pub use crate::store::KvStore;

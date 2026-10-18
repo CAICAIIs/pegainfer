@@ -19,11 +19,13 @@ use crate::ffi;
 
 thread_local! {
     static STREAM_OVERRIDE: Cell<Option<CUstream>> = const { Cell::new(None) };
+    static PREFILL_STREAM_OVERRIDE: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Scoped stream override for [`active_cu_stream`]; drop restores the previous value.
 pub struct StreamOverrideGuard {
     previous: Option<CUstream>,
+    previous_prefill: bool,
 }
 
 impl StreamOverrideGuard {
@@ -31,20 +33,41 @@ impl StreamOverrideGuard {
     /// The stream must be valid for the guard's lifetime and belong to the
     /// same CUDA device as the `DeviceContext`.
     pub unsafe fn activate(stream: CUstream) -> Self {
+        Self::activate_inner(stream, false)
+    }
+
+    /// # Safety
+    /// The stream must be valid for the guard's lifetime and belong to the
+    /// same CUDA device as the `DeviceContext`.
+    pub unsafe fn activate_prefill(stream: CUstream) -> Self {
+        Self::activate_inner(stream, true)
+    }
+
+    fn activate_inner(stream: CUstream, prefill: bool) -> Self {
         let previous = STREAM_OVERRIDE.with(|c| c.replace(Some(stream)));
-        Self { previous }
+        let previous_prefill = PREFILL_STREAM_OVERRIDE.with(|c| c.replace(prefill));
+        Self {
+            previous,
+            previous_prefill,
+        }
     }
 }
 
 impl Drop for StreamOverrideGuard {
     fn drop(&mut self) {
         STREAM_OVERRIDE.with(|c| c.set(self.previous));
+        PREFILL_STREAM_OVERRIDE.with(|c| c.set(self.previous_prefill));
     }
 }
 
 /// Returns true if a stream override is currently active on this thread.
 pub fn has_stream_override() -> bool {
     STREAM_OVERRIDE.with(|c| c.get().is_some())
+}
+
+/// Returns true while split-concurrent prefill owns the stream override.
+pub fn has_prefill_stream_override() -> bool {
+    PREFILL_STREAM_OVERRIDE.with(Cell::get)
 }
 
 /// Returns the effective CUDA stream: the thread-local override if set,
@@ -54,6 +77,71 @@ pub fn active_cu_stream(ctx: &DeviceContext) -> CUstream {
     STREAM_OVERRIDE
         .with(Cell::get)
         .unwrap_or_else(|| ctx.stream.cu_stream())
+}
+
+/// Poll the active stream up to a fixed cap, then synchronize that stream.
+const STREAM_SPIN_WAIT_CAP: std::time::Duration = std::time::Duration::from_millis(5);
+
+pub fn stream_spin_wait(ctx: &DeviceContext) -> anyhow::Result<()> {
+    let stream = active_cu_stream(ctx);
+    let cap = std::time::Instant::now() + STREAM_SPIN_WAIT_CAP;
+    loop {
+        match unsafe { cudarc::driver::sys::cuStreamQuery(stream) } {
+            cudarc::driver::sys::CUresult::CUDA_SUCCESS => return Ok(()),
+            cudarc::driver::sys::CUresult::CUDA_ERROR_NOT_READY => {
+                if std::time::Instant::now() >= cap {
+                    let result = unsafe { cudarc::driver::sys::cuStreamSynchronize(stream) };
+                    anyhow::ensure!(
+                        result == cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+                        "stream sync after spin cap failed: {result:?}"
+                    );
+                    return Ok(());
+                }
+                std::hint::spin_loop();
+            }
+            err => return Err(anyhow::anyhow!("cuStreamQuery failed: {err:?}")),
+        }
+    }
+}
+
+/// Copy token ids from an i32 argmax buffer into a u32 embedding buffer.
+pub fn memcpy_dtod_u32_from_i32(
+    ctx: &DeviceContext,
+    src: &CudaSlice<i32>,
+    dst: &mut CudaSlice<u32>,
+    count: usize,
+) -> anyhow::Result<()> {
+    use cudarc::driver::DevicePtr;
+    use cudarc::driver::DevicePtrMut;
+
+    anyhow::ensure!(
+        !has_stream_override(),
+        "dtod i32->u32 copy runs on the base stream only"
+    );
+    anyhow::ensure!(
+        count <= src.len() && count <= dst.len(),
+        "dtod i32->u32 copy of {count} exceeds src {} or dst {}",
+        src.len(),
+        dst.len()
+    );
+    if count == 0 {
+        return Ok(());
+    }
+    let (src_ptr, _src_guard) = src.device_ptr(&ctx.stream);
+    let (dst_ptr, _dst_guard) = dst.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+            dst_ptr,
+            src_ptr,
+            count * std::mem::size_of::<i32>(),
+            ctx.stream.cu_stream(),
+        )
+    };
+    anyhow::ensure!(
+        result == cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+        "cuMemcpyDtoDAsync i32->u32 failed: {result:?}"
+    );
+    Ok(())
 }
 
 /// Marker trait for tensor metadata tags.
@@ -467,12 +555,42 @@ pub struct HiddenStates {
 }
 
 impl HiddenStates {
+    /// The band `[col, col + width)` of every row.
+    pub fn columns(&self, col: usize, width: usize) -> Columns<'_> {
+        Columns {
+            states: self,
+            col,
+            width,
+        }
+    }
+
     pub fn as_ref(&self) -> HiddenStatesRef<'_> {
         HiddenStatesRef {
             data: &self.data,
             hidden_dim: self.hidden_dim,
             seq_len: self.seq_len,
         }
+    }
+
+    /// Logical extent `hidden_dim * seq_len`, checked to fit the backing
+    /// allocation (`>=`, not `==`: buffers allocate at a max and rewrite
+    /// `seq_len` to the active size per step). Fields are public, so a safe
+    /// caller can shape a logical size past the backing; launch wrappers
+    /// call this to reject that before it reaches a kernel.
+    pub(crate) fn checked_extent(&self, what: &str) -> Result<usize> {
+        let extent = self
+            .hidden_dim
+            .checked_mul(self.seq_len)
+            .ok_or_else(|| anyhow!("{what} logical extent overflow"))?;
+        if self.data.len() < extent {
+            return Err(anyhow!(
+                "{what} backing len {} < hidden_dim {} * seq_len {}",
+                self.data.len(),
+                self.hidden_dim,
+                self.seq_len
+            ));
+        }
+        Ok(extent)
     }
 
     /// Create zeroed batch
@@ -635,6 +753,26 @@ pub struct HiddenStatesRef<'a> {
     pub seq_len: usize,
 }
 
+/// The columns `[col, col + width)` of every row of a `HiddenStates`: the
+/// band one projection occupies when a row holds several, read at the row's
+/// full stride. A whole tensor is its own band from column 0.
+#[derive(Clone, Copy)]
+pub struct Columns<'a> {
+    pub states: &'a HiddenStates,
+    pub col: usize,
+    pub width: usize,
+}
+
+impl<'a> From<&'a HiddenStates> for Columns<'a> {
+    fn from(states: &'a HiddenStates) -> Self {
+        Self {
+            states,
+            col: 0,
+            width: states.hidden_dim,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -643,14 +781,19 @@ mod tests {
     fn stream_override_guard_restores_on_drop() {
         let outer = 0x10usize as CUstream;
         assert!(!has_stream_override());
+        assert!(!has_prefill_stream_override());
         {
-            let _outer_guard = unsafe { StreamOverrideGuard::activate(outer) };
+            let _outer_guard = unsafe { StreamOverrideGuard::activate_prefill(outer) };
+            assert!(has_prefill_stream_override());
             {
                 let _inner_guard = unsafe { StreamOverrideGuard::activate(0x20usize as CUstream) };
+                assert!(!has_prefill_stream_override());
             }
             assert_eq!(STREAM_OVERRIDE.with(Cell::get), Some(outer));
+            assert!(has_prefill_stream_override());
         }
         assert!(!has_stream_override());
+        assert!(!has_prefill_stream_override());
     }
 
     fn copy_matrix_to_host(ctx: &DeviceContext, matrix: &DeviceMatrix) -> Vec<bf16> {

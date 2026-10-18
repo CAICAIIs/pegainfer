@@ -4,6 +4,8 @@ use anyhow::Result;
 use anyhow::bail;
 use cudarc::driver::CudaSlice;
 use half::bf16;
+pub use pegainfer_kernels::paged_kv::KvFormat;
+pub use pegainfer_kernels::paged_kv::KvStorage;
 
 use crate::page_pool::OwnedPagePermit;
 use crate::page_pool::PageId;
@@ -21,18 +23,70 @@ pub struct KvLayout {
     pub head_dim: usize,
     /// Elements in one K (or V) block: page_size × num_kv_heads × head_dim.
     pub kv_block_len: usize,
-    /// Elements between layers within a page: 2 × kv_block_len (K then V).
+    /// Elements between layers within a page: the format's values per token
+    /// over the page's tokens and heads (K then V for `KvFormat::Split`).
     pub layer_stride: usize,
     /// Elements per page (all layers): num_layers × layer_stride.
     pub page_stride: usize,
+    pub storage: KvStorage,
+    pub format: KvFormat,
 }
 
 impl KvLayout {
-    pub fn new(num_layers: usize, num_kv_heads: usize, head_dim: usize, page_size: usize) -> Self {
-        let kv_block_len = page_size * num_kv_heads * head_dim;
-        let layer_stride = 2 * kv_block_len;
-        let page_stride = num_layers * layer_stride;
-        Self {
+    pub fn new(
+        num_layers: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        page_size: usize,
+    ) -> anyhow::Result<Self> {
+        Self::with_storage(
+            num_layers,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            KvStorage::Bf16,
+        )
+    }
+
+    pub fn with_storage(
+        num_layers: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        page_size: usize,
+        storage: KvStorage,
+    ) -> anyhow::Result<Self> {
+        Self::with_storage_and_format(
+            num_layers,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            storage,
+            KvFormat::Split,
+        )
+    }
+
+    pub fn with_storage_and_format(
+        num_layers: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        page_size: usize,
+        storage: KvStorage,
+        format: KvFormat,
+    ) -> anyhow::Result<Self> {
+        let (kv_block_len, layer_stride, page_stride) = pegainfer_kernels::paged_kv::derive_strides(
+            page_size,
+            num_kv_heads,
+            head_dim,
+            num_layers,
+            format,
+        )
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "kv layout strides overflow usize or {format:?} does not fit head_dim {head_dim}: \
+                 {num_layers} layers x {num_kv_heads} heads x {page_size} page"
+            )
+        })?;
+        Ok(Self {
             page_size,
             num_layers,
             num_kv_heads,
@@ -40,7 +94,9 @@ impl KvLayout {
             kv_block_len,
             layer_stride,
             page_stride,
-        }
+            storage,
+            format,
+        })
     }
 
     pub fn kernel_layout(&self) -> pegainfer_kernels::paged_kv::PagedKvLayout {
@@ -52,6 +108,8 @@ impl KvLayout {
             kv_block_len: self.kv_block_len,
             layer_stride: self.layer_stride,
             page_stride: self.page_stride,
+            storage: self.storage,
+            format: self.format,
         }
     }
 }
@@ -91,12 +149,78 @@ impl KvPool {
         page_size: usize,
         num_pages: usize,
     ) -> Result<Self> {
-        let layout = KvLayout::new(num_layers, num_kv_heads, head_dim, page_size);
-        let total_elements = num_pages * layout.page_stride;
+        Self::with_storage(
+            ctx,
+            num_layers,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            num_pages,
+            KvStorage::Bf16,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_storage(
+        ctx: &DeviceContext,
+        num_layers: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        page_size: usize,
+        num_pages: usize,
+        storage: KvStorage,
+    ) -> Result<Self> {
+        Self::with_storage_and_format(
+            ctx,
+            num_layers,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            num_pages,
+            storage,
+            KvFormat::Split,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_storage_and_format(
+        ctx: &DeviceContext,
+        num_layers: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        page_size: usize,
+        num_pages: usize,
+        storage: KvStorage,
+        format: KvFormat,
+    ) -> Result<Self> {
+        let layout = KvLayout::with_storage_and_format(
+            num_layers,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            storage,
+            format,
+        )?;
+        let total_elements = num_pages.checked_mul(layout.page_stride).ok_or_else(|| {
+            anyhow::anyhow!(
+                "KvPool geometry overflows: {num_pages} pages x {} elements per page",
+                layout.page_stride
+            )
+        })?;
+        // The allocator multiplies by the element size unchecked; answer
+        // for the byte domain here, before it does.
+        let total_bytes = total_elements
+            .checked_mul(layout.storage.elem_bytes())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "KvPool geometry overflows the byte domain: {total_elements} elements"
+                )
+            })?;
+        let backing_slots = total_bytes.div_ceil(std::mem::size_of::<bf16>());
 
         let buffer: CudaSlice<bf16> = ctx
             .stream
-            .alloc_zeros(total_elements)
+            .alloc_zeros(backing_slots)
             .map_err(|e| anyhow::anyhow!("KvPool alloc failed: {e}"))?;
 
         let pool = PagePool::new(num_pages);
@@ -127,6 +251,13 @@ impl KvPool {
         &self.inner.layout
     }
 
+    /// Every state in this pool is a view into this one buffer, so an
+    /// executor can hold the pool and take page metadata from a plan rather
+    /// than from a request's state.
+    pub fn buffer(&self) -> &CudaSlice<bf16> {
+        &self.inner.buffer
+    }
+
     pub fn capacity_pages(&self) -> usize {
         self.inner.pool.capacity_pages()
     }
@@ -138,6 +269,32 @@ impl KvPool {
     /// Page index reserved for bucket CUDA Graph padding.
     pub fn padding_page_id(&self) -> i32 {
         self.inner.padding_permit.pages()[0].index() as i32
+    }
+
+    /// The schedule half of an atomic multi-pool admission: reserve from
+    /// every pool first, commit only when all reservations hold, and let a
+    /// failure roll the rest back by drop. Growing a request's own permit
+    /// instead cannot be undone.
+    pub fn try_reserve(&self, pages: usize) -> Option<KvReservation> {
+        self.inner
+            .pool
+            .try_acquire_many(pages)
+            .map(|permit| KvReservation { permit })
+    }
+}
+
+/// Returns its pages on drop unless committed via
+/// [`KvState::commit_reservation`].
+pub struct KvReservation {
+    permit: OwnedPagePermit,
+}
+
+impl KvReservation {
+    /// Append this reservation's page ids to a row the caller owns. A sliding
+    /// state rebuilds that row every step, so the pages land in one buffer
+    /// instead of one `Vec` per reservation.
+    pub fn extend_page_indices_i32(&self, row: &mut Vec<i32>) {
+        row.extend(self.permit.pages().iter().map(|p| p.index() as i32));
     }
 }
 
@@ -155,35 +312,44 @@ fn pages_needed(token_count: usize, page_size: usize) -> usize {
     token_count.div_ceil(page_size)
 }
 
+fn last_page_len_for(token_count: usize, page_size: usize) -> usize {
+    if token_count == 0 {
+        0
+    } else {
+        let rem = token_count % page_size;
+        if rem == 0 { page_size } else { rem }
+    }
+}
+
 impl KvState {
     pub fn seq_len(&self) -> usize {
         self.seq_len
     }
 
     pub fn last_page_len(&self) -> usize {
-        if self.seq_len == 0 {
-            0
-        } else {
-            let rem = self.seq_len % self.pool.inner.layout.page_size;
-            if rem == 0 {
-                self.pool.inner.layout.page_size
-            } else {
-                rem
-            }
-        }
+        last_page_len_for(self.seq_len, self.pool.inner.layout.page_size)
     }
 
     /// Page indices as i32 for GPU upload.
     pub fn page_indices_i32(&self) -> Vec<i32> {
-        self.permit
-            .pages()
-            .iter()
-            .map(|p| p.index() as i32)
-            .collect()
+        let mut pages = Vec::with_capacity(self.permit.pages().len());
+        self.extend_page_indices_i32(&mut pages);
+        pages
+    }
+
+    /// Append page indices to caller-owned planning storage.
+    pub fn extend_page_indices_i32(&self, pages: &mut Vec<i32>) {
+        pages.extend(self.permit.pages().iter().map(|p| p.index() as i32));
     }
 
     pub fn buffer(&self) -> &CudaSlice<bf16> {
         &self.pool.inner.buffer
+    }
+
+    /// Page ids only mean something against the pool that issued them, so an
+    /// executor holding a pool must check before indexing its buffer.
+    pub fn belongs_to(&self, pool: &KvPool) -> bool {
+        std::sync::Arc::ptr_eq(&self.pool.inner, &pool.inner)
     }
 
     pub fn layout(&self) -> &KvLayout {
@@ -207,17 +373,38 @@ impl KvState {
         Ok(())
     }
 
-    /// Advance sequence length after writing tokens.
+    pub fn held_pages(&self) -> usize {
+        self.permit.len()
+    }
+
+    /// The apply half of an atomic multi-pool admission. The reservation must
+    /// come from this state's pool, which the permit merge enforces.
+    pub fn commit_reservation(&mut self, reservation: KvReservation) {
+        self.permit.absorb(reservation.permit);
+    }
+
     pub fn advance(&mut self, count: usize) {
         self.seq_len += count;
     }
 
-    /// Build kernel-facing metadata for this request's KV.
     pub fn desc(&self) -> KvDesc<'_> {
         KvDesc {
             pages: self.permit.pages(),
             last_page_len: self.last_page_len(),
         }
+    }
+
+    pub fn desc_for_len(&self, seq_len: usize) -> Result<KvDesc<'_>> {
+        let held = self.permit.len();
+        let needed = pages_needed(seq_len, self.pool.inner.layout.page_size);
+        anyhow::ensure!(
+            held == needed,
+            "KvState holds {held} pages where {seq_len} tokens need exactly {needed}"
+        );
+        Ok(KvDesc {
+            pages: self.permit.pages(),
+            last_page_len: last_page_len_for(seq_len, self.pool.inner.layout.page_size),
+        })
     }
 
     /// Reset for a new request: return all pages, zero seq_len.
@@ -243,7 +430,7 @@ pub struct KvDesc<'a> {
 }
 
 impl KvDesc<'_> {
-    pub(crate) fn last_page_len(&self) -> usize {
+    pub fn last_page_len(&self) -> usize {
         self.last_page_len
     }
 
@@ -269,9 +456,24 @@ mod tests {
     }
 
     #[test]
+    fn storage_width_sets_backing_capacity() {
+        let ctx = DeviceContext::new().expect("GPU required for kv_pool tests");
+        let pages = 3;
+        let fp8 =
+            KvPool::with_storage(&ctx, 1, 1, 1, 16, pages, KvStorage::E4m3).expect("fp8 KvPool");
+        let bf16 =
+            KvPool::with_storage(&ctx, 1, 1, 1, 16, pages, KvStorage::Bf16).expect("bf16 KvPool");
+        assert_eq!(
+            fp8.buffer().len(),
+            (pages * fp8.layout().page_stride).div_ceil(2)
+        );
+        assert_eq!(bf16.buffer().len(), pages * bf16.layout().page_stride);
+    }
+
+    #[test]
     fn stride_geometry_qwen35() {
         // Qwen3.5-4B: 8 full attn layers, 4 KV heads, head_dim=256, page_size=16
-        let l = KvLayout::new(8, 4, 256, 16);
+        let l = KvLayout::new(8, 4, 256, 16).expect("layout");
 
         assert_eq!(l.kv_block_len, 16 * 4 * 256); // 16384 elements
         assert_eq!(l.layer_stride, 2 * 16384); // 32768 (K + V)
@@ -283,7 +485,7 @@ mod tests {
     #[test]
     fn stride_geometry_qwen3() {
         // Qwen3-4B: 36 full attn layers, 4 KV heads, head_dim=128, page_size=16
-        let l = KvLayout::new(36, 4, 128, 16);
+        let l = KvLayout::new(36, 4, 128, 16).expect("layout");
 
         // 36 layers × 16384 = 589824 elements per page
         assert_eq!(l.page_stride, 589_824);

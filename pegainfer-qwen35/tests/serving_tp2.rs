@@ -1,5 +1,4 @@
 use std::net::TcpListener;
-use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -7,7 +6,7 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
-use pegainfer_core::engine::EngineLoadOptions;
+use pegainfer_frontend::engine::EngineLoadOptions;
 use reqwest::Client;
 use serde_json::Value;
 use serde_json::json;
@@ -16,7 +15,6 @@ use tokio_util::sync::CancellationToken;
 
 mod common;
 
-const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3.5-4B");
 const MODEL_NAME: &str = "qwen35-tp2-serving-smoke";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -39,8 +37,23 @@ impl Qwen35Tp2Server {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires two CUDA devices, CUDA-12 NCCL, Qwen3.5 weights, and real HTTP frontend startup"]
 async fn qwen35_tp2_serves_openai_completions_over_http() -> Result<()> {
-    let engine_model_path = PathBuf::from(get_model_path());
-    let frontend_model_path = PathBuf::from(get_frontend_model_path(&engine_model_path));
+    let Some(engine_model_path) =
+        common::model_path_or_skip("qwen35_tp2_serves_openai_completions_over_http")
+    else {
+        return Ok(());
+    };
+    let engine_model_path = PathBuf::from(engine_model_path);
+    let Some(frontend_model_path) = common::model_fixture::frontend_model_path_or_skip(
+        &engine_model_path,
+        "qwen35_tp2_serves_openai_completions_over_http",
+    ) else {
+        return Ok(());
+    };
+    let frontend_model_path = PathBuf::from(frontend_model_path);
+    // P2c graph acceptance smoke: CUDA Graph requested at TP2. Models with a
+    // compiled TP-local decode GQA group replay pre-captured decode graphs;
+    // uncompiled groups stay on the batched eager path under the same serving
+    // flow.
     let server = spawn_ready_server(engine_model_path, frontend_model_path, 1).await?;
     let client = test_client()?;
 
@@ -48,7 +61,6 @@ async fn qwen35_tp2_serves_openai_completions_over_http() -> Result<()> {
     assert_non_streaming_completion(&client, &server.base_url).await?;
     assert_streaming_completion(&client, &server.base_url).await?;
     assert_concurrent_completions(&client, &server.base_url).await?;
-    assert_invalid_cuda_graph_tp_startup_fails(&get_model_path())?;
 
     server.shutdown().await
 }
@@ -63,7 +75,7 @@ async fn spawn_ready_server(
         pegainfer_qwen35::start_engine_with_capacity(
             &engine_model_path,
             EngineLoadOptions {
-                enable_cuda_graph: false,
+                enable_cuda_graph: true,
                 device_ordinals,
                 seed: 42,
                 ..EngineLoadOptions::default()
@@ -80,10 +92,13 @@ async fn spawn_ready_server(
     let shutdown = CancellationToken::new();
     let server_shutdown = shutdown.clone();
     let mut task = tokio::spawn(async move {
-        pegainfer_vllm_frontend::serve(
-            std::future::ready(Ok(handle)),
+        pegainfer_frontend::vllm::serve(
+            std::future::ready(Ok(pegainfer_frontend::engine::LaunchedEngine::Stepped(
+                handle,
+            ))),
             &frontend_model_path,
             vec![MODEL_NAME.to_string()],
+            pegainfer_frontend::vllm::ParserSelection::Auto,
             port,
             None,
             server_shutdown,
@@ -179,27 +194,6 @@ async fn assert_concurrent_completions(client: &Client, base_url: &str) -> Resul
     assert_usage(&first, 3)?;
     assert_usage(&second, 3)?;
     assert_logprobs(&second)?;
-    Ok(())
-}
-
-fn assert_invalid_cuda_graph_tp_startup_fails(model_path: &str) -> Result<()> {
-    let Err(error) = pegainfer_qwen35::start_engine_with_capacity(
-        Path::new(model_path),
-        EngineLoadOptions {
-            enable_cuda_graph: true,
-            device_ordinals: common::tp2_device_ordinals(),
-            seed: 42,
-            ..EngineLoadOptions::default()
-        },
-        8,
-        1,
-    ) else {
-        bail!("TP2 + CUDA Graph must fail before serving requests");
-    };
-    let message = error.to_string();
-    if !message.contains("eager execution only") {
-        bail!("unexpected TP2 + CUDA Graph startup error: {message}");
-    }
     Ok(())
 }
 
@@ -326,13 +320,4 @@ fn reserve_loopback_port() -> Result<u16> {
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .context("failed to reserve loopback port for Qwen3.5 TP2 serving test")?;
     Ok(listener.local_addr()?.port())
-}
-
-fn get_model_path() -> String {
-    std::env::var("PEGAINFER_TEST_MODEL_PATH").unwrap_or_else(|_| DEFAULT_MODEL_PATH.to_string())
-}
-
-fn get_frontend_model_path(engine_model_path: &Path) -> String {
-    std::env::var("PEGAINFER_TEST_FRONTEND_MODEL_PATH")
-        .unwrap_or_else(|_| engine_model_path.to_string_lossy().into_owned())
 }

@@ -2,7 +2,7 @@
 //! on the same bf16 rows — top-k ids exactly, values within `TOL`. Needs a GPU.
 
 use half::bf16;
-use pegainfer_engine::engine::TokenLogprob;
+use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_kernels::tensor::DeviceContext;
 use pegainfer_kernels::tensor::HiddenStates;
 use pegainfer_kernels::tensor::StreamOverrideGuard;
@@ -36,6 +36,7 @@ fn noise_row(vocab: usize, salt: u64) -> Vec<bf16> {
 
 fn assert_matches_host(row: &[bf16], got: &TokenLogprob, picked: u32, top_k: usize) {
     let want = token_logprob_from_row(row, picked, top_k).unwrap();
+    assert_eq!(got.rank, want.rank, "selected vocabulary rank diverged");
     assert!(
         (got.logprob - want.logprob).abs() <= TOL,
         "picked logprob diverged: got {}, want {} (picked={picked}, k={top_k})",
@@ -130,6 +131,10 @@ fn tie_ordering_matches_host() {
     .unwrap();
     let ids: Vec<u32> = got[0].top_logprobs.iter().map(|&(id, _)| id).collect();
     assert_eq!(ids, vec![77, 901, 2048, 15, 512]);
+    assert_eq!(
+        got[0].rank, 3,
+        "all three tied peaks count toward selected rank"
+    );
 
     // Adjacent bf16 logits whose f32 `- lse` shifts collapse to one value.
     let collapse = vec![

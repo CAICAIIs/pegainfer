@@ -24,11 +24,71 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    pub fn rms_norm_batched_dual_cuda(
+        x: *const Half,
+        weight_a: *const Half,
+        weight_b: *const Half,
+        out_a: *mut Half,
+        out_b: *mut Half,
+        hidden_dim: i32,
+        seq_len: i32,
+        eps: f32,
+        scale_a: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn dual_rms_norm_add_batched_cuda(
+        a: *const Half,
+        weight_a: *const Half,
+        b: *const Half,
+        weight_b: *const Half,
+        out: *mut Half,
+        hidden_dim: i32,
+        seq_len: i32,
+        eps: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn rms_norm_add_rms_norm_round_batched_cuda(
+        x: *const Half,
+        weight_post: *const Half,
+        res_in: *const Half,
+        weight_pre: *const Half,
+        residual_out: *mut Half,
+        out: *mut Half,
+        hidden_dim: i32,
+        seq_len: i32,
+        eps: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn rms_norm_add_scale_batched_cuda(
+        x: *const Half,
+        weight: *const Half,
+        residual: *const Half,
+        out: *mut Half,
+        hidden_dim: i32,
+        seq_len: i32,
+        eps: f32,
+        scale: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn add_cuda(
         a: *const Half,
         b: *const Half,
         out: *mut Half,
         n: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn advance_decode_metadata_cuda(
+        positions: *mut i32,
+        local_last: *mut i32,
+        pseudo_last: *mut i32,
+        kv_chunk: *mut i32,
+        rows: i32,
+        factor: i32,
         stream: CUstream,
     ) -> CUresult;
 
@@ -124,6 +184,40 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn gelu_tanh_mul_cuda(
+        gate: *const Half,
+        up: *const Half,
+        out: *mut Half,
+        cols: i32,
+        gate_stride: i32,
+        up_stride: i32,
+        n: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn scale_bf16_in_place_cuda(
+        buf: *mut Half,
+        scale: f32,
+        n: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn softcap_bf16_in_place_cuda(
+        buf: *mut Half,
+        cap: f32,
+        n: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn suppress_logits_bf16_in_place_cuda(
+        logits: *mut Half,
+        ids: *const u32,
+        vocab: i32,
+        rows: i32,
+        id_count: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn embedding_batched_cuda(
         embed: *const Half,
         token_ids: *const u32,
@@ -152,6 +246,7 @@ unsafe extern "C" {
         picked: *const i32,
         top_k: *const i32,
         out_picked_lp: *mut f32,
+        out_picked_rank: *mut i32,
         out_topk_vals: *mut f32,
         out_topk_ids: *mut i32,
         rows: i32,
@@ -245,6 +340,28 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
+    /// cuBLAS `cublasGemmStridedBatchedEx` (f32 in/out, f32 compute). `beta`
+    /// selects overwrite (0.0) vs accumulate-into-C (1.0).
+    pub fn gemm_strided_batched_f32_cuda(
+        op_a: i32,
+        op_b: i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        a: *const f32,
+        lda: i32,
+        stride_a: i64,
+        b: *const f32,
+        ldb: i32,
+        stride_b: i64,
+        beta: f32,
+        c: *mut f32,
+        ldc: i32,
+        stride_c: i64,
+        batch_count: i32,
+        stream: CUstream,
+    ) -> i32;
+
     pub fn gemm_bf16_f32_cuda(
         op_a: i32,
         op_b: i32,
@@ -268,6 +385,21 @@ unsafe extern "C" {
         K: i32,
         stream: CUstream,
     ) -> i32;
+
+    // The tuned-algo store's record format and file (csrc/shared/lt_algo_store.cu).
+    // `linear.cu` is the caller; declared here because the format and its recovery
+    // from a short write are what `tests/lt_algo_store.rs` exercises, and that
+    // half needs no GPU.
+    pub fn pegainfer_lt_store_lookup(
+        path: *const std::os::raw::c_char,
+        key: *const std::os::raw::c_char,
+        out: *mut u64,
+    ) -> i32;
+    pub fn pegainfer_lt_store_append(
+        path: *const std::os::raw::c_char,
+        key: *const std::os::raw::c_char,
+        words: *const u64,
+    );
 
     // Batch-invariant pinned-algo path (csrc/shared/linear.cu).
     pub fn gemm_lt_pin_tune_cuda(
@@ -305,6 +437,16 @@ unsafe extern "C" {
         bs: i32,
         stream: CUstream,
     ) -> i32;
+    pub fn split_qkv_cuda(
+        qkv: *const Half,
+        q: *mut Half,
+        k: *mut Half,
+        v: *mut Half,
+        q_dim: i32,
+        kv_dim: i32,
+        tokens: i32,
+        stream: CUstream,
+    ) -> i32;
 
     pub fn cublas_init();
     pub fn cublas_activate_device_handles() -> i32;
@@ -338,6 +480,19 @@ unsafe extern "C" {
 
     // Per-head RMSNorm with F32 weight + SiLU gate
     pub fn rms_norm_gated_cuda(
+        x: *const Half,
+        weight: *const f32,
+        gate: *const Half,
+        out: *mut Half,
+        num_heads: i32,
+        head_dim: i32,
+        eps: f32,
+        stream: CUstream,
+    );
+
+    // The same kernel with a sigmoid gate, for the lines whose
+    // `output_gate_type` selects it.
+    pub fn rms_norm_gated_sigmoid_cuda(
         x: *const Half,
         weight: *const f32,
         gate: *const Half,
@@ -675,6 +830,8 @@ unsafe extern "C" {
         bias: *const Half,
         block_size: i32,
         step: i32,
+        chains: i32,
+        req_map: *const i32,
         rows: i32,
         n: i32,
         partial_values: *mut f32,
@@ -682,7 +839,39 @@ unsafe extern "C" {
         out_tokens: *mut u32,
         sampled_tokens: *mut u32,
         stream: CUstream,
-    );
+    ) -> i32;
+
+    pub fn hedge_ladder_force_cuda(
+        prev: *mut u32,
+        sampled: *mut u32,
+        runners: *const u32,
+        req_map: *const i32,
+        n: i32,
+        c: i32,
+        j: i32,
+        runner_stride: i32,
+        block_size: i32,
+        step: i32,
+        stream: CUstream,
+    ) -> i32;
+
+    pub fn markov_step_top2_cuda(
+        base: *const Half,
+        bias: *const Half,
+        block_size: i32,
+        step: i32,
+        chains: i32,
+        rows: i32,
+        n: i32,
+        partial_v1: *mut f32,
+        partial_i1: *mut i32,
+        partial_v2: *mut f32,
+        partial_i2: *mut i32,
+        out_tokens: *mut u32,
+        sampled_tokens: *mut u32,
+        out_top2: *mut u32,
+        stream: CUstream,
+    ) -> i32;
 
     pub fn bf16_to_f32_cuda(
         input: *const Half,
@@ -771,6 +960,18 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn store_rows_indexed_cuda(
+        src: *const Half,
+        token_indices: *const i32,
+        out: *mut Half,
+        out_hidden_dim: i32,
+        row_offset: i32,
+        rows: i32,
+        token_count: i32,
+        out_seq_len: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn scale_f32_cuda(values: *mut f32, scale: f32, n: i32, stream: CUstream) -> CUresult;
 
     pub fn accumulate_bf16_token_scaled_to_f32_cuda(
@@ -798,72 +999,6 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
-}
-
-// hd512 (Gemma 4 global layers): csrc/shared/paged_attention_hd512.cu
-unsafe extern "C" {
-    pub fn single_prefill_cuda_hd512(
-        q: *const Half,
-        output: *mut Half,
-        k_cache: *const Half,
-        v_cache: *const Half,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        seq_len: i32,
-        kv_len: i32,
-        max_seq_len: i32,
-        sm_scale: f32,
-        stream: CUstream,
-    ) -> i32;
-
-    pub fn paged_attention_decode_cuda_hd512(
-        q: *const Half,
-        output: *mut Half,
-        kv_data: *const Half,
-        k_offset_elems: i64,
-        v_offset_elems: i64,
-        page_indices: *const i32,
-        page_indptr: *const i32,
-        last_page_len_d: *const i32,
-        request_indices: *const i32,
-        kv_tile_indices: *const i32,
-        kv_chunk_size_ptr: *const i32,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        page_size: i32,
-        batch_size: i32,
-        stride_page: i64,
-        sm_scale: f32,
-        stream: CUstream,
-    ) -> i32;
-
-    pub fn batch_prefill_paged_cuda_hd512(
-        q: *const Half,
-        output: *mut Half,
-        kv_data: *const Half,
-        k_offset_elems: i64,
-        v_offset_elems: i64,
-        page_indices: *const i32,
-        page_indptr: *const i32,
-        last_page_len_d: *const i32,
-        q_indptr: *const i32,
-        request_indices: *const i32,
-        qo_tile_indices: *const i32,
-        kv_tile_indices: *const i32,
-        kv_chunk_size_ptr: *const i32,
-        total_num_rows: *const u32,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        page_size: i32,
-        seq_len: i32,
-        batch_size: i32,
-        padded_batch_size: i32,
-        stride_page: i64,
-        sm_scale: f32,
-        stream: CUstream,
-    ) -> i32;
 }
 
 unsafe extern "C" {

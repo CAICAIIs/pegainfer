@@ -18,13 +18,13 @@ use grouping::common_decode_position;
 use grouping::restore_surviving_rows;
 use grouping::take_decode_position_groups;
 use log::info;
-use pegainfer_engine::engine::FinishReason;
-use pegainfer_engine::engine::GenerateRequest;
-use pegainfer_engine::engine::SubmittedRequest;
-use pegainfer_engine::engine::TokenEvent;
-use pegainfer_engine::engine::TokenSink;
-use pegainfer_engine::engine::unix_now_s;
-use pegainfer_engine::sampler::SamplingParams;
+use pegainfer_frontend::engine::FinishReason;
+use pegainfer_frontend::engine::GenerateRequest;
+use pegainfer_frontend::engine::SubmittedRequest;
+use pegainfer_frontend::engine::TokenEvent;
+use pegainfer_frontend::engine::TokenSink;
+use pegainfer_frontend::engine::unix_now_s;
+use pegainfer_frontend::sampler::SamplingParams;
 use tokio::sync::mpsc;
 use trace::RequestTrace;
 use trace::ScheduledTrace;
@@ -54,8 +54,8 @@ struct PendingRequest {
     max_tokens: usize,
     lora_adapter: Option<String>,
     token_tx: TokenSink,
-    logprobs: usize,
-    echo: bool,
+    logprobs: Option<usize>,
+    prompt_logprobs: Option<usize>,
 }
 
 struct ActiveRequestState {
@@ -71,9 +71,8 @@ struct ActiveRequestState {
     trace: RequestTrace,
 }
 
-#[derive(Clone, Copy)]
 struct FinishPolicy {
-    eos_token_id: u32,
+    eos_token_ids: Vec<u32>,
     ignore_eos: bool,
 }
 
@@ -146,7 +145,6 @@ impl MixedRequestScheduler {
         for (pending, message) in batch.rejected {
             match send_scheduled(&pending) {
                 Ok(scheduled) => {
-                    let _ = send_prompt_echo(&pending);
                     log_pending_terminal_trace(
                         &pending,
                         &scheduled,
@@ -174,7 +172,6 @@ impl MixedRequestScheduler {
         for pending in batch.finished {
             match send_scheduled(&pending) {
                 Ok(scheduled) => {
-                    let _ = send_prompt_echo(&pending);
                     log_pending_terminal_trace(
                         &pending,
                         &scheduled,
@@ -225,20 +222,6 @@ impl MixedRequestScheduler {
             }
         };
 
-        if !send_prompt_echo(&pending) {
-            let terminal_message = terminal_send_failure_message(&pending.token_tx, "prompt echo");
-            log_pending_terminal_trace(
-                &pending,
-                &scheduled,
-                FinishReason::Error,
-                0,
-                Some(&terminal_message),
-                self.active.len(),
-                self.pending.len(),
-            );
-            return None;
-        }
-
         let prefill_start = Instant::now();
         let mut cache = DecodeCache::new(self.generator.config());
         let mut stats = self.generator.new_generation_stats(prompt_len);
@@ -280,7 +263,7 @@ impl MixedRequestScheduler {
             generated: 0,
             last_token: next,
             finish_policy: FinishPolicy {
-                eos_token_id: self.generator.config().eos_token_id,
+                eos_token_ids: self.generator.config().eos_token_ids.clone(),
                 ignore_eos: pending.params.ignore_eos,
             },
             cache,
@@ -539,7 +522,7 @@ impl From<GenerateRequest> for PendingRequest {
             lora_adapter: req.lora_adapter,
             token_tx: req.token_tx,
             logprobs: req.logprobs,
-            echo: req.echo,
+            prompt_logprobs: req.prompt_logprobs,
         }
     }
 }
@@ -568,7 +551,7 @@ impl ActiveRequestState {
         pending_queue_size_at_terminal: usize,
     ) -> bool {
         self.last_token = token;
-        if !self.finish_policy.ignore_eos && token == self.finish_policy.eos_token_id {
+        if !self.finish_policy.ignore_eos && self.finish_policy.eos_token_ids.contains(&token) {
             self.log_http_trace(
                 FinishReason::Stop,
                 None,
@@ -687,19 +670,6 @@ fn send_scheduled(pending: &PendingRequest) -> std::result::Result<ScheduledTrac
     } else {
         Err(scheduled)
     }
-}
-
-fn send_prompt_echo(pending: &PendingRequest) -> bool {
-    if !pending.echo {
-        return true;
-    }
-    pending
-        .token_tx
-        .send(TokenEvent::PromptTokens {
-            ids: pending.prompt_tokens.clone(),
-            logprobs: vec![None; pending.prompt_tokens.len()],
-        })
-        .is_ok()
 }
 
 fn terminal_send_failure_message(token_tx: &TokenSink, stage: &str) -> String {
@@ -843,9 +813,10 @@ fn admission_decision(req: &PendingRequest, supported_context: usize) -> Admissi
             req.params.temperature, req.params.top_k, req.params.top_p
         ));
     }
-    if req.logprobs > 0 {
+    if req.logprobs.is_some() || req.prompt_logprobs.is_some() {
         return AdmissionDecision::Reject(
-            "DeepSeek-V2-Lite EP=2 mixed serving gate does not return logprobs yet".to_string(),
+            "DeepSeek-V2-Lite EP=2 mixed serving gate does not return completion or prompt logprobs yet"
+                .to_string(),
         );
     }
     if req.lora_adapter.is_some() {

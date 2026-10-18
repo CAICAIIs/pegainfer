@@ -39,15 +39,19 @@
 //! `PEGAINFER_TEST_MODEL_PATH` (target) and `PEGAINFER_DFLASH_TEST_MODEL_PATH`
 //! (drafter); skips cleanly when either is absent.
 
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command;
 use std::time::Duration;
 
-use pegainfer_core::engine::EngineHandle;
-use pegainfer_core::engine::GenerateRequest;
-use pegainfer_core::engine::TokenEvent;
-use pegainfer_core::engine::TokenSink;
-use pegainfer_core::sampler::SamplingParams;
+use pegainfer_frontend::engine::EosPolicy;
+use pegainfer_frontend::engine::FinishReason;
+use pegainfer_frontend::engine::StopCause;
+use pegainfer_frontend::engine::StopPolicy;
+use pegainfer_frontend::engine::Terminal;
+use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_qwen3::DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES;
 use pegainfer_qwen3::DEFAULT_KV_PAGE_SIZE;
 use pegainfer_qwen3::DEFAULT_MAX_PREFILL_TOKENS;
@@ -58,6 +62,10 @@ use pegainfer_qwen3::Qwen3OffloadOptions;
 use vllm_text::tokenizer::DynTokenizer;
 
 mod common;
+
+use common::harness::EngineHarness;
+use common::harness::Outcome;
+use common::harness::request;
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B");
 const DRAFT_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B-DFlash-b16");
@@ -128,7 +136,6 @@ fn launch_options(draft: Option<PathBuf>) -> Qwen3LaunchOptions {
         decode_overlap: DecodeOverlap::Off,
         batch_invariant: false,
         dflash_draft_model_path: draft,
-        enable_kv_events: false,
     }
 }
 
@@ -139,49 +146,36 @@ struct Step {
     top_logprobs: Vec<(u32, f32)>,
 }
 
-/// Submit one greedy request and collect the decoded steps until `Finished`.
+/// Fold a finished request's outcome into decoded steps: tokens paired with
+/// their requested top-K distributions (empty when logprobs were off).
+fn to_steps(outcome: Outcome) -> Vec<Step> {
+    let Outcome {
+        tokens, logprobs, ..
+    } = outcome;
+    tokens
+        .into_iter()
+        .enumerate()
+        .map(|(i, id)| Step {
+            id,
+            top_logprobs: logprobs
+                .get(i)
+                .and_then(Option::as_ref)
+                .map(|lp| lp.top_logprobs.clone())
+                .unwrap_or_default(),
+        })
+        .collect()
+}
+
+/// Submit one greedy request and collect the decoded steps until it finishes.
 fn generate(
-    handle: &EngineHandle,
+    engine: &EngineHarness,
     prompt_tokens: Vec<u32>,
     logprobs: usize,
     max_tokens: usize,
 ) -> Vec<Step> {
-    let (token_tx, mut rx) = TokenSink::standalone();
-    handle
-        .submit(GenerateRequest {
-            trace_parent: None,
-            request_id: None,
-            queued_at_unix_s: None,
-            data_parallel_rank: None,
-            prompt_tokens,
-            params: SamplingParams::default(),
-            max_tokens,
-            lora_adapter: None,
-            kv_transfer_params: None,
-            token_tx,
-            logprobs,
-            echo: false,
-        })
-        .expect("submit failed");
-
-    let mut steps = Vec::new();
-    loop {
-        match rx.blocking_recv().map(|(_, event)| event) {
-            Some(TokenEvent::Token { id, logprob }) => steps.push(Step {
-                id,
-                top_logprobs: logprob.map(|lp| lp.top_logprobs).unwrap_or_default(),
-            }),
-            Some(
-                TokenEvent::Scheduled { .. }
-                | TokenEvent::PromptTokens { .. }
-                | TokenEvent::KvTransfer { .. },
-            ) => {}
-            Some(TokenEvent::Finished { .. }) => return steps,
-            Some(TokenEvent::Error { message, .. }) => panic!("generation failed: {message}"),
-            Some(TokenEvent::Rejected { message, .. }) => panic!("generation rejected: {message}"),
-            None => panic!("scheduler channel closed without Finished"),
-        }
-    }
+    let mut req = request(prompt_tokens, SamplingParams::default(), max_tokens);
+    req.logprobs = (logprobs > 0).then_some(logprobs);
+    to_steps(engine.submit(req).expect_finished())
 }
 
 /// Submit several greedy requests at once, then collect each one's steps. They
@@ -190,118 +184,53 @@ fn generate(
 /// the real bs>1 draft+verify path. Each tuple is `(prompt_tokens, max_tokens)`;
 /// logprobs are off so the speculative path stays active. Returns one step list
 /// per request, in submission order.
-fn generate_concurrent(handle: &EngineHandle, requests: Vec<(Vec<u32>, usize)>) -> Vec<Vec<Step>> {
+fn generate_concurrent(engine: &EngineHarness, requests: Vec<(Vec<u32>, usize)>) -> Vec<Vec<Step>> {
     // Submit all up front so they coexist in the engine and form real batches.
-    let receivers: Vec<_> = requests
+    let streams: Vec<_> = requests
         .into_iter()
         .map(|(prompt_tokens, max_tokens)| {
-            let (token_tx, rx) = TokenSink::standalone();
-            handle
-                .submit(GenerateRequest {
-                    trace_parent: None,
-                    request_id: None,
-                    queued_at_unix_s: None,
-                    data_parallel_rank: None,
-                    prompt_tokens,
-                    params: SamplingParams::default(),
-                    max_tokens,
-                    lora_adapter: None,
-                    kv_transfer_params: None,
-                    token_tx,
-                    logprobs: 0,
-                    echo: false,
-                })
-                .expect("submit failed");
-            rx
+            engine.submit(request(
+                prompt_tokens,
+                SamplingParams::default(),
+                max_tokens,
+            ))
         })
         .collect();
 
-    // Drain each request's channel to completion (events are buffered per-channel,
-    // so the drain order doesn't matter — they all ran concurrently).
-    receivers
+    // Fold each stream to its terminal (updates are buffered per request, so
+    // the fold order doesn't matter — they all ran concurrently).
+    streams
         .into_iter()
-        .map(|mut rx| {
-            let mut steps = Vec::new();
-            loop {
-                match rx.blocking_recv().map(|(_, event)| event) {
-                    Some(TokenEvent::Token { id, logprob }) => steps.push(Step {
-                        id,
-                        top_logprobs: logprob.map(|lp| lp.top_logprobs).unwrap_or_default(),
-                    }),
-                    Some(
-                        TokenEvent::Scheduled { .. }
-                        | TokenEvent::PromptTokens { .. }
-                        | TokenEvent::KvTransfer { .. },
-                    ) => {}
-                    Some(TokenEvent::Finished { .. }) => break,
-                    Some(TokenEvent::Error { message, .. }) => {
-                        panic!("generation failed: {message}")
-                    }
-                    Some(TokenEvent::Rejected { message, .. }) => {
-                        panic!("generation rejected: {message}")
-                    }
-                    None => panic!("scheduler channel closed without Finished"),
-                }
-            }
-            steps
-        })
+        .map(|stream| to_steps(stream.expect_finished()))
         .collect()
 }
 
-/// Prefill `context` (echo) and return the next-token distribution the *prefill*
+/// Prefill `context` (prompt scoring) and return the next-token distribution the *prefill*
 /// kernel produces — the kernel the speculative verify path also uses. This is
 /// the reference the spec pick should match (vs the plain-decode baseline, whose
 /// kernel resolves bifurcation ties to the other side). Returns the first
 /// generated token's `(id, top_logprobs)`.
-fn prefill_next(handle: &EngineHandle, context: Vec<u32>, logprobs: usize) -> Step {
-    let (token_tx, mut rx) = TokenSink::standalone();
-    handle
-        .submit(GenerateRequest {
-            trace_parent: None,
-            request_id: None,
-            queued_at_unix_s: None,
-            data_parallel_rank: None,
-            prompt_tokens: context,
-            params: SamplingParams::default(),
-            max_tokens: 1,
-            lora_adapter: None,
-            kv_transfer_params: None,
-            token_tx,
-            logprobs,
-            echo: true,
-        })
-        .expect("submit failed");
-
-    loop {
-        match rx.blocking_recv().map(|(_, event)| event) {
-            Some(TokenEvent::Token { id, logprob }) => {
-                return Step {
-                    id,
-                    top_logprobs: logprob.map(|lp| lp.top_logprobs).unwrap_or_default(),
-                };
-            }
-            Some(
-                TokenEvent::Scheduled { .. }
-                | TokenEvent::PromptTokens { .. }
-                | TokenEvent::KvTransfer { .. },
-            ) => {}
-            Some(TokenEvent::Finished { .. }) => panic!("echo prefill finished without a token"),
-            Some(TokenEvent::Error { message, .. }) => panic!("prefill failed: {message}"),
-            Some(TokenEvent::Rejected { message, .. }) => panic!("prefill rejected: {message}"),
-            None => panic!("scheduler channel closed without a token"),
-        }
-    }
+fn prefill_next(engine: &EngineHarness, context: Vec<u32>, logprobs: usize) -> Step {
+    let mut req = request(context, SamplingParams::default(), 1);
+    req.logprobs = (logprobs > 0).then_some(logprobs);
+    req.prompt_logprobs = Some(logprobs);
+    let mut generated = to_steps(engine.submit(req).expect_finished());
+    assert!(
+        !generated.is_empty(),
+        "prompt-scoring prefill finished without a token"
+    );
+    generated.swap_remove(0)
 }
 
 /// Compare one prompt's speculative `spec` steps against its plain-greedy `base`,
 /// tolerating only the benign prefill-vs-decode kernel-gap tie flip (the spec
 /// pick sits within `MARGIN_TOL` of the prefill kernel's own argmax, measured in
 /// the prefill distribution the verify path actually runs). `Ok(())` ⇒ lossless
-/// or a benign tie; `Err(diagnostic)` ⇒ a real spec bug. `handle` must be the
+/// or a benign tie; `Err(diagnostic)` ⇒ a real spec bug. `engine` must be the
 /// live speculative engine — at a divergence it re-prefills the shared context
 /// (`prompt_tokens` + the matched prefix) to read that prefill-kernel reference.
 fn check_lossless(
-    handle: &EngineHandle,
+    engine: &EngineHarness,
     tokenizer: &DynTokenizer,
     i: usize,
     prompt: &str,
@@ -362,7 +291,7 @@ fn check_lossless(
     // other side and amplifies the gap.
     let mut context = prompt_tokens.to_vec();
     context.extend(base[..matched].iter().map(|s| s.id));
-    let prefill_ref = prefill_next(handle, context, LOGPROBS);
+    let prefill_ref = prefill_next(engine, context, LOGPROBS);
 
     if prefill_ref.id == spec_id {
         // Spec faithfully reproduced the prefill-kernel greedy pick; the
@@ -422,6 +351,7 @@ fn check_lossless(
 
 #[test]
 fn dflash_speculative_greedy_matches_plain_greedy() {
+    common::harness::init_capture_logging();
     let (Some(model_path), Some(draft_path)) = (target_path_or_skip(), draft_path_or_skip()) else {
         return;
     };
@@ -446,13 +376,15 @@ fn dflash_speculative_greedy_matches_plain_greedy() {
     // 1. Baseline: plain greedy decode (speculative off), with logprobs so the
     //    regret check has the reference distribution at the divergence point.
     let baseline: Vec<Vec<Step>> = {
-        let handle = pegainfer_qwen3::launch(Path::new(&model_path), launch_options(None))
-            .expect("failed to start baseline engine");
+        let engine = EngineHarness::new(
+            pegainfer_qwen3::launch(Path::new(&model_path), launch_options(None))
+                .expect("failed to start baseline engine"),
+        );
         let out = encoded
             .iter()
-            .map(|t| generate(&handle, t.clone(), LOGPROBS, GENERATED_TOKENS))
+            .map(|t| generate(&engine, t.clone(), LOGPROBS, GENERATED_TOKENS))
             .collect();
-        drop(handle);
+        drop(engine);
         // Let the scheduler thread tear down and free GPU memory before the
         // speculative engine loads the same 8 GB target.
         std::thread::sleep(Duration::from_secs(2));
@@ -463,17 +395,19 @@ fn dflash_speculative_greedy_matches_plain_greedy() {
     //    Keep the engine alive through analysis: at a divergence we re-prefill
     //    the shared context to read the prefill-kernel reference (the kernel the
     //    verify path uses), which the plain-decode baseline cannot provide.
-    let handle = pegainfer_qwen3::launch(
-        Path::new(&model_path),
-        launch_options(Some(PathBuf::from(&draft_path))),
-    )
-    .expect("failed to start speculative engine");
+    let engine = EngineHarness::new(
+        pegainfer_qwen3::launch(
+            Path::new(&model_path),
+            launch_options(Some(PathBuf::from(&draft_path))),
+        )
+        .expect("failed to start speculative engine"),
+    );
 
     let mut failures = Vec::new();
     for (i, &prompt) in prompts.iter().enumerate() {
-        let spec = generate(&handle, encoded[i].clone(), 0, GENERATED_TOKENS);
+        let spec = generate(&engine, encoded[i].clone(), 0, GENERATED_TOKENS);
         if let Err(failure) = check_lossless(
-            &handle,
+            &engine,
             &tokenizer,
             i,
             prompt,
@@ -485,7 +419,7 @@ fn dflash_speculative_greedy_matches_plain_greedy() {
         }
     }
 
-    drop(handle);
+    drop(engine);
 
     assert!(
         failures.is_empty(),
@@ -547,10 +481,12 @@ fn dflash_short_then_long_verify_capture_is_lossless() {
     // 1. Baseline: the victim's plain-greedy decode (spec off) with logprobs, for
     //    the regret reference at any divergence.
     let baseline = {
-        let handle = pegainfer_qwen3::launch(Path::new(&model_path), launch_options(None))
-            .expect("failed to start baseline engine");
-        let out = generate(&handle, victim_tokens.clone(), LOGPROBS, GENERATED_TOKENS);
-        drop(handle);
+        let engine = EngineHarness::new(
+            pegainfer_qwen3::launch(Path::new(&model_path), launch_options(None))
+                .expect("failed to start baseline engine"),
+        );
+        let out = generate(&engine, victim_tokens.clone(), LOGPROBS, GENERATED_TOKENS);
+        drop(engine);
         // Free the target before the speculative engine loads the same 8 GB.
         std::thread::sleep(Duration::from_secs(2));
         out
@@ -558,15 +494,17 @@ fn dflash_short_then_long_verify_capture_is_lossless() {
 
     // 2. Speculative engine, shared across both requests so the bucket-bs=1
     //    capture from the poison request persists into the victim's replay.
-    let handle = pegainfer_qwen3::launch(
-        Path::new(&model_path),
-        launch_options(Some(PathBuf::from(&draft_path))),
-    )
-    .expect("failed to start speculative engine");
+    let engine = EngineHarness::new(
+        pegainfer_qwen3::launch(
+            Path::new(&model_path),
+            launch_options(Some(PathBuf::from(&draft_path))),
+        )
+        .expect("failed to start speculative engine"),
+    );
 
     // Poison: a short request whose only verify step has total_tokens < span,
     // first-capturing the bucket-bs=1 graph at the truncated shape.
-    let poison = generate(&handle, poison_tokens, 0, POISON_MAX_TOKENS);
+    let poison = generate(&engine, poison_tokens, 0, POISON_MAX_TOKENS);
     assert!(
         poison.len() <= POISON_MAX_TOKENS,
         "poison request emitted {} tokens, expected <= {POISON_MAX_TOKENS}",
@@ -574,10 +512,10 @@ fn dflash_short_then_long_verify_capture_is_lossless() {
     );
 
     // Victim: a full-span replay of the poisoned bucket-bs=1 graph.
-    let spec = generate(&handle, victim_tokens.clone(), 0, GENERATED_TOKENS);
+    let spec = generate(&engine, victim_tokens.clone(), 0, GENERATED_TOKENS);
 
     let result = check_lossless(
-        &handle,
+        &engine,
         &tokenizer,
         0,
         victim_prompt,
@@ -585,7 +523,7 @@ fn dflash_short_then_long_verify_capture_is_lossless() {
         &baseline,
         &spec,
     );
-    drop(handle);
+    drop(engine);
 
     assert!(
         result.is_ok(),
@@ -605,6 +543,7 @@ fn dflash_short_then_long_verify_capture_is_lossless() {
 /// (non-tie) divergence.
 #[test]
 fn dflash_concurrent_heterogeneous_is_lossless() {
+    common::harness::init_capture_logging();
     let (Some(model_path), Some(draft_path)) = (target_path_or_skip(), draft_path_or_skip()) else {
         return;
     };
@@ -633,26 +572,30 @@ fn dflash_concurrent_heterogeneous_is_lossless() {
     // 1. Baselines: each prompt's plain-greedy decode (spec off) at ITS budget,
     //    with logprobs for the regret reference. Sequential, one engine.
     let baselines: Vec<Vec<Step>> = {
-        let handle = pegainfer_qwen3::launch(Path::new(&model_path), launch_options(None))
-            .expect("failed to start baseline engine");
+        let engine = EngineHarness::new(
+            pegainfer_qwen3::launch(Path::new(&model_path), launch_options(None))
+                .expect("failed to start baseline engine"),
+        );
         let out = encoded
             .iter()
             .zip(&cases)
-            .map(|(t, (_, max_tokens))| generate(&handle, t.clone(), LOGPROBS, *max_tokens))
+            .map(|(t, (_, max_tokens))| generate(&engine, t.clone(), LOGPROBS, *max_tokens))
             .collect();
-        drop(handle);
+        drop(engine);
         std::thread::sleep(Duration::from_secs(2));
         out
     };
 
     // 2. Speculative engine: submit all four at once so they form real batches.
-    let handle = pegainfer_qwen3::launch(
-        Path::new(&model_path),
-        launch_options(Some(PathBuf::from(&draft_path))),
-    )
-    .expect("failed to start speculative engine");
+    let engine = EngineHarness::new(
+        pegainfer_qwen3::launch(
+            Path::new(&model_path),
+            launch_options(Some(PathBuf::from(&draft_path))),
+        )
+        .expect("failed to start speculative engine"),
+    );
     let specs = generate_concurrent(
-        &handle,
+        &engine,
         encoded
             .iter()
             .zip(&cases)
@@ -663,7 +606,7 @@ fn dflash_concurrent_heterogeneous_is_lossless() {
     let mut failures = Vec::new();
     for (i, (prompt, _)) in cases.iter().enumerate() {
         if let Err(failure) = check_lossless(
-            &handle,
+            &engine,
             &tokenizer,
             i,
             prompt,
@@ -674,13 +617,147 @@ fn dflash_concurrent_heterogeneous_is_lossless() {
             failures.push(failure);
         }
     }
-    drop(handle);
+    drop(engine);
 
     assert!(
         failures.is_empty(),
         "concurrent heterogeneous speculative decode is not lossless:\n{}",
         failures.join("\n")
     );
+}
+
+/// Production hedge regression: an explicit stop in the middle of a verify
+/// span must be applied before the hedge winner is selected and committed.
+/// The parent gate also checks the request-local worker trace, because the
+/// final stream alone cannot prove the winner was selected from a truncated
+/// span (a broken worker is only rejected at commit, after the fact).
+#[test]
+fn dflash_hedged_midspan_stop_retains_trigger() {
+    common::harness::init_capture_logging();
+    let (Some(model_path), Some(draft_path)) = (target_path_or_skip(), draft_path_or_skip()) else {
+        return;
+    };
+    if std::env::var_os("PEGAINFER_SPEC_HEDGE").is_none() {
+        eprintln!(
+            "skipping hedged mid-span stop gate: run it through hedged_ladder_passes_the_lossless_gates"
+        );
+        return;
+    }
+    let _gpu = GPU
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let prompt = "Write a short paragraph about a blue";
+    let tokenizer = common::load_tokenizer(&model_path);
+    let prompt_tokens = tokenizer.encode(prompt, false).expect("encode failed");
+    let draft_config: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(Path::new(&draft_path).join("config.json"))
+            .expect("read draft config"),
+    )
+    .expect("parse draft config");
+    let block_size = draft_config["block_size"]
+        .as_u64()
+        .expect("draft block_size") as usize;
+    let min_index = (block_size / 2).max(1);
+
+    let engine = EngineHarness::new(
+        pegainfer_qwen3::launch(
+            Path::new(&model_path),
+            launch_options(Some(PathBuf::from(&draft_path))),
+        )
+        .expect("failed to start speculative engine"),
+    );
+    let baseline_params = SamplingParams {
+        ignore_eos: true,
+        ..SamplingParams::default()
+    };
+    let baseline = engine
+        .submit(request(
+            prompt_tokens.clone(),
+            baseline_params,
+            GENERATED_TOKENS,
+        ))
+        .expect_finished();
+    assert!(matches!(
+        baseline.terminal,
+        Terminal::Finished {
+            reason: FinishReason::Length,
+            stop_cause: None,
+            completion_tokens,
+            ..
+        } if completion_tokens == GENERATED_TOKENS && completion_tokens == baseline.tokens.len()
+    ));
+    let baseline = baseline.tokens;
+    let candidate_stops: Vec<(usize, u32)> = baseline
+        .iter()
+        .enumerate()
+        .skip(min_index)
+        .take(block_size.saturating_sub(min_index))
+        .filter(|(index, token)| !baseline[..*index].contains(token))
+        .map(|(index, token)| (index, *token))
+        .collect();
+    assert!(
+        !candidate_stops.is_empty(),
+        "baseline did not produce a unique token inside the first verify span"
+    );
+
+    let mut stopped_cases = 0usize;
+    let mut no_stop_cases = 0usize;
+    for (baseline_index, stop_id) in candidate_stops {
+        let stopped_params = SamplingParams {
+            ignore_eos: true,
+            ..SamplingParams::default()
+        };
+        let mut stopped = request(prompt_tokens.clone(), stopped_params, GENERATED_TOKENS);
+        stopped.stop_policy = StopPolicy::new(EosPolicy::Ignore, vec![stop_id]);
+        let stream = engine.submit(stopped);
+        let request_id = stream.id();
+        eprintln!("hedge stop request={request_id}");
+        let outcome = stream.expect_finished();
+
+        // Do not `continue` past a candidate: a mid-span stop must still be
+        // the final token, and a run that never sampled the stop must terminate
+        // at the length limit. Filtering either shape would hide a suffix leak.
+        if let Some(position) = outcome.tokens.iter().position(|&token| token == stop_id) {
+            assert_eq!(
+                position,
+                outcome.tokens.len() - 1,
+                "stop {stop_id} was followed by {} more token(s) in candidate baseline_index={baseline_index}: {:?}",
+                outcome.tokens.len() - 1 - position,
+                outcome.tokens
+            );
+            assert!(matches!(
+                outcome.terminal,
+                Terminal::Finished {
+                    reason: FinishReason::Stop,
+                    stop_cause: Some(StopCause::Token(id)),
+                    completion_tokens,
+                    ..
+                } if id == stop_id && completion_tokens == outcome.tokens.len()
+            ));
+            eprintln!(
+                "hedge stop candidate baseline_index={baseline_index} token={stop_id} retained_len={}",
+                outcome.tokens.len()
+            );
+            stopped_cases += 1;
+        } else {
+            assert!(matches!(
+                outcome.terminal,
+                Terminal::Finished {
+                    reason: FinishReason::Length,
+                    stop_cause: None,
+                    completion_tokens,
+                    ..
+                } if completion_tokens == GENERATED_TOKENS && completion_tokens == outcome.tokens.len()
+            ));
+            no_stop_cases += 1;
+        }
+    }
+    assert!(
+        stopped_cases > 0,
+        "none of the candidate tokens produced a mid-span explicit stop"
+    );
+    eprintln!("hedge stop child: {stopped_cases} stopped case(s), {no_stop_cases} no-stop case(s)");
 }
 
 /// P2 regression: a request that fits the target context window but lands in the
@@ -690,8 +767,6 @@ fn dflash_concurrent_heterogeneous_is_lossless() {
 /// panicked mid-prefill when the draft allocated KV past its own max positions.
 #[test]
 fn dflash_request_in_draft_headroom_is_rejected_not_panicked() {
-    const BLOCK_SIZE: usize = 16; // DFlash drafter block size.
-
     let (Some(model_path), Some(draft_path)) = (target_path_or_skip(), draft_path_or_skip()) else {
         return;
     };
@@ -699,9 +774,10 @@ fn dflash_request_in_draft_headroom_is_rejected_not_panicked() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    // Read the real context window so the boundary is exact regardless of the
-    // checkpoint, then size the request to sit inside the draft's final in-fill
-    // block — it fits the target window but not the DFlash-effective one.
+    // Read both context windows so the boundary is exact for ANY checkpoint
+    // pairing: the request must clear the target's own limit but land inside
+    // the draft's final in-fill block `(draft_max - block_size, draft_max]`,
+    // where the DFlash admission cap (`draft_max - block_size`) rejects it.
     let config: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(Path::new(&model_path).join("config.json")).expect("read config"),
     )
@@ -709,55 +785,263 @@ fn dflash_request_in_draft_headroom_is_rejected_not_panicked() {
     let max_pos = config["max_position_embeddings"]
         .as_u64()
         .expect("max_position_embeddings") as usize;
-    let prompt_len = 16usize;
-    // total in (max_pos - BLOCK_SIZE, max_pos]: clears the target check, trips
-    // the DFlash admission cap (max_pos - BLOCK_SIZE).
-    let max_tokens = max_pos - BLOCK_SIZE / 2 - prompt_len;
-
-    let handle = pegainfer_qwen3::launch(
-        Path::new(&model_path),
-        launch_options(Some(PathBuf::from(&draft_path))),
+    let draft_config: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(Path::new(&draft_path).join("config.json"))
+            .expect("read draft config"),
     )
-    .expect("failed to start speculative engine");
+    .expect("parse draft config");
+    let block_size = draft_config["block_size"]
+        .as_u64()
+        .expect("draft block_size") as usize;
+    let draft_max = draft_config["max_position_embeddings"]
+        .as_u64()
+        .map_or(max_pos, |v| v as usize);
+    let prompt_len = 16usize;
+    let total = (draft_max - block_size / 2).min(max_pos);
+    if total <= draft_max - block_size {
+        eprintln!(
+            "skipping draft-headroom case: target max {max_pos} cannot reach the draft in-fill window (draft max {draft_max}, block {block_size})"
+        );
+        return;
+    }
+    let max_tokens = total - prompt_len;
 
-    let (token_tx, mut rx) = TokenSink::standalone();
-    handle
-        .submit(GenerateRequest {
-            trace_parent: None,
-            request_id: None,
-            queued_at_unix_s: None,
-            data_parallel_rank: None,
-            prompt_tokens: vec![100u32; prompt_len],
-            params: SamplingParams::default(),
+    let engine = EngineHarness::new(
+        pegainfer_qwen3::launch(
+            Path::new(&model_path),
+            launch_options(Some(PathBuf::from(&draft_path))),
+        )
+        .expect("failed to start speculative engine"),
+    );
+
+    let outcome = engine
+        .submit(request(
+            vec![100u32; prompt_len],
+            SamplingParams::default(),
             max_tokens,
-            lora_adapter: None,
-            kv_transfer_params: None,
-            token_tx,
-            logprobs: 0,
-            echo: false,
-        })
-        .expect("submit failed");
-
-    loop {
-        match rx.blocking_recv().map(|(_, event)| event) {
-            Some(TokenEvent::Rejected { message, .. }) => {
-                eprintln!("draft-headroom request rejected as expected: {message}");
-                break;
-            }
-            Some(
-                TokenEvent::Scheduled { .. }
-                | TokenEvent::PromptTokens { .. }
-                | TokenEvent::KvTransfer { .. },
-            ) => {}
-            Some(TokenEvent::Token { .. } | TokenEvent::Finished { .. }) => {
-                panic!("draft-headroom request was admitted instead of rejected")
-            }
-            Some(TokenEvent::Error { message, .. }) => {
-                panic!(
-                    "draft-headroom request errored mid-flight instead of clean rejection: {message}"
-                )
-            }
-            None => panic!("scheduler channel closed without a rejection"),
+        ))
+        .outcome();
+    assert!(
+        outcome.tokens.is_empty(),
+        "draft-headroom request was admitted instead of rejected"
+    );
+    match outcome.terminal {
+        Terminal::Rejected { reason, .. } => {
+            eprintln!("draft-headroom request rejected as expected: {reason}");
+        }
+        Terminal::Finished { .. } => {
+            panic!("draft-headroom request was admitted instead of rejected")
+        }
+        Terminal::Failed { message, .. } => {
+            panic!(
+                "draft-headroom request errored mid-flight instead of clean rejection: {message}"
+            )
         }
     }
+}
+
+/// Execution gate for the hedge ladder: re-runs the hedge child suites
+/// above in child processes, since the hedge config is read once per process
+/// and cannot be toggled in-process.
+///
+/// The stop child additionally checks that an untrimmed B candidate is not
+/// selected over the truncated A candidate, and that context append and KV
+/// commit use the same retained length. The losslessness children retain their
+/// numerical tie tolerance and only require that the configured hedge path
+/// actually ran.
+///
+/// Strict token equality against an unhedged run is NOT a valid contract:
+/// hedged rounds change the verify batch shape, which legally flips bf16 ties,
+/// and `--batch-invariant` rejects DFlash.
+#[test]
+fn hedged_ladder_passes_the_lossless_gates() {
+    // Strict mode (CI / validation boxes): every skip below is a failure —
+    // the gate must not go green without actually executing the hedge.
+    let strict = std::env::var("PEGAINFER_REQUIRE_HEDGE_GATE").is_ok_and(|v| v == "1");
+    let (target, draft) = (target_path_or_skip(), draft_path_or_skip());
+    let (Some(_), Some(draft_path)) = (target, draft) else {
+        assert!(
+            !strict,
+            "hedged gate requires model fixtures when PEGAINFER_REQUIRE_HEDGE_GATE is set"
+        );
+        return;
+    };
+    // A plain DFlash drafter (markov_rank == 0) never hedges; a green run
+    // against it would be vacuous.
+    let draft_config: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(Path::new(&draft_path).join("config.json"))
+            .expect("read draft config"),
+    )
+    .expect("parse draft config");
+    if draft_config["markov_rank"].as_u64().unwrap_or(0) == 0 {
+        assert!(
+            !strict,
+            "hedged gate requires a DSpark drafter but {draft_path} has markov_rank 0"
+        );
+        eprintln!(
+            "skipping hedged gate: {draft_path} is a plain DFlash drafter (markov_rank 0); \
+             point PEGAINFER_DFLASH_TEST_MODEL_PATH at a DSpark checkpoint"
+        );
+        return;
+    }
+    // Hold this process's GPU slot for the whole child run: the children own
+    // the card, and sibling tests here must not load an engine beside them.
+    let _gpu = GPU
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let exe = std::env::current_exe().expect("test binary path");
+    // One child per suite, each with a single exact filter, so the invocation
+    // shape is beyond dispute on any libtest version.
+    // A hedge-free child would make its lossless pass vacuous, so each child
+    // must show expanded spans in the executor's per-round trace.
+    let mut total_spans = 0usize;
+    let mut total_rounds = 0usize;
+    let mut total_wins = 0usize;
+    for child_test in [
+        "dflash_speculative_greedy_matches_plain_greedy",
+        "dflash_concurrent_heterogeneous_is_lossless",
+        "dflash_hedged_midspan_stop_retains_trigger",
+    ] {
+        let output = Command::new(&exe)
+            .args(["--exact", child_test, "--test-threads=1", "--nocapture"])
+            .env("PEGAINFER_SPEC_HEDGE", "8")
+            .env("PEGAINFER_SPEC_HEDGE_POSITIONS", "0,1,2")
+            .env("PEGAINFER_TEST_LOG", "1")
+            .env_remove("PEGAINFER_SPEC_HEDGE_AUTO")
+            .output()
+            .expect("spawn hedged child gate");
+        let child_stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            output.status.success(),
+            "hedged lossless gate '{child_test}' failed:\n{}\n{child_stderr}",
+            String::from_utf8_lossy(&output.stdout),
+        );
+        let mut rounds = 0usize;
+        let mut spans = 0usize;
+        for line in child_stderr.lines() {
+            let Some(rest) = line.split("DFlash hedge: ").nth(1) else {
+                continue;
+            };
+            let mut nums = rest
+                .split(|ch: char| !ch.is_ascii_digit())
+                .filter(|tok| !tok.is_empty())
+                .map(|tok| tok.parse::<usize>().expect("hedge trace number"));
+            spans += nums.next().expect("span count");
+            let wins = nums.next().expect("win count");
+            if child_test != "dflash_hedged_midspan_stop_retains_trigger" {
+                total_wins += wins;
+            }
+            rounds += 1;
+        }
+        assert!(
+            rounds > 0 && spans > 0,
+            "child '{child_test}' executed no hedged verify round:\n{child_stderr}"
+        );
+        if child_test == "dflash_hedged_midspan_stop_retains_trigger" {
+            let stop_requests: HashSet<String> = child_stderr
+                .lines()
+                .filter_map(|line| line.strip_prefix("hedge stop request="))
+                .map(str::to_owned)
+                .collect();
+            assert!(
+                !stop_requests.is_empty(),
+                "stop child emitted no request marker"
+            );
+            let mut context_by_round_request: HashMap<(u64, String), usize> = HashMap::new();
+            let mut commit_by_round_request: HashMap<(u64, String), usize> = HashMap::new();
+            for line in child_stderr.lines() {
+                let (length_field, lengths) = if line.contains("Qwen3 DFlash context ") {
+                    ("context_len=", &mut context_by_round_request)
+                } else if line.contains("Qwen3 DFlash commit ") {
+                    ("accepted_len=", &mut commit_by_round_request)
+                } else {
+                    continue;
+                };
+                let value = |name: &str| {
+                    line.split_whitespace()
+                        .find_map(|field| field.strip_prefix(name))
+                };
+                let round = value("round=")
+                    .expect("verify round")
+                    .parse::<u64>()
+                    .expect("numeric verify round");
+                let request = value("request=").expect("verify request");
+                let length = value(length_field)
+                    .expect("verify length")
+                    .parse::<usize>()
+                    .expect("numeric verify length");
+                assert!(
+                    lengths
+                        .insert((round, request.to_string()), length)
+                        .is_none(),
+                    "duplicate {length_field} for round={round} request={request}"
+                );
+            }
+            let mut worker_side_truncation = false;
+            for line in child_stderr.lines() {
+                if !line.contains("Qwen3 DFlash hedge detail ") {
+                    continue;
+                }
+                let value = |name: &str| {
+                    line.split_whitespace()
+                        .find_map(|field| field.strip_prefix(name))
+                };
+                let selected = value("selected=");
+                let round = value("round=")
+                    .expect("hedge round")
+                    .parse::<u64>()
+                    .expect("numeric hedge round");
+                let request = value("request=").expect("hedge request");
+                let raw_a = value("raw_a=").and_then(|v| v.parse().ok());
+                let raw_b_lens = value("raw_b_lens=").map(|v| {
+                    v.split(',')
+                        .filter(|value| !value.is_empty())
+                        .map(|value| value.parse::<usize>().expect("raw B length"))
+                        .collect::<Vec<_>>()
+                });
+                let selected_len = value("selected_len=")
+                    .expect("selected length")
+                    .parse::<usize>()
+                    .expect("numeric selected length");
+                if !stop_requests.contains(request) {
+                    continue;
+                }
+                let key = (round, request.to_string());
+                let context_len = context_by_round_request
+                    .get(&key)
+                    .expect("same-round DFlash context record");
+                let commit_len = commit_by_round_request
+                    .get(&key)
+                    .expect("same-round KV commit record");
+                assert_eq!(
+                    selected_len, *context_len,
+                    "hedge/context mismatch for round={round} request={request}"
+                );
+                assert_eq!(
+                    selected_len, *commit_len,
+                    "hedge/commit mismatch for round={round} request={request}"
+                );
+                let raw_b_max = raw_b_lens
+                    .as_ref()
+                    .and_then(|lengths| lengths.iter().copied().max());
+                if raw_b_max.is_some_and(|raw_b| raw_a.is_some_and(|raw_a| raw_b > raw_a))
+                    && selected == Some("A")
+                    && raw_b_max.is_some_and(|raw| selected_len < raw)
+                {
+                    worker_side_truncation = true;
+                }
+            }
+            assert!(
+                worker_side_truncation,
+                "stop hedge never truncated a candidate before winner/context commit:\n{child_stderr}"
+            );
+        }
+        if child_test != "dflash_hedged_midspan_stop_retains_trigger" {
+            total_rounds += rounds;
+            total_spans += spans;
+        }
+    }
+    assert!(total_rounds > 0 && total_spans > 0);
+    assert!(total_wins > 0);
+    assert!(total_spans > total_wins);
 }

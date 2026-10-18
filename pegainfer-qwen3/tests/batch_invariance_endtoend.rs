@@ -11,7 +11,7 @@
 //!   PEGAINFER_TEST_MODEL_PATH=<Qwen3-4B-base> cargo test --release \
 //!     -p pegainfer-qwen3 --test batch_invariance_endtoend -- --nocapture
 
-use pegainfer_core::sampler::SamplingParams;
+use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_kernels::ops::NumericPolicy;
 use pegainfer_kernels::ops::pin_served;
 use pegainfer_kernels::ops::reset_numeric_policy_counters;
@@ -40,8 +40,8 @@ fn item(id: RequestId, prompt: Vec<u32>) -> PrefillStepItem {
         prompt,
         MAX_OUTPUT_TOKENS,
         SamplingParams::default(),
-        LOGPROBS,
-        false,
+        Some(LOGPROBS),
+        None,
     )
 }
 
@@ -53,7 +53,6 @@ fn dist_for_first(ex: &mut Qwen3Executor, batch: &[(RequestId, Vec<u32>)]) -> Ve
         .execute_prefill(PrefillPlan {
             sample_seed: 0,
             requests: &items,
-            echo: false,
         })
         .expect("prefill");
     let out = pr.requests[0]

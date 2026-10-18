@@ -114,6 +114,88 @@ fn workspace_root() -> PathBuf {
     crate_root().join("..")
 }
 
+/// AOT-export the CuTe DSL tcgen05 fp8 GEMMs and compile the dispatch shim
+/// around them (csrc/glm52/glm52_fp8_dsl_gemm.c). Opt-in via
+/// `PEGAINFER_CUTEDSL_PYTHON` (a Python with torch + nvidia-cutlass-dsl on a
+/// CUDA box); without it the shim compiles as an empty-table stub and the
+/// runtime stays on the CUTLASS route. The exported objects resolve their
+/// `_cuda*` wrapper symbols from the DSL wheel's libcute_dsl_runtime.so —
+/// linked here, needed on LD_LIBRARY_PATH at run time.
+fn build_glm52_cutedsl_fp8_dsl(root: &Path, out_dir: &Path, cuda_include: &Path) {
+    println!("cargo:rerun-if-env-changed=PEGAINFER_CUTEDSL_PYTHON");
+    let shim_c = root.join("csrc/glm52/glm52_fp8_dsl_gemm.c");
+    println!("cargo:rerun-if-changed={}", shim_c.display());
+    let mut shim = cc::Build::new();
+    shim.include(cuda_include)
+        .flag("-std=c11")
+        .warnings(false)
+        .file(&shim_c);
+    if let Ok(python) = std::env::var("PEGAINFER_CUTEDSL_PYTHON") {
+        let script = root.join("tools/cutedsl/export_glm52_fp8_dsl.py");
+        let benches = workspace_root().join("pegainfer-glm52/benches");
+        let gen_dir = out_dir.join("cutedsl_fp8_dsl");
+        fs::create_dir_all(&gen_dir).expect("create the cutedsl gen dir");
+        println!("cargo:rerun-if-changed={}", script.display());
+        for source in [
+            "kernel_lab/units/fp8_gemm_dsl_tc_kernel.py",
+            "kernel_lab/units/fp8_gemm_dsl_tc.py",
+        ] {
+            println!("cargo:rerun-if-changed={}", benches.join(source).display());
+        }
+        let status = time_phase("cutedsl fp8 GEMM export", || {
+            Command::new(&python)
+                .arg(&script)
+                .arg("--benches-dir")
+                .arg(&benches)
+                .arg("--out-dir")
+                .arg(&gen_dir)
+                .status()
+        })
+        .unwrap_or_else(|err| panic!("failed to run {python}: {err}"));
+        assert!(
+            status.success(),
+            "CuTe DSL fp8 GEMM export failed (PEGAINFER_CUTEDSL_PYTHON={python})"
+        );
+        let mut objects: Vec<PathBuf> = fs::read_dir(&gen_dir)
+            .expect("read the cutedsl gen dir")
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                (path.extension().and_then(|e| e.to_str()) == Some("o")).then_some(path)
+            })
+            .collect();
+        objects.sort();
+        assert!(!objects.is_empty(), "cutedsl export produced no objects");
+        let object_count = objects.len();
+        for object in objects {
+            shim.object(object);
+        }
+        shim.define("GLM52_CUTEDSL_AOT", None).include(&gen_dir);
+        let lib_dir_probe = Command::new(&python)
+            .args([
+                "-c",
+                "import cutlass, os; print(os.path.abspath(os.path.join(os.path.dirname(cutlass.__file__), '..', '..', 'lib')))",
+            ])
+            .output()
+            .expect("probe the nvidia-cutlass-dsl lib dir");
+        let lib_dir = String::from_utf8_lossy(&lib_dir_probe.stdout)
+            .trim()
+            .to_string();
+        assert!(
+            Path::new(&lib_dir).join("libcute_dsl_runtime.so").exists(),
+            "libcute_dsl_runtime.so not found under {lib_dir}"
+        );
+        println!("cargo:rustc-link-search=native={lib_dir}");
+        println!("cargo:rustc-link-lib=dylib=cute_dsl_runtime");
+        println!(
+            "cargo:warning=GLM5.2 CuTe DSL fp8 GEMM AOT enabled: {object_count} objects; \
+             libcute_dsl_runtime.so ({lib_dir}) must be on LD_LIBRARY_PATH at run time"
+        );
+    }
+    time_phase("cc glm52_fp8_dsl_gemm", || {
+        shim.compile("glm52_fp8_dsl_gemm");
+    });
+}
+
 fn crate_root() -> PathBuf {
     PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"))
 }
@@ -222,7 +304,12 @@ fn nvcc_job_count() -> usize {
 fn nvcc_task_priority(cu_file: &Path) -> usize {
     match cu_file.file_stem().and_then(|stem| stem.to_str()) {
         Some("paged_attention") => 0,
-        Some("paged_attention_hd512" | "flashinfer_sampling") => 1,
+        Some(
+            "paged_attention_hd512"
+            | "paged_attention_hd256"
+            | "paged_attention_window_hd256"
+            | "flashinfer_sampling",
+        ) => 1,
         Some("flashinfer_top1") => 2,
         Some("flashinfer_norm") => 3,
         _ => 10,
@@ -264,8 +351,21 @@ fn parse_sm_token(raw: &str) -> Option<String> {
     None
 }
 
+/// `nvcc`, prefixed by `PEGAINFER_NVCC_LAUNCHER` when that is set and non-empty.
+fn nvcc_command(nvcc: &str) -> Command {
+    println!("cargo:rerun-if-env-changed=PEGAINFER_NVCC_LAUNCHER");
+    match std::env::var_os("PEGAINFER_NVCC_LAUNCHER").filter(|value| !value.is_empty()) {
+        Some(launcher) => {
+            let mut command = Command::new(launcher);
+            command.arg(nvcc);
+            command
+        }
+        None => Command::new(nvcc),
+    }
+}
+
 fn nvcc_supported_arches(nvcc: &str) -> Option<BTreeSet<String>> {
-    let output = Command::new(nvcc).arg("--list-gpu-arch").output().ok()?;
+    let output = nvcc_command(nvcc).arg("--list-gpu-arch").output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -400,7 +500,7 @@ fn nvcc_accepts_gencode(nvcc: &str, compute: &str, sm: &str) -> bool {
         return false;
     }
 
-    let output = Command::new(nvcc)
+    let output = nvcc_command(nvcc)
         .args(["-c"])
         .arg(&cu_path)
         .arg("-o")
@@ -552,6 +652,40 @@ fn glm52_sm100f_only_arch_args(normalized_sms: &[String], nvcc: &str) -> Option<
     })
 }
 
+// --- k3 -------------------------------------------------------------------
+/// K3's DeepGEMM FP8xFP4 masked grouped GEMM is raw Blackwell tcgen05, so it
+/// follows the same sm_100f-family rule as the GLM5.2 DeepGEMM stems: assemble
+/// for the family arch when a sm_100 target exists, otherwise let the TU fall
+/// back to its NOT_SUPPORTED stub.
+fn k3_sm100f_only_arch_args(normalized_sms: &[String], nvcc: &str) -> Option<Vec<String>> {
+    glm52_sm100f_only_arch_args(normalized_sms, nvcc)
+}
+
+/// FlashKDA (vendored, third_party/flash-kda) is SM90 TMA + cluster barriers,
+/// portable across the accelerated (`a`) variants — upstream supports
+/// 90a/100a/103a/120a with one code path. Compile the accelerated variant of
+/// every requested target that nvcc accepts; `None` means no target can carry
+/// the kernel and the TU falls back to its NOT_SUPPORTED stub.
+fn k3_flash_kda_arch_args(normalized_sms: &[String], nvcc: &str) -> Option<Vec<String>> {
+    let mut args = Vec::new();
+    for sm in normalized_sms {
+        let Some(numeric) = sm_numeric_prefix(sm) else {
+            continue;
+        };
+        if numeric < 90 {
+            continue;
+        }
+        let accelerated = format!("{numeric}a");
+        if !nvcc_accepts_gencode(nvcc, &accelerated, &accelerated) {
+            continue;
+        }
+        args.push("-gencode".to_string());
+        args.push(format!("arch=compute_{accelerated},code=sm_{accelerated}"));
+    }
+    (!args.is_empty()).then_some(args)
+}
+// --- end k3 ---------------------------------------------------------------
+
 fn collect_files_recursively(dir: &Path, out: &mut Vec<PathBuf>) {
     let mut entries: Vec<_> = std::fs::read_dir(dir)
         .unwrap_or_else(|err| panic!("Failed to read {}: {err}", dir.display()))
@@ -600,6 +734,40 @@ fn is_deepep_source(csrc_dir: &Path, path: &Path) -> bool {
     }
 }
 
+/// The Marlin substrate (csrc/marlin/): shared by every four-bit weight, so it
+/// rides whichever of its consumers is enabled rather than a feature of its own.
+fn is_marlin_source(csrc_dir: &Path, path: &Path) -> bool {
+    match path.strip_prefix(csrc_dir) {
+        Ok(relative) => relative
+            .components()
+            .any(|part| part.as_os_str() == "marlin"),
+        Err(_) => false,
+    }
+}
+
+/// Gemma 4 model-local CUDA. The NVFP4 conversion intrinsics arrived in CUDA
+/// 12.8, so keeping this out of the default build keeps the toolkit floor
+/// where the other model lines put it.
+fn is_gemma4_source(csrc_dir: &Path, path: &Path) -> bool {
+    match path.strip_prefix(csrc_dir) {
+        Ok(relative) => relative
+            .components()
+            .any(|part| part.as_os_str() == "gemma4"),
+        Err(_) => false,
+    }
+}
+
+/// Qwen3.5 model-local CUDA: the linear-attention recurrence and the
+/// head_dim 256 full-attention path.
+fn is_qwen35_source(csrc_dir: &Path, path: &Path) -> bool {
+    match path.strip_prefix(csrc_dir) {
+        Ok(relative) => relative
+            .components()
+            .any(|part| part.as_os_str() == "qwen35"),
+        Err(_) => false,
+    }
+}
+
 /// GLM5.2 model-local CUDA shims over DeepGEMM/FlashMLA contracts.
 fn is_glm52_source(csrc_dir: &Path, path: &Path) -> bool {
     match path.strip_prefix(csrc_dir) {
@@ -609,6 +777,16 @@ fn is_glm52_source(csrc_dir: &Path, path: &Path) -> bool {
         Err(_) => false,
     }
 }
+
+// --- k3 -------------------------------------------------------------------
+/// Kimi-K3 model-local CUDA shims (FP8xFP4 masked grouped GEMM over DeepGEMM).
+fn is_k3_source(csrc_dir: &Path, path: &Path) -> bool {
+    match path.strip_prefix(csrc_dir) {
+        Ok(relative) => relative.components().any(|part| part.as_os_str() == "k3"),
+        Err(_) => false,
+    }
+}
+// --- end k3 ---------------------------------------------------------------
 
 fn require_submodule_file(root: &Path, feature: &str, label: &str, relative: &str) {
     let path = root.join(relative);
@@ -639,6 +817,27 @@ fn require_glm52_submodules(root: &Path) {
         "third_party/FlashMLA/csrc/cutlass/include/cutlass/bfloat16.h",
     );
 }
+
+// --- k3 -------------------------------------------------------------------
+/// The k3 feature has no DeepEP/NCCL dependency, but its FP8xFP4 masked
+/// grouped GEMM is AOT-instantiated straight out of the DeepGEMM device
+/// headers, which in turn need DeepGEMM's own nested CUTLASS and fmt.
+fn require_k3_submodules(root: &Path) {
+    require_submodule_file(root, "k3", "DeepGEMM", "third_party/DeepGEMM/README.md");
+    require_submodule_file(
+        root,
+        "k3",
+        "DeepGEMM nested CUTLASS",
+        "third_party/DeepGEMM/third-party/cutlass/include/cutlass/float_subbyte.h",
+    );
+    require_submodule_file(
+        root,
+        "k3",
+        "DeepGEMM nested fmt",
+        "third_party/DeepGEMM/third-party/fmt/include/fmt/format.h",
+    );
+}
+// --- end k3 ---------------------------------------------------------------
 
 /// NCCL >= 2.30.4 root (include/nccl.h + lib/libnccl.so.2) for the DeepEP
 /// shim's device API (ncclDevComm / windows / GIN). cudarc dlopens whatever
@@ -705,6 +904,69 @@ fn link_deepep_nccl(nccl_root: &Path, out_dir: &Path) {
         }
     }
     println!("cargo:rustc-link-lib=dylib=nccl");
+}
+
+/// Link the freshly compiled CUDA objects into `libglm52_kernel_lab.so` for
+/// the kernel-lab Python harness (`PEGAINFER_KERNEL_LAB=1` only). The objects
+/// are already PIC (every nvcc task adds `--compiler-options -fPIC`), so the
+/// same .o files that feed `libkernels_cuda.a` link into a shared object
+/// without a second compile pass. DeepEP shim objects reference NCCL symbols
+/// that stay unresolved in the .so — the harness dlopens with `RTLD_LAZY` and
+/// never calls into DeepEP for these units.
+fn link_kernel_lab_shared(
+    nvcc: &str,
+    toolkit: &pegainfer_build::CudaToolkit,
+    out_dir: &Path,
+    obj_files: &[PathBuf],
+) {
+    let so_path = out_dir.join("libglm52_kernel_lab.so");
+    let _ = fs::remove_file(&so_path);
+    let mut args = vec!["-shared".to_string()];
+    args.extend(
+        obj_files
+            .iter()
+            .map(|path| path.to_string_lossy().to_string()),
+    );
+    args.extend([
+        "-o".to_string(),
+        so_path.to_string_lossy().to_string(),
+        format!("-L{}", toolkit.root.join("lib64").display()),
+        "-lcudart".to_string(),
+        "-lcublas".to_string(),
+        "-lcublasLt".to_string(),
+        "-lnvrtc".to_string(),
+        "-lcuda".to_string(),
+        "-lstdc++".to_string(),
+    ]);
+    let status = time_phase("nvcc -shared libglm52_kernel_lab.so", || {
+        nvcc_command(nvcc)
+            .args(&args)
+            .status()
+            .expect("Failed to run nvcc for libglm52_kernel_lab.so")
+    });
+    assert!(status.success(), "kernel-lab shared link failed");
+
+    // Stable discovery path: OUT_DIR is target/<profile>/build/<pkg>-<hash>/out,
+    // so three parents up is target/<profile>.
+    if let Some(profile_dir) = out_dir
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+    {
+        let stable = profile_dir.join("libglm52_kernel_lab.so");
+        fs::copy(&so_path, &stable).unwrap_or_else(|err| {
+            panic!(
+                "Failed to copy kernel-lab .so to {}: {err}",
+                stable.display()
+            )
+        });
+        println!("cargo:warning=kernel_lab .so: {}", stable.display());
+    } else {
+        println!(
+            "cargo:warning=kernel_lab .so: {} (no stable target/<profile> copy)",
+            so_path.display()
+        );
+    }
 }
 
 fn cuda_object_name(csrc_dir: &Path, cu_file: &Path) -> String {
@@ -1256,6 +1518,680 @@ fn compile_triton_aot_kernels(cuda_include: &Path, out_dir: &Path, sm_targets: &
     println!("cargo:rerun-if-env-changed=PEGAINFER_TRITON_PYTHON");
 }
 
+// ===========================================================================
+// tilelang: BEGIN — TileLang AOT kernel families.
+//
+// Self-contained section: everything a model line needs to turn its
+// `generate.py` into objects lives between these two markers plus one
+// `cfg!(feature = ...)` block per family inside `main`. A family is a row in
+// the table below; the tiers, the arch handling and the nvcc flags are shared.
+//
+// Three tiers, first one that works wins:
+//   1. generate — run the generator with a build-host Python that has the
+//      pinned TileLang. Preferred; this is what a dev box and the GPU CI
+//      builders take.
+//   2. pre-generated — `PEGAINFER_<label>_TILELANG_PREGEN=<dir>` points at a
+//      directory produced earlier by `generate.py --vendor-includes`, for
+//      hosts that cannot install TileLang. The directory carries its own
+//      `manifest.txt` with the CUDA files and header include paths.
+//   3. stub — no Python, no pre-generated dir: compile launchers that return
+//      `cudaErrorNotSupported`, so a featureless/CI build stays green and a
+//      call fails loudly instead of silently computing garbage.
+// ===========================================================================
+
+struct TileLangArtifacts {
+    cu_files: Vec<PathBuf>,
+    template_include: PathBuf,
+    cutlass_include: PathBuf,
+    /// nvcc flags the generator states its bodies were compiled with; leaving
+    /// one out is a silent numerical difference from the gated kernel.
+    nvcc_flags: Vec<String>,
+    /// Entry points the generator says it emitted, as `(name, parameters)`.
+    /// C has no mangling, so a stub whose parameters drifted from the real
+    /// launcher would link and then be called wrongly; these are checked
+    /// against the family's own list instead.
+    launchers: Vec<(String, String)>,
+    /// Arch the bodies were lowered for, e.g. `sm_103a`.
+    arch: Option<String>,
+    /// The attention geometry the bodies were compiled for. Re-exported, so
+    /// a caller refuses another checkpoint before it loads weights.
+    geometry: Option<String>,
+    /// Dynamic shared memory one block opts into. A device whose per-block
+    /// limit is under it cannot run the bodies at all.
+    smem: Option<String>,
+}
+
+/// One model line's TileLang kernels. `label` names the family in warnings,
+/// in its `PEGAINFER_<label>_TILELANG_*` variables and, lowercased, in its
+/// artifact directory and stub file, so a family is this row and nothing else.
+struct TileLangFamily {
+    label: &'static str,
+    /// Generator, relative to the workspace root.
+    generator: &'static str,
+    /// Further inputs the generator reads, for rerun tracking.
+    sources: &'static [&'static str],
+    /// `extern "C"` entry points the generator emits; the stub tier has to
+    /// match this list exactly or the feature fails to link.
+    launchers: &'static [(&'static str, &'static str)],
+    /// Lowest SM the lowering supports; below it the build takes the stub.
+    min_sm: u32,
+    /// Manifest keys the crate re-exports for a run-time refusal. A directory
+    /// that predates one of them would leave that refusal fail-open, so it is
+    /// rejected here rather than skipped.
+    required_manifest: &'static [&'static str],
+}
+
+impl TileLangFamily {
+    /// The `cfg` a caller reads to know real bodies were built, not stubs.
+    fn cfg(&self) -> String {
+        format!("{}_tilelang", self.label.to_lowercase())
+    }
+}
+
+const GEMMA4_TILELANG: TileLangFamily = TileLangFamily {
+    label: "GEMMA4",
+    generator: "pegainfer-gemma4/kernels/generate.py",
+    sources: &["pegainfer-gemma4/kernels/tilelang_defs.py"],
+    launchers: GEMMA4_TILELANG_LAUNCHERS,
+    // The key and query loads lower to TMA, which is Hopper and newer.
+    min_sm: 90,
+    required_manifest: &["ARCH", "GEOMETRY", "SMEM"],
+};
+
+/// The hd512 global-attention prefill: the packed query rows and the output,
+/// the plan's page table, its per-request indptrs and final-page fills, and
+/// the run-time extents, pool geometry and row format. The query indptr
+/// arrives twice, on the device for the body and on the host for the grid.
+const GEMMA4_TILELANG_LAUNCHERS: &[(&str, &str)] = &[
+    (
+        "gemma4_hd512_prefill_varlen",
+        "const void*, const void*, const int*, const int*, const int*, const int*, \
+         const int*, void*, int, int, int, int, int, int, int, int, int, float",
+    ),
+    // The split-KV decode: the plan's per-slot arrays and workspace, the
+    // decode rows' offset into the step's buffers, the run-time extents,
+    // pool geometry and row format, and the chunk the tile indices count in.
+    (
+        "gemma4_hd512_decode_split_kv",
+        "const void*, const void*, const int*, const int*, const int*, const int*, \
+         const int*, const unsigned char*, const int*, void*, float*, void*, int, int, \
+         int, int, int, int, int, int, int, int, int, int, float",
+    ),
+    // The sliding family's windowed split-KV decode: the same plan arrays
+    // and workspace, no row format, and the window as a key distance in
+    // place of it.
+    (
+        "gemma4_hd256_decode_window",
+        "const void*, const void*, const int*, const int*, const int*, const int*, \
+         const int*, const unsigned char*, const int*, void*, float*, void*, int, int, \
+         int, int, int, int, int, int, int, int, int, int, float",
+    ),
+    // The sliding family's windowed prefill: the global prefill's arguments
+    // without a row format, with the window as a key distance in its place.
+    (
+        "gemma4_hd256_prefill_window",
+        "const void*, const void*, const int*, const int*, const int*, const int*, \
+         const int*, void*, int, int, int, int, int, int, int, int, int, float",
+    ),
+];
+
+const GEMMA4_W4A16_TILELANG: TileLangFamily = TileLangFamily {
+    label: "GEMMA4_W4A16",
+    generator: "pegainfer-gemma4/kernels/w4a16_generate.py",
+    sources: &[
+        "pegainfer-gemma4/kernels/w4a16_defs.py",
+        "pegainfer-gemma4/kernels/generate.py",
+    ],
+    launchers: GEMMA4_W4A16_TILELANG_LAUNCHERS,
+    // Plain cp.async and mma.sync: Ampere and newer.
+    min_sm: 80,
+    // GEOMETRY is `ctas,block_n,block_k,warps`; the crate refuses a device
+    // whose SM count is not ctas / 2.
+    required_manifest: &["ARCH", "GEOMETRY", "SMEM"],
+};
+
+/// The decode GEMM over (x, packed weight, packed scales, output, stream-K
+/// partials, flags, fix-up table) dispatched on (n, k, rows), and the
+/// residency query the crate checks those kernels against.
+const GEMMA4_W4A16_TILELANG_LAUNCHERS: &[(&str, &str)] = &[
+    (
+        "gemma4_w4a16_gemm",
+        "void*, int*, int*, void*, float*, int*, int*, int*, int, int, int",
+    ),
+    ("gemma4_w4a16_occupancy", "int, int, int, int*"),
+];
+
+const K3_TILELANG: TileLangFamily = TileLangFamily {
+    label: "K3",
+    generator: "pegainfer-k3/kernels/generate.py",
+    sources: &["pegainfer-k3/kernels/tilelang_defs.py"],
+    launchers: K3_TILELANG_LAUNCHERS,
+    min_sm: 0,
+    required_manifest: &[],
+};
+
+const K3_TILELANG_LAUNCHERS: &[(&str, &str)] = &[
+    (
+        "k3_rms_norm_rbs_batched",
+        "const void*, const void*, void*, int, int",
+    ),
+    (
+        "k3_land_batched",
+        "const float*, void*, int, int, int, int, int",
+    ),
+    (
+        "k3_land_rms_norm_rbs_batched",
+        "const float*, const void*, void*, int, int, int, int, int",
+    ),
+    (
+        "k3_add2_batched",
+        "const void*, const void*, void*, int, int",
+    ),
+    (
+        "k3_mul_sigmoid_batched",
+        "const void*, const void*, void*, int, int",
+    ),
+    (
+        "k3_situ_batched",
+        "const void*, const void*, void*, int, int",
+    ),
+    (
+        "k3_conv_silu_batched",
+        "const float*, const float*, const void*, void*, void*, void*, int, int, int, int",
+    ),
+    (
+        "k3_kda_core_batched",
+        "const void*, const void*, const void*, const float*, const float*, const float*, \
+         const void*, const void*, const float*, const float*, float*, void*, \
+         int, int, int, int",
+    ),
+    (
+        "k3_o_norm_gate_batched",
+        "const void*, const void*, const float*, void*, int, int, int",
+    ),
+    (
+        "k3_attnres_scores_batched",
+        "const void*, const void*, const float*, float*, int, int, int",
+    ),
+    (
+        "k3_attnres_mix_batched",
+        "const void*, const void*, const float*, void*, int, int, int",
+    ),
+];
+
+fn probe_tilelang_python(candidate: &str) -> Result<String, String> {
+    let output = Command::new(candidate)
+        .args(["-c", "import tilelang"])
+        .output()
+        .map_err(|err| format!("{candidate}: {err}"))?;
+
+    if output.status.success() {
+        Ok(candidate.to_string())
+    } else {
+        Err(format!(
+            "{candidate}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+fn find_tilelang_python(family: &TileLangFamily) -> Result<String, String> {
+    for var in [
+        format!("PEGAINFER_{}_TILELANG_PYTHON", family.label),
+        "PEGAINFER_TILELANG_PYTHON".to_string(),
+    ] {
+        let Ok(candidate) = std::env::var(&var) else {
+            continue;
+        };
+        let candidate = candidate.trim().to_string();
+        if candidate.is_empty() {
+            return Err(format!("{var} is set but empty."));
+        }
+        return probe_tilelang_python(&candidate).map_err(|message| {
+            format!("{var}=`{candidate}` could not import TileLang: {message}")
+        });
+    }
+
+    let local_venv = workspace_root().join("../.venv/bin/python");
+    let workspace_venv = workspace_root().join(".venv/bin/python");
+    let mut diagnostics = Vec::new();
+    let mut candidates = Vec::new();
+    if local_venv.exists() {
+        candidates.push(local_venv.to_string_lossy().to_string());
+    }
+    if workspace_venv.exists() {
+        candidates.push(workspace_venv.to_string_lossy().to_string());
+    }
+    candidates.extend(["python3".to_string(), "python".to_string()]);
+
+    for candidate in candidates {
+        match probe_tilelang_python(&candidate) {
+            Ok(path) => return Ok(path),
+            Err(message) => diagnostics.push(message),
+        }
+    }
+
+    Err(format!(
+        "Could not find a Python interpreter with TileLang installed. Probe results: {}.",
+        diagnostics.join(" | ")
+    ))
+}
+
+/// TileLang arch for the AOT lowering. Generation must not depend on a GPU
+/// being visible to the build host (containers routinely have none), so the
+/// arch is derived from the same SM list nvcc targets and passed explicitly.
+/// Architectures from Hopper on need the `a` (accelerated) variant.
+fn tilelang_arch(sm_targets: &[String]) -> Option<String> {
+    let max_sm = sm_targets
+        .iter()
+        .filter_map(|sm| sm_numeric_prefix(sm))
+        .max()?;
+    Some(if max_sm >= 90 {
+        format!("sm_{max_sm}a")
+    } else {
+        format!("sm_{max_sm}")
+    })
+}
+
+/// nvcc gencode for the exact arch the TileLang bodies were lowered for.
+///
+/// These TUs cannot ride the generic arch list: TileLang lowers a TMA copy
+/// into a warp-specialized kernel that emits `setmaxnreg`, which ptxas only
+/// assembles for the accelerated (`a`) target. Generation targets a single
+/// arch, so the objects do too — a multi-SM build gets K3 TileLang kernels for
+/// the highest SM only. `None` means this nvcc cannot assemble that arch, and
+/// the caller falls back to the stub tier rather than emitting objects that
+/// would fail to link or run.
+fn tilelang_gencode(arch: &str, nvcc: &str) -> Option<Vec<String>> {
+    let target = arch.strip_prefix("sm_")?;
+    nvcc_accepts_gencode(nvcc, target, target).then(|| {
+        vec![
+            "-gencode".to_string(),
+            format!("arch=compute_{target},code=sm_{target}"),
+        ]
+    })
+}
+
+/// Parse the `KEY=VALUE` contract the generator prints on stdout and mirrors
+/// into `manifest.txt` (a generator that cannot lower for this build prints
+/// one `UNAVAILABLE=<reason>` line instead, and the family takes the stub
+/// tier): one `CU_PATH` per emitted translation unit, the two
+/// header roots the generated CUDA includes, and the arch the bodies were
+/// lowered for. Paths resolve against `base`, the directory the manifest
+/// describes, so a vendored directory answers for its own files wherever it
+/// was copied; an absolute entry passes through unchanged.
+fn parse_tilelang_manifest(text: &str, origin: &str, base: &Path) -> TileLangArtifacts {
+    let mut cu_files = Vec::new();
+    let mut template_include = None;
+    let mut cutlass_include = None;
+    let mut arch = None;
+    let mut geometry = None;
+    let mut smem = None;
+    let mut nvcc_flags = Vec::new();
+    let mut launchers = Vec::new();
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix("CU_PATH=") {
+            cu_files.push(base.join(value.trim()));
+        } else if let Some(value) = line.strip_prefix("TILELANG_TEMPLATE_PATH=") {
+            template_include = Some(base.join(value.trim()));
+        } else if let Some(value) = line.strip_prefix("CUTLASS_INCLUDE_DIR=") {
+            cutlass_include = Some(base.join(value.trim()));
+        } else if let Some(value) = line.strip_prefix("ARCH=") {
+            arch = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("GEOMETRY=") {
+            geometry = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("SMEM=") {
+            smem = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("NVCC_FLAG=") {
+            nvcc_flags.push(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("LAUNCHER=") {
+            let (name, params) = value
+                .trim()
+                .split_once('|')
+                .unwrap_or_else(|| panic!("{origin} has a LAUNCHER without parameters: {value}"));
+            launchers.push((name.to_string(), params.to_string()));
+        }
+    }
+
+    assert!(!cu_files.is_empty(), "{origin} listed no CU_PATH");
+    let template_include =
+        template_include.unwrap_or_else(|| panic!("{origin} listed no TILELANG_TEMPLATE_PATH"));
+    let cutlass_include =
+        cutlass_include.unwrap_or_else(|| panic!("{origin} listed no CUTLASS_INCLUDE_DIR"));
+    for cu_file in &cu_files {
+        assert!(
+            cu_file.exists(),
+            "{origin} lists a missing CUDA file: {}",
+            cu_file.display()
+        );
+    }
+
+    TileLangArtifacts {
+        cu_files,
+        template_include,
+        cutlass_include,
+        nvcc_flags,
+        launchers,
+        arch,
+        geometry,
+        smem,
+    }
+}
+
+/// Compare two C parameter lists ignoring how they were wrapped.
+fn same_parameters(left: &str, right: &str) -> bool {
+    let normalize = |text: &str| {
+        text.split(',')
+            .map(|part| part.split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect::<Vec<_>>()
+    };
+    normalize(left) == normalize(right)
+}
+
+/// The generated entry points have to be exactly the ones the stub tier
+/// declares, or the two tiers present different ABIs under one name.
+fn checked_launchers(family: &TileLangFamily, artifacts: &TileLangArtifacts) {
+    if artifacts.launchers.is_empty() {
+        return;
+    }
+    let expected: Vec<_> = family.launchers.iter().map(|(name, _)| *name).collect();
+    let got: Vec<_> = artifacts
+        .launchers
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    assert_eq!(
+        expected, got,
+        "the {} TileLang generator emits {got:?} where the stub tier declares {expected:?}",
+        family.label
+    );
+    for ((name, declared), (_, generated)) in family.launchers.iter().zip(&artifacts.launchers) {
+        assert!(
+            same_parameters(declared, generated),
+            "{}: the stub declares `{name}({declared})` where the generator \
+             emits `{name}({generated})`",
+            family.label
+        );
+    }
+}
+
+/// The manifest keys the crate turns into run-time refusals have to be there
+/// and parse. A directory generated before one of them exists would otherwise
+/// build, report its bodies as real, and refuse nothing.
+fn checked_manifest_fields(family: &TileLangFamily, artifacts: &TileLangArtifacts) {
+    for key in family.required_manifest {
+        let value = match *key {
+            "ARCH" => artifacts.arch.as_deref(),
+            "GEOMETRY" => artifacts.geometry.as_deref(),
+            "SMEM" => artifacts.smem.as_deref(),
+            other => panic!("{} names an unknown manifest key {other}", family.label),
+        };
+        let ok = match (*key, value) {
+            (_, None | Some("")) => false,
+            ("SMEM", Some(text)) => text.parse::<usize>().is_ok(),
+            ("GEOMETRY", Some(text)) => {
+                text.split(',').count() == 4
+                    && text.split(',').all(|f| f.trim().parse::<usize>().is_ok())
+            }
+            _ => true,
+        };
+        assert!(
+            ok,
+            "the {} TileLang artifacts state {key}={}, which the crate needs to refuse a \
+             device or checkpoint the bodies cannot serve; regenerate the directory with \
+             the current generator",
+            family.label,
+            value.unwrap_or("<missing>")
+        );
+    }
+}
+
+fn tilelang_pregen_artifacts(family: &TileLangFamily) -> Option<TileLangArtifacts> {
+    let var = format!("PEGAINFER_{}_TILELANG_PREGEN", family.label);
+    let dir = std::env::var(&var).ok()?;
+    let dir = PathBuf::from(dir.trim());
+    let manifest = dir.join("manifest.txt");
+    let text = fs::read_to_string(&manifest).unwrap_or_else(|err| {
+        panic!(
+            "{var}={} has no readable manifest.txt: {err}",
+            dir.display()
+        )
+    });
+    println!(
+        "cargo:warning=Using pre-generated {} TileLang CUDA from {}",
+        family.label,
+        dir.display()
+    );
+    println!("cargo:rerun-if-changed={}", manifest.display());
+    Some(parse_tilelang_manifest(
+        &text,
+        &format!("{var} manifest.txt"),
+        &dir,
+    ))
+}
+
+fn generate_tilelang_artifacts(
+    family: &TileLangFamily,
+    out_dir: &Path,
+    sm_targets: &[String],
+) -> Option<TileLangArtifacts> {
+    let label = family.label;
+    let python = match find_tilelang_python(family) {
+        Ok(python) => python,
+        Err(message) => {
+            println!("cargo:warning={label} TileLang generation unavailable: {message}");
+            return None;
+        }
+    };
+    let arch = tilelang_arch(sm_targets)?;
+    let target_sm = arch
+        .trim_start_matches("sm_")
+        .trim_end_matches(|c: char| !c.is_ascii_digit())
+        .parse::<u32>()
+        .unwrap_or(0);
+    if target_sm < family.min_sm {
+        println!(
+            "cargo:warning={label} TileLang generation needs SM{} or newer; this build targets {arch}, so its launchers are NOT_SUPPORTED stubs",
+            family.min_sm
+        );
+        return None;
+    }
+
+    let generator_path = workspace_root().join(family.generator);
+    assert!(
+        generator_path.exists(),
+        "{label} TileLang generator is missing: {}",
+        generator_path.display()
+    );
+
+    let artifact_dir = out_dir.join("tilelang").join(label.to_lowercase());
+    let output = time_phase(format!("tilelang-gen {}", label.to_lowercase()), || {
+        Command::new(&python)
+            .arg(&generator_path)
+            .arg("--out-dir")
+            .arg(&artifact_dir)
+            .arg("--arch")
+            .arg(&arch)
+            .output()
+            .unwrap_or_else(|err| panic!("failed to run the {label} TileLang generator: {err}"))
+    });
+    assert!(
+        output.status.success(),
+        "{label} TileLang generator failed. stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout).trim(),
+        String::from_utf8_lossy(&output.stderr).trim(),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if let Some(reason) = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("UNAVAILABLE="))
+    {
+        println!(
+            "cargo:warning={label} TileLang generation unavailable: {reason}; its launchers are NOT_SUPPORTED stubs"
+        );
+        return None;
+    }
+    let mut artifacts = parse_tilelang_manifest(
+        &stdout,
+        &format!("the {label} TileLang generator"),
+        &artifact_dir,
+    );
+    artifacts.arch.get_or_insert(arch.clone());
+    println!("cargo:warning=Generated {label} TileLang CUDA for {arch}");
+    println!("cargo:rerun-if-changed={}", generator_path.display());
+    for source in family.sources {
+        println!(
+            "cargo:rerun-if-changed={}",
+            workspace_root().join(source).display()
+        );
+    }
+    Some(artifacts)
+}
+
+/// Launchers that refuse every shape, for build hosts with neither TileLang
+/// nor a pre-generated directory. Keeps the family's feature linkable; any
+/// call fails fast with `cudaErrorNotSupported`.
+fn write_tilelang_stub(family: &TileLangFamily, out_dir: &Path) -> PathBuf {
+    let label = family.label;
+    let mut source = format!(
+        "// Generated by pegainfer-kernels/build.rs: no {label} TileLang artifacts.\n\
+         #include <cuda_runtime.h>\n"
+    );
+    for (name, params) in family.launchers {
+        writeln!(
+            source,
+            "extern \"C\" int {name}({params}, cudaStream_t) {{\n  \
+             return static_cast<int>(cudaErrorNotSupported);\n}}"
+        )
+        .expect("string write cannot fail");
+    }
+    let stub_path = out_dir.join(format!("{}_tilelang_stub.cu", label.to_lowercase()));
+    fs::write(&stub_path, source)
+        .unwrap_or_else(|err| panic!("failed to write the {label} TileLang stub: {err}"));
+    stub_path
+}
+
+fn tilelang_nvcc_tasks(
+    family: &TileLangFamily,
+    out_dir: &Path,
+    cuda_include: &Path,
+    arch_args: &[String],
+    sm_targets: &[String],
+    nvcc: &str,
+) -> Vec<NvccTask> {
+    let label = family.label;
+    for knob in ["PYTHON", "PREGEN", "JOBS"] {
+        println!("cargo:rerun-if-env-changed=PEGAINFER_{label}_TILELANG_{knob}");
+    }
+    // The interpreter search falls back to this one.
+    println!("cargo:rerun-if-env-changed=PEGAINFER_TILELANG_PYTHON");
+    // Which tier ran is a build-time fact with no other way across: the stub
+    // links under the same name, so a caller that needed to know would have
+    // to launch a kernel and read back an error code, after the weights are
+    // loaded. Declared unconditionally, set only when real bodies were built.
+    let cfg = family.cfg();
+    println!("cargo::rustc-check-cfg=cfg({cfg})");
+
+    let artifacts = tilelang_pregen_artifacts(family)
+        .or_else(|| generate_tilelang_artifacts(family, out_dir, sm_targets));
+    if let Some(artifacts) = artifacts.as_ref() {
+        checked_launchers(family, artifacts);
+        checked_manifest_fields(family, artifacts);
+    }
+
+    // Generated bodies need the arch they were lowered for; the stub is plain
+    // host code and rides the generic arch list.
+    let generated = artifacts.and_then(|artifacts| {
+        let arch = artifacts
+            .arch
+            .clone()
+            .or_else(|| tilelang_arch(sm_targets))
+            .unwrap_or_default();
+        let Some(gencode) = tilelang_gencode(&arch, nvcc) else {
+            println!(
+                "cargo:warning=nvcc cannot assemble {arch}, which the {label} TileLang bodies were lowered for; they compile as NOT_SUPPORTED stubs"
+            );
+            return None;
+        };
+        Some((artifacts, gencode))
+    });
+
+    let (cu_files, extra_args, tilelang_arch_args) = match generated {
+        Some((artifacts, gencode)) => {
+            println!("cargo::rustc-cfg={cfg}");
+            // One arch per generation, so a multi-SM build carries SASS for
+            // that one alone and a caller can refuse the other devices.
+            println!(
+                "cargo::rustc-env=PEGAINFER_{label}_TILELANG_ARCH={}",
+                artifacts.arch.clone().unwrap_or_default()
+            );
+            println!(
+                "cargo::rustc-env=PEGAINFER_{label}_TILELANG_GEOMETRY={}",
+                artifacts.geometry.clone().unwrap_or_default()
+            );
+            println!(
+                "cargo::rustc-env=PEGAINFER_{label}_TILELANG_SMEM={}",
+                artifacts.smem.clone().unwrap_or_default()
+            );
+            let mut extra = vec![
+                "-I".to_string(),
+                artifacts.template_include.to_string_lossy().to_string(),
+                "-I".to_string(),
+                artifacts.cutlass_include.to_string_lossy().to_string(),
+            ];
+            // The bodies are compiled the way the generator compiled them:
+            // a pass config that reaches nvcc's line changes the numbers,
+            // not just the code.
+            extra.extend(artifacts.nvcc_flags.iter().cloned());
+            (artifacts.cu_files, extra, gencode)
+        }
+        None => (
+            vec![write_tilelang_stub(family, out_dir)],
+            Vec::new(),
+            arch_args.to_vec(),
+        ),
+    };
+
+    cu_files
+        .into_iter()
+        .map(|cu_file| {
+            let stem = cu_file.file_stem().unwrap().to_str().unwrap();
+            let obj_file = out_dir.join(format!("{stem}_cuda.o"));
+            let mut args = vec![
+                "-c".to_string(),
+                cu_file.to_string_lossy().to_string(),
+                "-o".to_string(),
+                obj_file.to_string_lossy().to_string(),
+                "-O3".to_string(),
+                "-I".to_string(),
+                cuda_include.to_string_lossy().to_string(),
+            ];
+            args.extend(tilelang_arch_args.iter().cloned());
+            args.extend([
+                "--std=c++20".to_string(),
+                "--compiler-options".to_string(),
+                "-fPIC".to_string(),
+                // TileLang codegen trips unused-value and narrowing warnings
+                // that are noise here; 177 is "declared but never referenced".
+                "-w".to_string(),
+                "-Xcudafe".to_string(),
+                "--diag_suppress=177".to_string(),
+            ]);
+            args.extend(extra_args.iter().cloned());
+            NvccTask {
+                cu_file,
+                obj_file,
+                args,
+            }
+        })
+        .collect()
+}
+
+// ===========================================================================
+// tilelang: END
+// ===========================================================================
+
 fn main() {
     ensure_git_submodules_initialized(&workspace_root());
 
@@ -1270,11 +2206,15 @@ fn main() {
     let arch_args = nvcc_arch_args(&nvcc_sm_targets);
     let deepseek_v2_lite_enabled = cfg!(feature = "deepseek-v2-lite");
     let moe_enabled = cfg!(feature = "moe");
+    let gemma4_enabled = cfg!(feature = "gemma4");
     let glm52_enabled = cfg!(feature = "glm52");
     let kimi_k2_enabled = cfg!(feature = "kimi-k2");
+    // --- k3: DeepGEMM-only, no DeepEP/NCCL dependency ---
+    let k3_enabled = cfg!(feature = "k3");
     let qwen35_enabled = cfg!(feature = "qwen35");
     if glm52_enabled {
         generate_glm52_trtllm_fmha_cubins(&crate_root(), &out_dir);
+        build_glm52_cutedsl_fp8_dsl(&crate_root(), &out_dir, &cuda_include);
     }
     println!(
         "cargo:warning=Detected CUDA SM targets: {}",
@@ -1303,6 +2243,11 @@ fn main() {
     if glm52_enabled {
         require_glm52_submodules(&root);
     }
+    // --- k3 ---
+    if k3_enabled {
+        require_k3_submodules(&root);
+    }
+    // --- end k3 ---
     let csrc_dir = root.join("csrc");
     let mut csrc_files = Vec::new();
     collect_files_recursively(&csrc_dir, &mut csrc_files);
@@ -1321,12 +2266,26 @@ fn main() {
             if !glm52_enabled && file_name.starts_with("deepep_shim_glm52") {
                 return None;
             }
+            if !gemma4_enabled && is_gemma4_source(&csrc_dir, path) {
+                return None;
+            }
+            if !gemma4_enabled && !kimi_k2_enabled && is_marlin_source(&csrc_dir, path) {
+                return None;
+            }
             if !glm52_enabled && is_glm52_source(&csrc_dir, path) {
                 return None;
             }
             if !kimi_k2_enabled && is_kimi_k2_source(&csrc_dir, path) {
                 return None;
             }
+            if !qwen35_enabled && is_qwen35_source(&csrc_dir, path) {
+                return None;
+            }
+            // --- k3 ---
+            if !k3_enabled && is_k3_source(&csrc_dir, path) {
+                return None;
+            }
+            // --- end k3 ---
             if path.extension().and_then(|e| e.to_str()) == Some("cu")
                 && !replaced_cuda_files.contains(file_name)
             {
@@ -1412,6 +2371,105 @@ fn main() {
                 );
                 nvcc_args.extend(arch_args.clone());
             }
+        // --- k3 ---
+        } else if stem == "k3_deepgemm_fp8_fp4_grouped_sm100" {
+            if let Some(sm100f_args) = k3_sm100f_only_arch_args(&nvcc_sm_targets, &nvcc) {
+                nvcc_args.extend(sm100f_args);
+                nvcc_args.push("-DK3_DEEPGEMM_FP8_FP4_SM100F".to_string());
+            } else {
+                println!(
+                    "cargo:warning=No sm_100f target; K3 DeepGEMM {stem} kernels compile as NOT_SUPPORTED stubs"
+                );
+                nvcc_args.extend(arch_args.clone());
+            }
+        } else if stem == "k3_mega_moe_sm100"
+            || stem == "k3_mega_moe_sm100_wide224"
+            || stem == "k3_mega_moe_sm100_wide896"
+        {
+            if let Some(sm100f_args) = k3_sm100f_only_arch_args(&nvcc_sm_targets, &nvcc) {
+                nvcc_args.extend(sm100f_args);
+                nvcc_args.push("-DK3_MEGA_MOE_SM100F".to_string());
+            } else {
+                println!(
+                    "cargo:warning=No sm_100f target; K3 MegaMoE {stem} kernels compile as NOT_SUPPORTED stubs"
+                );
+                nvcc_args.extend(arch_args.clone());
+            }
+        } else if stem == "k3_flash_kda" {
+            if let Some(kda_args) = k3_flash_kda_arch_args(&nvcc_sm_targets, &nvcc) {
+                let flash_kda = root.join("third_party/flash-kda/csrc");
+                nvcc_args.extend(kda_args);
+                // Upstream setup.py flags (torch adds -std=c++17); fast_math
+                // is part of the configuration vLLM ships, keep it.
+                nvcc_args.extend(
+                    [
+                        "-DK3_FLASH_KDA_SM90A",
+                        "--std=c++17",
+                        "--expt-relaxed-constexpr",
+                        "--expt-extended-lambda",
+                        "--use_fast_math",
+                    ]
+                    .map(str::to_string),
+                );
+                nvcc_args.extend([
+                    "-I".to_string(),
+                    flash_kda.to_string_lossy().to_string(),
+                    "-I".to_string(),
+                    flash_kda.join("smxx").to_string_lossy().to_string(),
+                    "-I".to_string(),
+                    flashinfer.cutlass.to_string_lossy().to_string(),
+                ]);
+            } else {
+                println!(
+                    "cargo:warning=No accelerated SM target; K3 FlashKDA {stem} compiles as a NOT_SUPPORTED stub"
+                );
+                nvcc_args.extend(arch_args.clone());
+            }
+        } else if stem == "k3_flash_mla_prefill" {
+            // FlashMLA's SM100 dense FMHA forward rides in single-TU like the
+            // sparse decode shim; the gather/expand helpers in the same file
+            // compile either way.
+            if let Some(sm100f_args) = k3_sm100f_only_arch_args(&nvcc_sm_targets, &nvcc) {
+                let flashmla = root.join("third_party/FlashMLA/csrc");
+                nvcc_args.extend(sm100f_args);
+                nvcc_args.extend(
+                    [
+                        "-DK3_FLASH_MLA_SM100F",
+                        "--std=c++20",
+                        "--expt-relaxed-constexpr",
+                        "--expt-extended-lambda",
+                    ]
+                    .map(str::to_string),
+                );
+                nvcc_args.extend([
+                    "-I".to_string(),
+                    flashmla
+                        .join("sm100/prefill/dense")
+                        .to_string_lossy()
+                        .to_string(),
+                    "-I".to_string(),
+                    flashmla
+                        .join("cutlass/include")
+                        .to_string_lossy()
+                        .to_string(),
+                    "-I".to_string(),
+                    flashmla
+                        .join("cutlass/tools/util/include")
+                        .to_string_lossy()
+                        .to_string(),
+                    "-I".to_string(),
+                    flashmla
+                        .join("kerutils/include")
+                        .to_string_lossy()
+                        .to_string(),
+                ]);
+            } else {
+                println!(
+                    "cargo:warning=No sm_100f target; K3 FlashMLA prefill {stem} FMHA compiles as a NOT_SUPPORTED stub"
+                );
+                nvcc_args.extend(arch_args.clone());
+            }
+        // --- end k3 ---
         } else {
             nvcc_args.extend(arch_args.clone());
         }
@@ -1420,16 +2478,20 @@ fn main() {
         // Files that include FlashInfer headers (C++17, header-only)
         if stem == "paged_attention"
             || stem == "paged_attention_hd512"
+            || stem == "paged_attention_hd256"
+            || stem == "paged_attention_window_hd256"
             || stem == "flashinfer_norm"
             || stem == "flashinfer_sampling"
             || stem == "flashinfer_top1"
             || stem == "glm52_topk"
+            || stem == "local_kv_fp8"
         {
             for dir in &flashinfer.cccl {
                 nvcc_args.extend(["-I".to_string(), dir.to_string_lossy().to_string()]);
             }
             nvcc_args.extend([
                 "--std=c++17".to_string(),
+                "--expt-relaxed-constexpr".to_string(),
                 "-I".to_string(),
                 flashinfer.include.to_string_lossy().to_string(),
                 "-I".to_string(),
@@ -1442,7 +2504,7 @@ fn main() {
                 flashinfer.spdlog.to_string_lossy().to_string(),
                 "-I".to_string(),
                 csrc_dir
-                    .join("kimi_k2/vllm_marlin")
+                    .join("marlin/vllm_marlin")
                     .to_string_lossy()
                     .to_string(),
             ]);
@@ -1476,7 +2538,7 @@ fn main() {
             ]);
         }
 
-        if stem.starts_with("kimi_") {
+        if stem.starts_with("kimi_") || stem.starts_with("marlin_nvfp4") {
             for dir in &flashinfer.cccl {
                 nvcc_args.extend(["-I".to_string(), dir.to_string_lossy().to_string()]);
             }
@@ -1494,8 +2556,10 @@ fn main() {
                 "-I".to_string(),
                 flashinfer.spdlog.to_string_lossy().to_string(),
                 "-I".to_string(),
+                csrc_dir.join("marlin").to_string_lossy().to_string(),
+                "-I".to_string(),
                 csrc_dir
-                    .join("kimi_k2/vllm_marlin")
+                    .join("marlin/vllm_marlin")
                     .to_string_lossy()
                     .to_string(),
             ]);
@@ -1601,6 +2665,34 @@ fn main() {
             ]);
         } else if stem.starts_with("glm52_") {
             nvcc_args.extend(["--std=c++17".to_string()]);
+        // --- k3 ---
+        } else if is_k3_source(&csrc_dir, cu_file) {
+            // K3 FP8xFP4 masked grouped GEMM, AOT-instantiated from the
+            // vendored DeepGEMM device headers (torch-free via DG_NO_TORCH, no
+            // runtime JIT). Same flags/includes as the GLM5.2 DeepGEMM stems.
+            let deepgemm_root = root.join("third_party/DeepGEMM");
+            let deepgemm_csrc = deepgemm_root.join("csrc");
+            let deepgemm_include = deepgemm_root.join("deep_gemm/include");
+            let cutlass_include = deepgemm_root.join("third-party/cutlass/include");
+            let cutlass_util = deepgemm_root.join("third-party/cutlass/tools/util/include");
+            let fmt_include = deepgemm_root.join("third-party/fmt/include");
+            nvcc_args.extend([
+                "--std=c++20".to_string(),
+                "--expt-relaxed-constexpr".to_string(),
+                "--expt-extended-lambda".to_string(),
+                "-DDG_NO_TORCH".to_string(),
+                "-I".to_string(),
+                deepgemm_csrc.to_string_lossy().to_string(),
+                "-I".to_string(),
+                deepgemm_include.to_string_lossy().to_string(),
+                "-I".to_string(),
+                cutlass_include.to_string_lossy().to_string(),
+                "-I".to_string(),
+                cutlass_util.to_string_lossy().to_string(),
+                "-I".to_string(),
+                fmt_include.to_string_lossy().to_string(),
+            ]);
+            // --- end k3 ---
         }
 
         nvcc_tasks.push(NvccTask {
@@ -1626,6 +2718,57 @@ fn main() {
         );
     }
 
+    // tilelang: BEGIN
+    if cfg!(feature = "gemma4") {
+        nvcc_tasks.extend(tilelang_nvcc_tasks(
+            &GEMMA4_TILELANG,
+            &out_dir,
+            &cuda_include,
+            &arch_args,
+            &sm_targets,
+            &nvcc,
+        ));
+        println!("cargo:rerun-if-env-changed=PEGAINFER_GEMMA4_W4A16_SMS");
+        nvcc_tasks.extend(tilelang_nvcc_tasks(
+            &GEMMA4_W4A16_TILELANG,
+            &out_dir,
+            &cuda_include,
+            &arch_args,
+            &sm_targets,
+            &nvcc,
+        ));
+    } else {
+        println!(
+            "cargo:warning=Gemma 4 TileLang kernels disabled; enable the pegainfer-kernels `gemma4` feature to build them"
+        );
+    }
+    if cfg!(feature = "k3") {
+        nvcc_tasks.extend(tilelang_nvcc_tasks(
+            &K3_TILELANG,
+            &out_dir,
+            &cuda_include,
+            &arch_args,
+            &sm_targets,
+            &nvcc,
+        ));
+        // The vendored FlashKDA sources ride into csrc/k3/k3_flash_kda.cu by
+        // include; csrc rerun tracking does not see them.
+        for vendored in [
+            "third_party/flash-kda/csrc/fwd.h",
+            "third_party/flash-kda/csrc/smxx/utils.cuh",
+            "third_party/flash-kda/csrc/smxx/fwd_kernel1.cuh",
+            "third_party/flash-kda/csrc/smxx/fwd_kernel2.cuh",
+            "third_party/flash-kda/csrc/smxx/fwd_launch.cu",
+        ] {
+            println!("cargo:rerun-if-changed={}", root.join(vendored).display());
+        }
+    } else {
+        println!(
+            "cargo:warning=K3 TileLang kernels disabled; enable the pegainfer-kernels `k3` feature to build them"
+        );
+    }
+    // tilelang: END
+
     nvcc_tasks.sort_by_key(|task| nvcc_task_priority(&task.cu_file));
 
     let task_queue = Mutex::new(VecDeque::from(nvcc_tasks));
@@ -1645,11 +2788,14 @@ fn main() {
                         };
 
                         let status = time_phase(format!("nvcc {}", task.cu_file.display()), || {
-                            Command::new(&nvcc)
+                            nvcc_command(&nvcc)
                                 .args(&task.args)
                                 .status()
-                                .unwrap_or_else(|_| {
-                                    panic!("Failed to run nvcc for {}", task.cu_file.display())
+                                .unwrap_or_else(|err| {
+                                    panic!(
+                                        "Failed to run nvcc for {}: {err}",
+                                        task.cu_file.display()
+                                    )
                                 })
                         });
                         completed.push((task.cu_file, task.obj_file, status));
@@ -1672,6 +2818,10 @@ fn main() {
     });
     obj_files.sort();
 
+    // The optional kernel-lab .so (linked below) uses the same objects; the
+    // ar invocation consumes the vector.
+    let kernel_lab_objs = obj_files.clone();
+
     let cuda_lib = out_dir.join("libkernels_cuda.a");
     let _ = fs::remove_file(&cuda_lib);
     let mut ar_args = vec!["rcs".to_string(), cuda_lib.to_string_lossy().to_string()];
@@ -1689,6 +2839,15 @@ fn main() {
     });
 
     assert!(status.success(), "ar failed");
+
+    // Optional kernel-lab shared object for the Python bench harness
+    // (pegainfer-glm52/benches/kernel_lab): the exact production objects —
+    // same sources, same nvcc flags — linked as a dlopen-able .so. Skipped
+    // entirely unless PEGAINFER_KERNEL_LAB is set, so default builds run zero
+    // extra commands and zero extra link lines.
+    if std::env::var_os("PEGAINFER_KERNEL_LAB").is_some() {
+        link_kernel_lab_shared(&nvcc, &toolkit, &out_dir, &kernel_lab_objs);
+    }
 
     if qwen35_enabled {
         compile_triton_aot_kernels(&cuda_include, &out_dir, &sm_targets);

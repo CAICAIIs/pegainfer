@@ -30,7 +30,7 @@ use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::Resource;
 
 /// Set to an OTLP gRPC endpoint (e.g. `http://127.0.0.1:4317`) to enable tracing.
-pub const OTLP_ENDPOINT_ENV: &str = "PEGAINFER_TRACE_OTLP_ENDPOINT";
+const OTLP_ENDPOINT_ENV: &str = "PEGAINFER_TRACE_OTLP_ENDPOINT";
 
 /// `service.name` reported to the trace backend; how this process shows up in
 /// the Jaeger service dropdown.
@@ -96,7 +96,7 @@ pub fn init() {
         fastrace::set_reporter(reporter, fastrace::collector::Config::default());
         // Only now, with a reporter actually installed, do request paths start
         // building spans. Until this flips, `Span::root` is skipped entirely.
-        pegainfer_engine::tracing_state::set_enabled(true);
+        pegainfer_frontend::tracing_state::set_enabled(true);
         log::info!("request tracing enabled: exporting OTLP spans to {endpoint}");
     });
 }

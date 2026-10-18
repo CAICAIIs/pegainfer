@@ -119,6 +119,18 @@ pub fn gemm_rows_call<Out: AxisTag>(
         .attr("rows", rows.to_string())
 }
 
+/// In-place mask of the last `ids` rows of each logits column to -inf.
+pub fn suppress_logits_call<A: AxisTag>(
+    label: impl Into<String>,
+    rows: usize,
+    batch: usize,
+    ids: usize,
+) -> KernelCall {
+    KernelCall::new("suppress_logits_bf16", label)
+        .output("logits", hidden_batch::<A>(rows, batch))
+        .attr("ids", ids.to_string())
+}
+
 pub fn gemm_call<Out: AxisTag, In: AxisTag>(
     label: impl Into<String>,
     out_dim: usize,
@@ -227,6 +239,19 @@ pub fn silu_mul_fused_batch_call(
     KernelCall::new("silu_mul_fused_batch", label)
         .input("gate_up", hidden_batch::<Inter2>(2 * inter, batch))
         .output("out", hidden_batch::<Intermediate>(inter, batch))
+}
+
+pub fn split_qkv_call(
+    label: impl Into<String>,
+    q_dim: usize,
+    kv_dim: usize,
+    batch: usize,
+) -> KernelCall {
+    KernelCall::new("split_qkv", label)
+        .input("qkv", hidden_batch::<OutTotal>(q_dim + 2 * kv_dim, batch))
+        .output("q", hidden_batch::<QDim>(q_dim, batch))
+        .output("k", hidden_batch::<KvDim>(kv_dim, batch))
+        .output("v", hidden_batch::<KvDim>(kv_dim, batch))
 }
 
 pub fn all_reduce_hidden_call(label: impl Into<String>, hidden: usize, batch: usize) -> KernelCall {

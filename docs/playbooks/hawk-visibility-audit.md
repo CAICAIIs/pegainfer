@@ -22,26 +22,25 @@ curl --proto '=https' --tlsv1.2 -LsSf \
 
 ```sh
 RUSTC_BOOTSTRAP=1 \
-PEGAINFER_NCCL_ROOT=/data/opt/nccl-2.30.4 \
-PEGAINFER_TRITON_PYTHON=.venv/bin/python \
+PEGAINFER_NCCL_ROOT="${NCCL_ROOT:?set NCCL_ROOT to the NCCL installation root}" \
+PEGAINFER_TRITON_PYTHON="$PWD/.venv/bin/python" \
 cargo +1.97.1 hawk check
 ```
 
 All three environment variables are required:
 
 - `RUSTC_BOOTSTRAP=1` — the repo pins nightly (`generic_const_exprs`); hawk only accepts the 1.97.1 stable compiler, so feature gates must be unlocked.
-- `PEGAINFER_NCCL_ROOT` — under all-features, `pegainfer-kernels/moe` builds the DeepEP shim, which needs NCCL >= 2.30.4.
-- `PEGAINFER_TRITON_PYTHON` — the `qwen35` build-time Triton AOT codegen (build.rs also falls back to `.venv/bin/python` on its own).
+- `PEGAINFER_NCCL_ROOT` — under all-features, `pegainfer-kernels/moe` builds the DeepEP shim, which needs NCCL >= 2.30.4. Set `NCCL_ROOT` to that installation before running the command.
+- `PEGAINFER_TRITON_PYTHON` — the `qwen35` build-time Triton AOT codegen. Keep this absolute: the build script runs with the kernel crate as its working directory, so a workspace-relative `.venv/bin/python` does not resolve there.
 
 Expected runtime: ~20 minutes cold (Triton AOT + Marlin nvcc dominate); artifacts are cached under `/tmp/cargo-hawk-target/<workspace>-<hash>`, so reruns take a few minutes.
 
 ## Reading results / gotchas
 
-- `hawk.toml` declares `pegainfer` + `bench_serving` as production targets and a single all-features profile. **Plain bins are not part of the non-production surface** — APIs used only by an undeclared bin get misreported as dead, so add a `[[production]]` entry whenever a new shipped bin appears.
+- `hawk.toml` declares the `pegainfer` bin as the production target and a single all-features profile. **Plain bins are not part of the non-production surface** — APIs used only by an undeclared bin get misreported as dead, so add a `[[production]]` entry whenever a new shipped bin appears.
 - kvbm-logical is a fork of upstream dynamo: whether to act on its findings (~1/3 of the 2026-07 baseline) depends on how much API divergence from upstream is acceptable. Do not batch-process it.
 - `#[macro_export]` macros escape module-visibility reachability: hawk flagged `pegainfer-kernels`' `pub mod forward_pass` as dead, but the `typed_pipeline!` macro it defines is exported crate-wide and used by kimi-k2. Verify macro exports before deleting a flagged module.
-- `pegainfer-engine` is an external boundary: the excluded `pegainfer-dynamo-backend` workspace consumes it by path (e.g. `EngineHandle::load_watch`/`take_kv_events`). hawk cannot see that workspace — cross-check engine findings against `pegainfer-dynamo-*/src` before acting.
-- `--fix` applies visibility reductions mechanically (via `cargo fix`) but only works with a single feature profile. Run it with `--exclude-crate kvbm_logical --exclude-crate pegainfer_engine` here (fork + dynamo boundaries).
+- `--fix` applies visibility reductions mechanically (via `cargo fix`) but only works with a single feature profile. Run it with `--exclude-crate kvbm_logical` here (upstream fork boundary). (The old `pegainfer_engine` exclusion is gone with the crate — the engine contract now lives in `pegainfer-frontend`, fully inside the workspace.)
 - hawk's all-features, all-target compilation doubles as a CI blind-spot detector: the first run here surfaced the three feature-gated compile errors fixed in #741.
 
 ## `--fix` fallout patterns (learned landing #745)

@@ -28,12 +28,13 @@ use anyhow::ensure;
 use cudarc::driver::CudaSlice;
 use cudarc::driver::DevicePtr;
 use pegainfer_core::cuda_graph::CudaGraphState;
+use pegainfer_core::rope::RopeTableSpec;
+use pegainfer_core::rope::precompute_rope;
 use pegainfer_core::weight_loader::deserialize_shards;
 use pegainfer_core::weight_loader::load_shard_info;
 use pegainfer_core::weight_loader::load_tensor_1d;
 use pegainfer_core::weight_loader::load_tensor_2d;
 use pegainfer_core::weight_loader::mmap_shards;
-use pegainfer_core::weight_loader::precompute_rope;
 use pegainfer_kernels::ops::add_batch_into;
 use pegainfer_kernels::ops::copy_hidden_token_range_into;
 use pegainfer_kernels::ops::dflash_qk_norm_rope_into;
@@ -206,16 +207,6 @@ fn validate_config(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn ensure_matrix(m: &DeviceMatrix, name: &str, rows: usize, cols: usize) -> Result<()> {
-    ensure!(
-        m.rows == rows && m.cols == cols,
-        "dspark tensor {name} is [{}, {}], expected [{rows}, {cols}]",
-        m.rows,
-        m.cols
-    );
-    Ok(())
-}
-
 impl Glm52DsparkModel {
     pub(crate) fn load(ctx: &DeviceContext, path: &Path, max_model_len: usize) -> Result<Self> {
         validate_config(path)?;
@@ -235,22 +226,25 @@ impl Glm52DsparkModel {
                 &shards,
                 &weight_map,
                 &format!("{p}.self_attn.q_proj.weight"),
+                DSPARK_QKV_DIM,
+                GLM52_HIDDEN,
             )?;
             let k = load_tensor_2d(
                 ctx,
                 &shards,
                 &weight_map,
                 &format!("{p}.self_attn.k_proj.weight"),
+                DSPARK_QKV_DIM,
+                GLM52_HIDDEN,
             )?;
             let v = load_tensor_2d(
                 ctx,
                 &shards,
                 &weight_map,
                 &format!("{p}.self_attn.v_proj.weight"),
+                DSPARK_QKV_DIM,
+                GLM52_HIDDEN,
             )?;
-            ensure_matrix(&q, "q_proj", DSPARK_QKV_DIM, GLM52_HIDDEN)?;
-            ensure_matrix(&k, "k_proj", DSPARK_QKV_DIM, GLM52_HIDDEN)?;
-            ensure_matrix(&v, "v_proj", DSPARK_QKV_DIM, GLM52_HIDDEN)?;
             let qkv = DeviceMatrix::vstack(ctx, &[&q, &k, &v])?;
             drop((q, k, v));
             let gate = load_tensor_2d(
@@ -258,15 +252,17 @@ impl Glm52DsparkModel {
                 &shards,
                 &weight_map,
                 &format!("{p}.mlp.gate_proj.weight"),
+                DSPARK_INTER,
+                GLM52_HIDDEN,
             )?;
             let up = load_tensor_2d(
                 ctx,
                 &shards,
                 &weight_map,
                 &format!("{p}.mlp.up_proj.weight"),
+                DSPARK_INTER,
+                GLM52_HIDDEN,
             )?;
-            ensure_matrix(&gate, "gate_proj", DSPARK_INTER, GLM52_HIDDEN)?;
-            ensure_matrix(&up, "up_proj", DSPARK_INTER, GLM52_HIDDEN)?;
             let gate_up = DeviceMatrix::vstack(ctx, &[&gate, &up])?;
             drop((gate, up));
             let o_proj = load_tensor_2d(
@@ -274,15 +270,17 @@ impl Glm52DsparkModel {
                 &shards,
                 &weight_map,
                 &format!("{p}.self_attn.o_proj.weight"),
+                GLM52_HIDDEN,
+                DSPARK_QKV_DIM,
             )?;
-            ensure_matrix(&o_proj, "o_proj", GLM52_HIDDEN, DSPARK_QKV_DIM)?;
             let down = load_tensor_2d(
                 ctx,
                 &shards,
                 &weight_map,
                 &format!("{p}.mlp.down_proj.weight"),
+                GLM52_HIDDEN,
+                DSPARK_INTER,
             )?;
-            ensure_matrix(&down, "down_proj", GLM52_HIDDEN, DSPARK_INTER)?;
             layers.push(DsparkLayer {
                 input_ln: load_tensor_1d(
                     ctx,
@@ -315,18 +313,43 @@ impl Glm52DsparkModel {
             });
         }
 
-        let fc = load_tensor_2d(ctx, &shards, &weight_map, "fc.weight")?;
-        ensure_matrix(&fc, "fc", GLM52_HIDDEN, GLM52_DSPARK_CONTEXT_DIM)?;
-        let markov_w1 = load_tensor_2d(ctx, &shards, &weight_map, "markov_head.markov_w1.weight")?;
-        let markov_w2 = load_tensor_2d(ctx, &shards, &weight_map, "markov_head.markov_w2.weight")?;
-        ensure_matrix(&markov_w1, "markov_w1", GLM52_VOCAB, DSPARK_MARKOV_RANK)?;
-        ensure_matrix(&markov_w2, "markov_w2", GLM52_VOCAB, DSPARK_MARKOV_RANK)?;
+        let fc = load_tensor_2d(
+            ctx,
+            &shards,
+            &weight_map,
+            "fc.weight",
+            GLM52_HIDDEN,
+            GLM52_DSPARK_CONTEXT_DIM,
+        )?;
+        let markov_w1 = load_tensor_2d(
+            ctx,
+            &shards,
+            &weight_map,
+            "markov_head.markov_w1.weight",
+            GLM52_VOCAB,
+            DSPARK_MARKOV_RANK,
+        )?;
+        let markov_w2 = load_tensor_2d(
+            ctx,
+            &shards,
+            &weight_map,
+            "markov_head.markov_w2.weight",
+            GLM52_VOCAB,
+            DSPARK_MARKOV_RANK,
+        )?;
 
         // embed_tokens / lm_head / confidence_head are intentionally not
         // loaded: the first two are byte-identical to the target's, the
         // confidence head is Phase 2.
-        let (cos_cache, sin_cache) =
-            precompute_rope(ctx, DSPARK_HEAD_DIM, cache_len, DSPARK_ROPE_THETA)?;
+        let (cos_cache, sin_cache) = precompute_rope(
+            ctx,
+            &RopeTableSpec {
+                rotary_dim: DSPARK_HEAD_DIM,
+                frequency_dim: DSPARK_HEAD_DIM,
+                max_seq_len: cache_len,
+                theta: DSPARK_ROPE_THETA,
+            },
+        )?;
         ctx.sync()?;
 
         Ok(Self {

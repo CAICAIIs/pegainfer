@@ -10,13 +10,15 @@ use half::bf16;
 use pegainfer_core::kv_pool::KvLayout;
 use pegainfer_core::ops;
 use pegainfer_core::ops::PrefillPagedPlan;
-use pegainfer_core::sampler::SamplingParams;
 use pegainfer_core::tensor::HiddenStates;
+use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_kernels::ops::NumericPolicy;
 use pegainfer_kernels::ops::numeric_policy;
 use pegainfer_kv_cache::KvBuffer;
 use pegainfer_kv_cache::KvView;
 
+use super::batch_decode::DecodeGraphPlan;
+use super::batch_decode::DecodeGraphUse;
 use super::batch_decode_buffers::BatchDecodeBuffers;
 use super::config::PREFILL_ATTENTION_CTA_TILE_Q;
 use super::prefill::PrefillBuffers;
@@ -50,7 +52,8 @@ impl Qwen3Model {
             kv_buffer.layout().num_kv_heads,
             kv_buffer.layout().head_dim,
             kv_buffer.layout().page_size,
-        );
+        )
+        .expect("kv layout geometry");
         let page_size = layout.page_size;
         let num_prefill_reqs = 1;
         let prefill_pages = max_prefill_tokens.div_ceil(page_size);
@@ -61,17 +64,41 @@ impl Qwen3Model {
         let decode_tokens = vec![0u32; profile_decode_rows];
         let decode_adapters = vec![None; profile_decode_rows];
 
-        // Force the decode CUDA-Graph/buffer path before the unified peak
-        // sample. The synthetic views are short, but the pre-allocated decode
-        // arena and graph state are the same serving objects used later. Skip it
-        // for uncompiled-group models: the unified sample below bounds their KV.
-        // Eager under TP: ranks profile uncoordinated, so an in-profile capture
-        // would hit the same deadlock the sweep avoids (see `PrecapturePhase`).
+        // Exercise decode before the unified peak sample. PerToken first captures
+        // every retained graph into this one buffer set so their cumulative
+        // residency remains live under the later eager/unified probes. Skip this
+        // for uncompiled-group models; the unified sample below bounds their KV.
+        // TP stays eager because its ranks profile independently.
         if self.config.decode_group_is_compiled() {
+            let graph_plan = DecodeGraphPlan::new(decode_bufs.policy_at_construction);
+            if self.enable_cuda_graph
+                && self.tensor_parallel.world_size == 1
+                && graph_plan.requires_cumulative_profile()
+            {
+                for graph_rows in graph_plan.retained_buckets() {
+                    anyhow::ensure!(
+                        graph_rows <= profile_decode_rows,
+                        "retained decode Graph bucket {graph_rows} exceeds profile row capacity \
+                        {profile_decode_rows}"
+                    );
+                    self.batch_decode(
+                        &decode_tokens[..graph_rows],
+                        &decode_views[..graph_rows],
+                        &decode_adapters[..graph_rows],
+                        kv_buffer.buffer(),
+                        &layout,
+                        decode_bufs,
+                        DecodeGraphUse::Serve,
+                    )?;
+                    self.ctx.sync()?;
+                    mark_peak()?;
+                }
+            }
+
             let graph_use = if self.tensor_parallel.world_size > 1 {
-                crate::batch_decode::DecodeGraphUse::Eager
+                DecodeGraphUse::Eager
             } else {
-                crate::batch_decode::DecodeGraphUse::Serve
+                DecodeGraphUse::Serve
             };
             self.batch_decode(
                 &decode_tokens,
@@ -132,7 +159,7 @@ impl Qwen3Model {
 
     /// Unified step: prefill + decode in one forward pass.
     ///
-    /// Returns batched last-token logits `[vocab_size, n_prefill + n_decode]`:
+    /// Returns batched last-token logits `[logits_rows, n_prefill + n_decode]`:
     /// prefill request columns first (in request order), then decode columns.
     pub(crate) fn unified_step(
         &self,

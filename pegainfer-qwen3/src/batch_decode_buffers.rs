@@ -4,6 +4,7 @@ use anyhow::Result;
 use cudarc::driver::CudaSlice;
 use log::info;
 use pegainfer_core::cuda_graph::CudaGraphState;
+use pegainfer_core::ops::build_split_kv_csr;
 use pegainfer_core::tensor::DeviceContext;
 use pegainfer_core::tensor::HiddenStates;
 use pegainfer_kernels::ops::NumericPolicy;
@@ -14,9 +15,10 @@ use pegainfer_kv_cache::KvView;
 use crate::split_kv::SplitKvConfig;
 
 /// Bucket sizes for CUDA Graph capture. Actual batch is padded to the nearest bucket.
-/// Based on vLLM's cudagraph capture list up to 256; graphs are captured lazily per
-/// bucket, and activation buffers are shared (sized once at the largest bucket), so
-/// extra buckets cost capture time on first hit, not memory.
+/// Based on vLLM's CUDA Graph capture list up to 256. Activation buffers are shared
+/// at the largest size, but every captured `(bucket, attention path)` owns an
+/// independently resident graph executable. The diagnostic PerToken policy
+/// therefore retains graphs only through bucket 32.
 ///
 /// Buckets 8/16 are viable only because decode GEMMs at N <= GEMM_LT_MAX_N run
 /// tuned cublasLt algos: cuBLAS's GemmEx heuristic skips split-K for batch in
@@ -26,6 +28,7 @@ pub(crate) const BATCH_BUCKETS: &[usize] = &[
     1, 2, 4, 8, 16, 20, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152,
     160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256,
 ];
+
 const DECODE_ATTENTION_PATH_COUNT: usize = 2;
 // Split-KV decode attention: the non-partitioned kernel issues one CTA per
 // (request x kv-head), starving SMs at small batch. The path is therefore
@@ -35,8 +38,8 @@ const DECODE_ATTENTION_PATH_COUNT: usize = 2;
 // already saturate the SMs (bs<=8 wins big, ~bs16 even, bs32 within ~1%).
 // 64-token chunks measured fastest on RTX 5090 (128/256 are 1-7% slower, 32
 // past the merge-overhead knee). Measurements: docs/models/qwen3/decode-attention.md.
-pub(crate) const SPLIT_KV_CHUNK_TOKENS: usize = 64;
-pub(crate) const SPLIT_KV_TUNED_MAX_CHUNKS: usize = 64; // Tuned adaptive-split count cap
+pub const SPLIT_KV_CHUNK_TOKENS: usize = 64;
+pub const SPLIT_KV_TUNED_MAX_CHUNKS: usize = 64; // Tuned adaptive-split count cap
 const SPLIT_KV_MAX_CHUNKS_PER_REQUEST: usize = 256; // split-KV workspace/guard bound
 const SPLIT_KV_MAX_BATCH_SIZE: usize = 32;
 
@@ -65,7 +68,7 @@ pub(crate) fn decode_projection_pin_shapes(
     q_dim: usize,
     kv_dim: usize,
     intermediate: usize,
-    vocab: usize,
+    logits_rows: usize,
 ) -> [(usize, usize); 6] {
     [
         (q_dim, hidden),
@@ -73,7 +76,7 @@ pub(crate) fn decode_projection_pin_shapes(
         (hidden, q_dim),
         (intermediate, hidden),
         (hidden, intermediate),
-        (vocab, hidden),
+        (logits_rows, hidden),
     ]
 }
 
@@ -84,9 +87,9 @@ pub(crate) fn warmup_decode_projection_pins(
     q_dim: usize,
     kv_dim: usize,
     intermediate: usize,
-    vocab: usize,
+    logits_rows: usize,
 ) -> Result<()> {
-    for (m, k) in decode_projection_pin_shapes(hidden, q_dim, kv_dim, intermediate, vocab) {
+    for (m, k) in decode_projection_pin_shapes(hidden, q_dim, kv_dim, intermediate, logits_rows) {
         let config = gemm_lt_pin_warmup(m, k)?;
         info!(
             "Qwen3 GEMM pin: m={m}, k={k}, splitk={}, reduction_scheme={}",
@@ -104,68 +107,6 @@ fn active_split_kv_config() -> SplitKvConfig {
 /// Per-request chunk cap (split-KV padded grid width + guard) for the active policy; Tuned stays at 64.
 fn max_split_chunks() -> usize {
     active_split_kv_config().max_chunks_per_request
-}
-
-/// Host-side CSR for the split-KV decode kernel: padded request/chunk indices, the
-/// per-slot validity mask, and the per-request chunk offsets.
-pub struct SplitKvCsr {
-    pub request_indices: Vec<i32>,
-    pub kv_tile_indices: Vec<i32>,
-    pub block_valid_mask: Vec<u8>,
-    pub o_indptr: Vec<i32>,
-}
-
-/// Build the split-KV CSR for `kv_lens` at a fixed `chunk_size`, padded to `padded_bs * cap` slots.
-/// Errors if a request needs more than `cap` chunks.
-pub fn build_split_kv_csr(
-    chunk_size: usize,
-    cap: usize,
-    kv_lens: &[usize],
-    padded_bs: usize,
-) -> Result<SplitKvCsr> {
-    anyhow::ensure!(chunk_size > 0, "split-KV chunk_size must be > 0");
-    anyhow::ensure!(cap > 0, "split-KV cap must be > 0");
-    anyhow::ensure!(
-        kv_lens.len() <= padded_bs,
-        "kv_lens length {} exceeds padded batch {padded_bs}",
-        kv_lens.len()
-    );
-    let padded_slots = padded_bs * cap;
-    let mut request_indices = Vec::with_capacity(padded_slots);
-    let mut kv_tile_indices = Vec::with_capacity(padded_slots);
-    let mut block_valid_mask = Vec::with_capacity(padded_slots);
-    let mut o_indptr = Vec::with_capacity(padded_bs + 1);
-    o_indptr.push(0);
-
-    for (request_idx, &kv_len) in kv_lens.iter().enumerate() {
-        let chunks = kv_len.div_ceil(chunk_size).max(1);
-        anyhow::ensure!(
-            chunks <= cap,
-            "split-KV chunk count {chunks} exceeds bound {cap} \
-             (kv_len={kv_len}, chunk_size={chunk_size}); context limit misconfigured"
-        );
-        for chunk_idx in 0..chunks {
-            request_indices.push(request_idx as i32);
-            kv_tile_indices.push(chunk_idx as i32);
-            block_valid_mask.push(1);
-        }
-        o_indptr.push(request_indices.len() as i32);
-    }
-    for _ in kv_lens.len()..padded_bs {
-        o_indptr.push(request_indices.len() as i32);
-    }
-    while request_indices.len() < padded_slots {
-        request_indices.push(0);
-        kv_tile_indices.push(0);
-        block_valid_mask.push(0);
-    }
-
-    Ok(SplitKvCsr {
-        request_indices,
-        kv_tile_indices,
-        block_valid_mask,
-        o_indptr,
-    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -211,7 +152,7 @@ pub(crate) struct BatchDecodeBuffers {
     pub(crate) attn_out: HiddenStates,
     pub(crate) attn_proj: HiddenStates,
     /// Fused QKV projection output [q_dim + 2*kv_dim, bs]
-    qkv_out: HiddenStates,
+    pub(crate) qkv_out: Option<HiddenStates>,
     /// Split MLP gate projection output [intermediate_size, bs].
     pub(crate) gate_out: HiddenStates,
     /// Split MLP up projection output [intermediate_size, bs].
@@ -278,12 +219,13 @@ impl BatchDecodeBuffers {
         q_dim: usize,
         kv_dim: usize,
         intermediate_size: usize,
-        vocab_size: usize,
+        logits_rows: usize,
         max_batch_size: usize,
         page_size: usize,
         padding_page_id: i32,
         num_qo_heads: usize,
         max_context_tokens: usize,
+        fused_decode_qkv: bool,
     ) -> Result<Self> {
         let bs = max_batch_size;
         // One construction-time policy snapshot sizes the split-KV workspace and is recorded in
@@ -320,13 +262,15 @@ impl BatchDecodeBuffers {
             v: HiddenStates::zeros(ctx, kv_dim, bs)?,
             attn_out: HiddenStates::zeros(ctx, q_dim, bs)?,
             attn_proj: HiddenStates::zeros(ctx, hidden_dim, bs)?,
-            qkv_out: HiddenStates::zeros(ctx, q_dim + 2 * kv_dim, bs)?,
+            qkv_out: fused_decode_qkv
+                .then(|| HiddenStates::zeros(ctx, q_dim + 2 * kv_dim, bs))
+                .transpose()?,
             gate_out: HiddenStates::zeros(ctx, intermediate_size, bs)?,
             up_out: HiddenStates::zeros(ctx, intermediate_size, bs)?,
             mlp_act: HiddenStates::zeros(ctx, intermediate_size, bs)?,
             mlp_out: HiddenStates::zeros(ctx, hidden_dim, bs)?,
             hidden: HiddenStates::zeros(ctx, hidden_dim, bs)?,
-            logits: HiddenStates::zeros(ctx, vocab_size, bs)?,
+            logits: HiddenStates::zeros(ctx, logits_rows, bs)?,
             token_ids_d: ctx.stream.alloc_zeros(bs)?,
             positions_d: ctx.stream.alloc_zeros(bs)?,
             lora_token_slots_d: ctx.stream.alloc_zeros(bs)?,
@@ -370,7 +314,9 @@ impl BatchDecodeBuffers {
         self.v.seq_len = bs;
         self.attn_out.seq_len = bs;
         self.attn_proj.seq_len = bs;
-        self.qkv_out.seq_len = bs;
+        if let Some(qkv_out) = &mut self.qkv_out {
+            qkv_out.seq_len = bs;
+        }
         self.gate_out.seq_len = bs;
         self.up_out.seq_len = bs;
         self.mlp_act.seq_len = bs;
@@ -550,6 +496,7 @@ mod tests {
             0,
             1,
             max_context_tokens,
+            false,
         )
         .expect("buffer alloc");
 

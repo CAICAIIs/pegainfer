@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 mod backend;
 mod generation;
 mod graph_probe;
@@ -12,6 +10,8 @@ mod routing;
 mod tests;
 mod types;
 
+use std::sync::Mutex;
+
 use backend::EpBackendRuntime;
 pub use types::BatchedGenerationResult;
 pub use types::DecodeGraphReadinessReport;
@@ -23,9 +23,9 @@ use crate::model::DriverRankModel;
 use crate::model::ExpertRankModel;
 
 pub struct DeepSeekV2LiteEp2Generator {
-    model_path: PathBuf,
     device_ordinals: Vec<usize>,
     config: Config,
+    device_routed_moe: Option<Mutex<moe::DeviceRoutedMoeRuntime>>,
     rank0: DriverRankModel,
     rank1: ExpertRankModel,
     backend: EpBackendRuntime,

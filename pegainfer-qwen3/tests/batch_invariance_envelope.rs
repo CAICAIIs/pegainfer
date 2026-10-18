@@ -1,7 +1,7 @@
 //! Production-envelope guard: under Pin the {M,K} algo is pinned and reused for every N; this
 //! verifies it serves the swept Qwen3-4B envelope — Unified at N=101/201/513/1024/1279 and
 //! pure-Decode at bs=256 (exactly these points, not all N) — a shape it can't serve would bail.
-use pegainfer_core::sampler::SamplingParams;
+use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_kernels::ops::NumericPolicy;
 use pegainfer_kernels::ops::pin_served;
 use pegainfer_kernels::ops::reset_numeric_policy_counters;
@@ -36,10 +36,9 @@ fn prefill_first(ex: &mut Qwen3Executor, id: RequestId, prompt: &[u32]) -> u32 {
             prompt.to_vec(),
             64,
             SamplingParams::default(),
-            0,
-            false,
+            None,
+            None,
         )],
-        echo: false,
         sample_seed: 0,
     })
     .expect("prefill")
@@ -79,10 +78,15 @@ fn pin_serves_production_envelope_without_fallback() {
                     synth(pf, 100 + i as u64),
                     64,
                     SamplingParams::default(),
-                    0,
-                    false,
+                    None,
+                    None,
                 )],
-                decode_requests: &[DecodeStepItem::new(id_d, t, SamplingParams::default(), 64)],
+                decode_requests: &[DecodeStepItem::new(
+                    id_d,
+                    t,
+                    SamplingParams::default(),
+                    Some(64),
+                )],
                 sample_seed: 0,
             })
             .unwrap_or_else(|e| panic!("Unified N={} bailed: {e}", pf + 1));
@@ -100,7 +104,7 @@ fn pin_serves_production_envelope_without_fallback() {
         .collect();
     let items: Vec<DecodeStepItem> = dec
         .iter()
-        .map(|&(id, tok)| DecodeStepItem::new(id, tok, SamplingParams::default(), 0))
+        .map(|&(id, tok)| DecodeStepItem::new(id, tok, SamplingParams::default(), None))
         .collect();
     reset_numeric_policy_counters();
     let _ = ex
@@ -124,7 +128,7 @@ fn pin_serves_production_envelope_without_fallback() {
     let id_big = RequestId::new(40000);
     let decode_items: Vec<DecodeStepItem> = decoders
         .iter()
-        .map(|&(id, tok)| DecodeStepItem::new(id, tok, SamplingParams::default(), 0))
+        .map(|&(id, tok)| DecodeStepItem::new(id, tok, SamplingParams::default(), None))
         .collect();
     reset_numeric_policy_counters();
     let _ = ex
@@ -134,8 +138,8 @@ fn pin_serves_production_envelope_without_fallback() {
                 synth(1024, 7),
                 64,
                 SamplingParams::default(),
-                0,
-                false,
+                None,
+                None,
             )],
             decode_requests: &decode_items,
             sample_seed: 0,

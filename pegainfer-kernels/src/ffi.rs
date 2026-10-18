@@ -8,21 +8,39 @@ pub type Half = u16;
 mod deepep;
 #[cfg(feature = "deepseek-v2-lite")]
 mod deepseek_v2_lite;
+#[cfg(feature = "gemma4")]
+mod gemma4;
+#[cfg(feature = "gemma4")]
+mod gemma4_tilelang;
 #[cfg(feature = "glm52")]
 mod glm52;
+#[cfg(feature = "k3")]
+mod k3;
+#[cfg(feature = "k3")]
+mod k3_tilelang;
 #[cfg(feature = "kimi-k2")]
 mod kimi;
 mod lora;
+#[cfg(feature = "qwen35")]
 mod qwen35;
 mod shared;
 #[cfg(feature = "moe")]
 pub use deepep::*;
 #[cfg(feature = "deepseek-v2-lite")]
 pub use deepseek_v2_lite::*;
+#[cfg(feature = "gemma4")]
+pub use gemma4::*;
+#[cfg(feature = "gemma4")]
+pub use gemma4_tilelang::*;
 #[cfg(feature = "glm52")]
 pub use glm52::*;
+#[cfg(feature = "k3")]
+pub use k3::*;
+#[cfg(feature = "k3")]
+pub use k3_tilelang::*;
 #[cfg(feature = "kimi-k2")]
 pub use kimi::*;
 pub use lora::*;
+#[cfg(feature = "qwen35")]
 pub use qwen35::*;
 pub use shared::*;

@@ -1,108 +1,238 @@
-mod config;
+//! The pegainfer server binary: pure dispatch over the compiled-in
+//! [`ModelLine`]s. Every model-specific flag, rule, and option type lives in
+//! its model crate; this file only wires detection, CLI validation, and the
+//! serve path selection together.
 
 use std::time::Instant;
 
 use anyhow::Context;
-use clap::CommandFactory;
 use clap::FromArgMatches;
-use config::Args;
 use log::info;
-use pegainfer::logging;
-use pegainfer::server_engine::ModelType;
-use pegainfer::server_engine::detect_model_type;
-use pegainfer_core::engine::EngineHandle;
-#[cfg(feature = "gemma4")]
-use pegainfer_core::engine::EngineLoadOptions;
-#[cfg(feature = "qwen3")]
-use pegainfer_qwen3::Qwen3LaunchOptions;
-#[cfg(feature = "qwen3")]
-use pegainfer_qwen3::Qwen3LoraOptions;
-#[cfg(feature = "qwen3")]
-use pegainfer_qwen3::Qwen3OffloadOptions;
+use pegainfer_core::logging;
+use pegainfer_frontend::engine::LaunchedEngine;
+use pegainfer_frontend::model_line::DetectError;
+use pegainfer_frontend::model_line::LaunchContext;
+use pegainfer_frontend::model_line::ModelLine;
+use pegainfer_frontend::model_line::ModelLineRegistry;
+use pegainfer_frontend::model_line::SharedArgs;
+use pegainfer_frontend::model_line::provided_args;
 
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+fn model_lines() -> Vec<&'static dyn ModelLine> {
+    vec![
+        #[cfg(feature = "deepseek-v2-lite")]
+        &pegainfer_deepseek_v2_lite::model_line::MODEL_LINE,
+        #[cfg(feature = "gemma4")]
+        &pegainfer_gemma4::model_line::MODEL_LINE,
+        #[cfg(feature = "glm52")]
+        &pegainfer_glm52::model_line::MODEL_LINE,
+        #[cfg(feature = "k3")]
+        &pegainfer_k3::model_line::MODEL_LINE,
+        #[cfg(feature = "kimi-k2")]
+        &pegainfer_kimi_k2::model_line::MODEL_LINE,
+        #[cfg(feature = "qwen3")]
+        &pegainfer_qwen3::model_line::MODEL_LINE,
+        #[cfg(feature = "qwen35")]
+        &pegainfer_qwen35::model_line::MODEL_LINE,
+        #[cfg(feature = "qwen4")]
+        &pegainfer_qwen4::model_line::MODEL_LINE,
+    ]
+}
+
+/// One row of [`families`]: a line's feature, the identities its `probe` claims,
+/// and whether that line is compiled into this binary.
+struct Family {
+    feature: &'static str,
+    model_types: &'static [&'static str],
+    text_model_types: &'static [&'static str],
+    compiled: bool,
+}
+
+/// Every line the server can be built with, and the identities its `probe`
+/// claims.
+///
+/// This is **a second source of truth by necessity**: the hint exists for the
+/// case where the line — and therefore its `probe` — is compiled out, so these
+/// strings cannot be read from the line crate. The `qwen4` row is bound to that
+/// crate's own `MODEL_TYPE`/`TEXT_MODEL_TYPE` by a test under the feature
+/// (`qwen4_hint_identity_matches_the_line_crate`).
+///
+/// The hint is **identity-only**: it cannot run a compiled-out probe, so it also
+/// fires for a variant that probe would refuse — a quantized sibling (its
+/// `quantization_config`), tied embeddings, a YaRN rope. It names the feature to
+/// rebuild with; it is not a promise that the checkpoint is servable.
+fn families() -> [Family; 8] {
+    [
+        Family {
+            feature: "deepseek-v2-lite",
+            model_types: &["deepseek_v2"],
+            text_model_types: &[],
+            compiled: cfg!(feature = "deepseek-v2-lite"),
+        },
+        Family {
+            feature: "gemma4",
+            model_types: &["gemma4", "gemma4_unified"],
+            text_model_types: &["gemma4_text", "gemma4_unified_text"],
+            compiled: cfg!(feature = "gemma4"),
+        },
+        Family {
+            feature: "glm52",
+            model_types: &["glm_moe_dsa"],
+            text_model_types: &[],
+            compiled: cfg!(feature = "glm52"),
+        },
+        Family {
+            feature: "k3",
+            model_types: &["kimi_k3"],
+            text_model_types: &["kimi_linear"],
+            compiled: cfg!(feature = "k3"),
+        },
+        Family {
+            feature: "kimi-k2",
+            model_types: &["kimi_k25", "kimi_k2"],
+            text_model_types: &["kimi_k2"],
+            compiled: cfg!(feature = "kimi-k2"),
+        },
+        Family {
+            feature: "qwen3",
+            model_types: &["qwen3"],
+            text_model_types: &[],
+            compiled: cfg!(feature = "qwen3"),
+        },
+        Family {
+            feature: "qwen35",
+            model_types: &["qwen3_5"],
+            text_model_types: &["qwen3_5_text"],
+            compiled: cfg!(feature = "qwen35"),
+        },
+        Family {
+            feature: "qwen4",
+            model_types: &["qwen4_exp"],
+            text_model_types: &["qwen4_exp_text"],
+            compiled: cfg!(feature = "qwen4"),
+        },
+    ]
+}
+
+/// When no compiled-in line claims the config but the identity belongs to a
+/// known family, tell the user which feature to rebuild with. See [`families`]
+/// for the identity table and its limits.
+fn feature_gate_hint(config: &serde_json::Value) -> Option<String> {
+    let model_type = config
+        .get("model_type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let text_model_type = config
+        .get("text_config")
+        .and_then(|text| text.get("model_type"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    families().iter().find_map(|family| {
+        (!family.compiled
+            && (family.model_types.contains(&model_type)
+                || family.text_model_types.contains(&text_model_type)))
+        .then(|| {
+            format!(
+                "this looks like a {} model; rebuild pegainfer-server with --features {}",
+                family.feature, family.feature
+            )
+        })
+    })
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     logging::init_default();
     pegainfer_core::tracing::init();
 
-    let matches = Args::command().get_matches();
-    let args =
-        Args::from_arg_matches(&matches).map_err(|e| anyhow::anyhow!("invalid CLI args: {e}"))?;
-    let provided = config::provided_args(&matches);
+    let registry = ModelLineRegistry::new(model_lines());
+    let cmd = registry.build_command(
+        clap::Command::new("pegainfer")
+            .version(env!("CARGO_PKG_VERSION"))
+            .about("PegaInfer GPU inference server"),
+    );
+    let matches = cmd.clone().get_matches();
+    let shared = SharedArgs::from_arg_matches(&matches)
+        .map_err(|error| anyhow::anyhow!("invalid CLI args: {error}"))?;
+    let provided = provided_args(&matches, &cmd);
 
-    let model_type = detect_model_type(&args.model_path).with_context(|| {
-        format!(
-            "failed to detect model type from {}",
-            args.model_path.display()
-        )
+    let config_path = shared.model_path.join("config.json");
+    let content = std::fs::read_to_string(&config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    let config: serde_json::Value = serde_json::from_str(&content)
+        .with_context(|| format!("failed to parse {}", config_path.display()))?;
+
+    let line = registry.detect(&config).map_err(|error| {
+        if matches!(error, DetectError::NoMatch { .. }) {
+            if let Some(hint) = feature_gate_hint(&config) {
+                return anyhow::anyhow!("{error}; {hint}");
+            }
+        }
+        anyhow::Error::from(error)
     })?;
-    args.validate(model_type, &provided)?;
 
-    info!("=== pegainfer - {} (GPU) ===", model_type);
+    registry.validate_provided(line, &provided, &cmd)?;
+    shared.validate(&provided)?;
+    let ctx = LaunchContext {
+        model_path: &shared.model_path,
+        config: &config,
+        shared: &shared,
+        matches: &matches,
+    };
+    line.validate(&ctx, &provided)?;
+    let plan = line.serve_plan(&ctx)?;
+
+    info!("=== pegainfer - {} (GPU) ===", line.name());
     info!("Loading engine...");
     let start = Instant::now();
     info!(
         "Runtime: model_path={}, user-set flags {provided:?}",
-        args.model_path.display(),
+        shared.model_path.display(),
     );
+
+    let model_path = shared.model_path.clone();
+    let served_model_name = shared.served_model_name.clone();
+    let tool_call_parser = plan.resolve_tool_call_parser(shared.tool_call_parser.clone());
+    let port = shared.port;
 
     // Engine load (weights → GPU) runs on a blocking thread so the HTTP
     // frontend (tokenizer, chat templates) loads concurrently. The frontend
     // binds only after the engine registers, so readiness is unchanged.
-    let model_path = args.model_path.clone();
-    let served_model_name = args.served_model_name.clone();
-    let lora_modules = args.lora_modules.clone();
-    let enable_lora = args.enable_lora;
-    let port = args.port;
-    let frontend_engine_count = 1;
-    #[cfg(feature = "glm52")]
-    let glm52_prefill_only = model_type == ModelType::Glm52 && args.glm52_prefill_only;
-    #[cfg(not(feature = "glm52"))]
-    let glm52_prefill_only = false;
-    #[cfg(feature = "glm52")]
-    let frontend_engine_count = if model_type == ModelType::Glm52 {
-        let moe_topo = args
-            .moe_topo
-            .parse::<pegainfer_glm52::Glm52MoeTopo>()
-            .context("--moe-topo")?;
-        match &args.glm52_ranks {
-            // A partial fleet hosts only its own ranks; a mirrored topology
-            // always collapses to one logical rank.
-            Some(spec) if !moe_topo.uses_tensor_replicated_moe() => {
-                pegainfer_glm52::parse_rank_range(spec)
-                    .context("--glm52-ranks")?
-                    .len()
-            }
-            _ => moe_topo.logical_rank_count(),
-        }
-    } else {
-        frontend_engine_count
-    };
-    let engine_load = tokio::task::spawn_blocking(move || -> anyhow::Result<EngineHandle> {
-        load_engine(&args, model_type)
+    let engine_load = tokio::task::spawn_blocking(move || -> anyhow::Result<LaunchedEngine> {
+        let ctx = LaunchContext {
+            model_path: &shared.model_path,
+            config: &config,
+            shared: &shared,
+            matches: &matches,
+        };
+        line.launch(&ctx)
+            .with_context(|| format!("failed to start {} engine", line.name()))
     });
 
-    let serve_result = if enable_lora {
-        // LoRA routes need the engine handle when the router is built, so this
-        // path stays sequential.
-        let handle = engine_load
+    let serve_result = if let Some(lora_modules) = plan.lora_modules {
+        // LoRA routes need the engine's control plane when the router is
+        // built, so this path stays sequential.
+        let launched = engine_load
             .await
             .context("engine loader thread panicked")??;
+        let LaunchedEngine::Stepped(engine) = launched else {
+            anyhow::bail!("LoRA serving requires a step-driven engine");
+        };
         info!("Engine loaded: elapsed_ms={}", start.elapsed().as_millis());
         let max_model_len =
-            pegainfer::vllm_frontend::load_max_model_len(&model_path).unwrap_or(4096);
-        pegainfer::vllm_frontend::serve_model_with_lora_routes(
-            handle,
+            pegainfer_frontend::vllm::load_max_model_len(&model_path).unwrap_or(4096);
+        pegainfer_frontend::vllm::serve_model_with_lora_routes(
+            engine,
             model_path.to_string_lossy().into_owned(),
             served_model_name.into_iter().collect(),
+            tool_call_parser,
             lora_modules,
             port,
             max_model_len,
-            pegainfer::vllm_frontend::shutdown_token_from_ctrl_c(),
+            pegainfer_frontend::vllm::shutdown_token_from_ctrl_c(),
         )
         .await
     } else {
@@ -117,29 +247,31 @@ async fn main() -> anyhow::Result<()> {
                 // The blocking load can't be cancelled, so SIGINT keeps its
                 // default kill behavior until the engine is up; only then
                 // switch to graceful shutdown.
-                pegainfer::vllm_frontend::cancel_token_on_ctrl_c(&shutdown);
+                pegainfer_frontend::vllm::cancel_token_on_ctrl_c(&shutdown);
                 anyhow::Ok(handle)
             }
         };
-        if glm52_prefill_only {
-            pegainfer::vllm_frontend::serve_prefill_only_with_engine_count(
+        if plan.prefill_only {
+            pegainfer_frontend::vllm::serve_prefill_only_with_engine_count(
                 engine,
                 &model_path,
                 served_model_name.into_iter().collect(),
+                tool_call_parser.clone(),
                 port,
                 None,
-                frontend_engine_count,
+                plan.scheduler_partition_count,
                 shutdown,
             )
             .await
         } else {
-            pegainfer::vllm_frontend::serve_with_engine_count(
+            pegainfer_frontend::vllm::serve_with_engine_count(
                 engine,
                 &model_path,
                 served_model_name.into_iter().collect(),
+                tool_call_parser,
                 port,
                 None,
-                frontend_engine_count,
+                plan.scheduler_partition_count,
                 shutdown,
             )
             .await
@@ -156,197 +288,51 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-// Pure dispatch: each model crate owns its own launch policy (topology
-// defaults, capability constraints, cross-arg validation). The server only
-// picks the crate by detected model type and forwards the relevant CLI knobs.
-fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandle> {
-    let handle = match model_type {
-        #[cfg(feature = "deepseek-v2-lite")]
-        ModelType::DeepSeekV2Lite => {
-            pegainfer_deepseek_v2_lite::launch(&args.model_path, args.cuda_graph)
-                .context("failed to start DeepSeek V2 Lite engine")?
-        }
-        #[cfg(feature = "gemma4")]
-        ModelType::Gemma4 => {
-            pegainfer_gemma4::start_engine(&args.model_path, EngineLoadOptions::default())
-                .context("failed to start Gemma 4 engine")?
-        }
-        #[cfg(feature = "glm52")]
-        ModelType::Glm52 => {
-            let moe_topo: pegainfer_glm52::Glm52MoeTopo =
-                args.moe_topo.parse().context("--moe-topo")?;
-            let drafter = if args.glm52_native_mtp {
-                pegainfer_glm52::Glm52Drafter::NativeMtp
-            } else if let Some(path) = &args.dflash_draft_model_path {
-                pegainfer_glm52::Glm52Drafter::Dspark(path.clone())
-            } else {
-                pegainfer_glm52::Glm52Drafter::None
-            };
-            pegainfer_glm52::launch(
-                &args.model_path,
-                pegainfer_glm52::Glm52LaunchOptions {
-                    tp_size: args.tp_size,
-                    dp_size: args.dp_size.unwrap_or_else(|| moe_topo.default_dp_size()),
-                    drafter,
-                    max_model_len: args.max_model_len,
-                    prefill_only: args.glm52_prefill_only.then_some(
-                        pegainfer_glm52::Glm52PrefillOnlyOptions {
-                            chunk_size: args.glm52_prefill_chunk_size,
-                        },
-                    ),
-                    no_prefix_cache: args.no_prefix_cache,
-                    kv_offload: args
-                        .kv_offload
-                        .then(|| pegainfer_glm52::Glm52KvOffloadOptions {
-                            pinned_pool_bytes: (args.kv_offload_host_gib * f64::from(1u32 << 30))
-                                as usize,
-                            use_hugepages: args.kv_offload_hugepages,
-                            p2p: match (
-                                args.kv_p2p_metaserver_addr.clone(),
-                                args.kv_p2p_advertise_addr.clone(),
-                            ) {
-                                (Some(metaserver_addr), Some(advertise_addr)) => {
-                                    Some(pegainfer_glm52::Glm52P2pOptions {
-                                        metaserver_addr,
-                                        advertise_addr,
-                                        rdma_nics: args.kv_p2p_nics.clone(),
-                                    })
-                                }
-                                _ => None,
-                            },
-                        }),
-                    moe_topo,
-                    weight_staging: args.glm52_weight_staging,
-                    dump_graph_png: args.dump_graph_png.clone(),
-                    ranks: args
-                        .glm52_ranks
-                        .as_deref()
-                        .map(pegainfer_glm52::parse_rank_range)
-                        .transpose()
-                        .context("--glm52-ranks")?,
-                    rendezvous: args.glm52_rendezvous.clone(),
-                },
-            )
-            .context("failed to start GLM5.2 engine")?
-        }
-        #[cfg(feature = "kimi-k2")]
-        ModelType::KimiK2 => pegainfer_kimi_k2::launch(
-            &args.model_path,
-            pegainfer_kimi_k2::KimiLaunchOptions {
-                tp_size: args.tp_size,
-                dp_size: args.dp_size.unwrap_or(8),
-                ep_backend: args.ep_backend.into(),
-                cuda_graph: args.cuda_graph,
-            },
-        )
-        .context("failed to start Kimi-K2.6 text engine")?,
-        #[cfg(feature = "qwen3")]
-        ModelType::Qwen3 => {
-            let offload = if args.kv_offload {
-                let bytes = (args.kv_offload_host_gib * f64::from(1u32 << 30)) as usize;
-                let mut offload = Qwen3OffloadOptions::enabled(bytes);
-                offload.use_hugepages = args.kv_offload_hugepages;
-                if let (Some(metaserver_addr), Some(advertise_addr)) = (
-                    args.kv_p2p_metaserver_addr.clone(),
-                    args.kv_p2p_advertise_addr.clone(),
-                ) {
-                    offload = offload.with_p2p(pegainfer_qwen3::Qwen3P2pOptions {
-                        metaserver_addr,
-                        advertise_addr,
-                        rdma_nics: args.kv_p2p_nics.clone(),
-                        flush_on_finish: args.kv_p2p_flush_on_finish,
-                    });
-                }
-                if let Some(seed) = args.kv_pd_vllm_seed.clone() {
-                    offload = offload.with_vllm_compat(pegainfer_qwen3::Qwen3VllmCompatOptions {
-                        python_hash_seed: seed,
-                        namespace: args
-                            .kv_pd_vllm_namespace
-                            .clone()
-                            .expect("clap requires kv_pd_vllm_namespace"),
-                        miss_wait: std::time::Duration::from_millis(args.kv_pd_miss_wait_ms),
-                    });
-                }
-                offload
-            } else {
-                Qwen3OffloadOptions::disabled()
-            };
-            let lora = args.enable_lora.then_some(Qwen3LoraOptions {
-                max_loras: args.max_loras,
-                max_lora_rank: args.max_lora_rank,
-            });
-            let kv_cache_memory_margin_bytes = args
-                .kv_cache_memory_margin_mib
-                .checked_mul(1 << 20)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "--kv-cache-memory-margin-mib is too large: {}",
-                        args.kv_cache_memory_margin_mib
-                    )
-                })?;
-            let dflash_draft_model_path = match args.dflash_draft_model_path.clone() {
-                Some(path) => {
-                    anyhow::ensure!(
-                        !args.enable_lora,
-                        "--dflash-draft-model-path is not supported with --enable-lora"
-                    );
-                    anyhow::ensure!(
-                        !args.kv_offload,
-                        "--dflash-draft-model-path is not supported with --kv-offload"
-                    );
-                    anyhow::ensure!(
-                        args.tp_size == 1,
-                        "--dflash-draft-model-path currently requires --tp-size=1"
-                    );
-                    Some(path)
-                }
-                None => None,
-            };
-            pegainfer_qwen3::launch(
-                &args.model_path,
-                Qwen3LaunchOptions {
-                    device_ordinal: args.device_ordinal,
-                    tp_size: args.tp_size,
-                    cuda_graph: args.cuda_graph,
-                    dump_graph_png: args.dump_graph_png.clone(),
-                    offload,
-                    no_prefix_cache: args.no_prefix_cache,
-                    max_prefill_tokens: args
-                        .max_prefill_tokens
-                        .unwrap_or(pegainfer_qwen3::DEFAULT_MAX_PREFILL_TOKENS),
-                    memory: pegainfer_qwen3::Qwen3MemoryOptions::new(
-                        args.gpu_memory_utilization,
-                        kv_cache_memory_margin_bytes,
-                        args.kv_page_size,
-                    )
-                    .validate()?,
-                    lora,
-                    decode_overlap: args.decode_overlap.resolve(args.decode_sm_pct),
-                    batch_invariant: args.batch_invariant,
-                    dflash_draft_model_path,
-                    // KV block events are a Dynamo-backend concern; the plain
-                    // server never publishes them.
-                    enable_kv_events: false,
-                },
-            )
-            .context("failed to start Qwen3 engine")?
-        }
-        #[cfg(feature = "qwen35")]
-        ModelType::Qwen35 => pegainfer_qwen35::launch_with_options_and_policy(
-            &args.model_path,
-            pegainfer_qwen35::Qwen35LaunchOptions {
-                device_ordinal: args.device_ordinal,
-                tp_size: args.tp_size,
-                cuda_graph: args.cuda_graph,
-                max_batch: args.max_batch.unwrap_or(pegainfer_qwen35::MAX_DECODE_BATCH),
-                max_prefill_tokens: args
-                    .max_prefill_tokens
-                    .unwrap_or(pegainfer_qwen35::DEFAULT_MAX_PREFILL_TOKENS),
-            },
-            args.qwen35_scheduler_policy.resolve(),
-        )
-        .context("failed to start Qwen3.5 engine")?,
-    };
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    Ok(handle)
+    #[cfg(not(feature = "glm52"))]
+    #[test]
+    fn hint_names_the_feature_for_a_known_but_uncompiled_family() {
+        let config = serde_json::json!({"model_type": "glm_moe_dsa"});
+        let hint = feature_gate_hint(&config).expect("glm52 identity should hint");
+        assert!(hint.contains("--features glm52"), "{hint}");
+    }
+
+    #[cfg(not(feature = "gemma4"))]
+    #[test]
+    fn hint_matches_text_config_identities() {
+        let config = serde_json::json!({"text_config": {"model_type": "gemma4_unified_text"}});
+        let hint = feature_gate_hint(&config).expect("gemma4 text identity should hint");
+        assert!(hint.contains("--features gemma4"), "{hint}");
+    }
+
+    #[cfg(feature = "qwen3")]
+    #[test]
+    fn hint_is_silent_for_a_compiled_family() {
+        let config = serde_json::json!({"model_type": "qwen3"});
+        assert!(feature_gate_hint(&config).is_none());
+    }
+
+    #[test]
+    fn hint_is_silent_for_an_unknown_family() {
+        let config = serde_json::json!({"model_type": "frobnicate_lm"});
+        assert!(feature_gate_hint(&config).is_none());
+    }
+
+    /// Binds the qwen4 row of [`families`] to the line crate's own constants, so
+    /// changing one side without the other fails here.
+    #[cfg(feature = "qwen4")]
+    #[test]
+    fn qwen4_hint_identity_matches_the_line_crate() {
+        use pegainfer_qwen4::MODEL_TYPE;
+        use pegainfer_qwen4::TEXT_MODEL_TYPE;
+        let family = families()
+            .into_iter()
+            .find(|family| family.feature == "qwen4")
+            .expect("the qwen4 family is always listed");
+        assert_eq!(family.model_types, [MODEL_TYPE].as_slice());
+        assert_eq!(family.text_model_types, [TEXT_MODEL_TYPE].as_slice());
+    }
 }

@@ -8,8 +8,9 @@
 //!   PEGAINFER_TEST_MODEL_PATH=<Qwen3-4B-base> cargo test --release \
 //!     -p pegainfer-qwen3 --test batch_invariance_decode_gemm_graph -- --nocapture
 
-use pegainfer_core::sampler::SamplingParams;
+use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_kernels::ops::NumericPolicy;
+use pegainfer_kernels::ops::per_token_served;
 use pegainfer_kernels::ops::pin_served;
 use pegainfer_kernels::ops::reset_numeric_policy_counters;
 use pegainfer_kernels::ops::set_numeric_policy;
@@ -53,8 +54,8 @@ fn pitem(id: RequestId, prompt: Vec<u32>) -> PrefillStepItem {
         prompt,
         MAX_OUTPUT_TOKENS,
         SamplingParams::default(),
-        LOGPROBS,
-        false,
+        Some(LOGPROBS),
+        None,
     )
 }
 
@@ -75,7 +76,6 @@ fn a_first_and_decode(ex: &mut Qwen3Executor, n_requests: usize) -> (u32, Vec<(u
         .execute_prefill(PrefillPlan {
             sample_seed: 0,
             requests: &pitems,
-            echo: false,
         })
         .expect("prefill");
     let a_first = pr.requests[0].first_token;
@@ -83,7 +83,12 @@ fn a_first_and_decode(ex: &mut Qwen3Executor, n_requests: usize) -> (u32, Vec<(u
         .iter()
         .zip(&pr.requests)
         .map(|((id, _), req)| {
-            DecodeStepItem::new(*id, req.first_token, SamplingParams::default(), LOGPROBS)
+            DecodeStepItem::new(
+                *id,
+                req.first_token,
+                SamplingParams::default(),
+                Some(LOGPROBS),
+            )
         })
         .collect();
     let dr = ex
@@ -104,8 +109,7 @@ fn a_first_and_decode(ex: &mut Qwen3Executor, n_requests: usize) -> (u32, Vec<(u
     (a_first, topk)
 }
 
-/// One fresh executor with `policy` active before first decode (graph captured under it).
-fn run_policy(policy: NumericPolicy, model_path: &str) -> Vec<(bool, bool, u64)> {
+fn run_policy(policy: NumericPolicy, model_path: &str) -> (Vec<(bool, bool, u64)>, Qwen3Executor) {
     set_numeric_policy(policy);
     let mut ex = Qwen3Executor::from_runtime(model_path, true, &[0]).expect("build executor");
     ex.set_prefix_cache_enabled(false);
@@ -121,7 +125,84 @@ fn run_policy(policy: NumericPolicy, model_path: &str) -> Vec<(bool, bool, u64)>
         // launch_gemm_pin is never called → served is structurally 0 (N/A).
         out.push((ft_eq, tk_eq, served));
     }
-    out
+    (out, ex)
+}
+
+fn decode_batch(ex: &mut Qwen3Executor, ids: &[RequestId], tokens: &[u32]) -> Vec<u32> {
+    let ditems: Vec<DecodeStepItem> = ids
+        .iter()
+        .zip(tokens.iter().copied())
+        .map(|(id, token)| DecodeStepItem::new(*id, token, SamplingParams::default(), None))
+        .collect();
+
+    ex.execute_decode(DecodePlan {
+        sample_seed: 0,
+        requests: &ditems,
+    })
+    .expect("decode for graph-mode probe")
+    .requests
+    .into_iter()
+    .map(|request| request.token)
+    .collect()
+}
+
+/// A graph replay does not invoke the GEMM closure again.
+/// An eager decode invokes the PerToken GEMM path on every step.
+fn per_token_counter_probe(ex: &mut Qwen3Executor, n_requests: usize) -> (u64, u64) {
+    let batch: Vec<(RequestId, Vec<u32>)> = (0..n_requests)
+        .map(|i| (RequestId::new(10_000 + i as u64), short_prompt(i as u32)))
+        .collect();
+
+    let pitems: Vec<PrefillStepItem> = batch.iter().map(|(id, p)| pitem(*id, p.clone())).collect();
+
+    let prefill = ex
+        .execute_prefill(PrefillPlan {
+            sample_seed: 0,
+            requests: &pitems,
+        })
+        .expect("prefill for graph-mode probe");
+
+    let ids: Vec<RequestId> = batch.iter().map(|(id, _)| *id).collect();
+
+    let mut tokens: Vec<u32> = prefill
+        .requests
+        .iter()
+        .map(|request| request.first_token)
+        .collect();
+
+    // Clear the counters from the prefill phase and observe only the next two decode steps.
+    reset_numeric_policy_counters();
+
+    tokens = decode_batch(ex, &ids, &tokens);
+    let after_first = per_token_served();
+
+    let _ = decode_batch(ex, &ids, &tokens);
+    let after_second = per_token_served();
+
+    for id in ids {
+        ex.drop_request(id).expect("drop graph-mode probe request");
+    }
+
+    (after_first, after_second)
+}
+
+/// Check graph replay at bucket 32 and eager execution at bucket 40
+fn assert_pertoken_graph_cap_behavior(ex: &mut Qwen3Executor) {
+    let (graph_first, graph_second) = per_token_counter_probe(ex, 32);
+    assert!(graph_first > 0, "PerToken graph probe served no GEMM calls");
+    assert_eq!(
+        graph_second, graph_first,
+        "PerToken bucket 32 ran the GEMM closure again; expected graph replay"
+    );
+
+    let (eager_first, eager_second) = per_token_counter_probe(ex, 33);
+
+    assert!(eager_first > 0, "PerToken eager probe served no GEMM calls");
+    assert!(
+        eager_second > eager_first,
+        "PerToken batch 33 did not execute eager GEMMs twice: \
+        first={eager_first}, second={eager_second}"
+    );
 }
 
 #[test]
@@ -129,9 +210,17 @@ fn batch_invariance_decode_gemm_graph() {
     let Some(model_path) = model_path_or_skip() else {
         return;
     };
-    let baseline = run_policy(NumericPolicy::Tuned, &model_path);
-    let pin = run_policy(NumericPolicy::Pin, &model_path);
-    let pertoken = run_policy(NumericPolicy::PerToken, &model_path);
+    let baseline = {
+        let (result, executor) = run_policy(NumericPolicy::Tuned, &model_path);
+        drop(executor);
+        result
+    };
+    let pin = {
+        let (result, executor) = run_policy(NumericPolicy::Pin, &model_path);
+        drop(executor);
+        result
+    };
+    let (pertoken, mut pertoken_executor) = run_policy(NumericPolicy::PerToken, &model_path);
 
     // Prefill must be identical for A in every batch/policy, else the decode comparison is
     // prefill-contaminated.
@@ -179,4 +268,6 @@ fn batch_invariance_decode_gemm_graph() {
             PAIRS[i].0.trim()
         );
     }
+
+    assert_pertoken_graph_cap_behavior(&mut pertoken_executor);
 }

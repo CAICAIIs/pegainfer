@@ -8,38 +8,21 @@
 
 use std::path::Path;
 
-use pegainfer_core::engine::EngineHandle;
-use pegainfer_core::engine::EngineLoadOptions;
-use pegainfer_core::engine::FinishReason;
-use pegainfer_core::engine::GenerateRequest;
-use pegainfer_core::engine::TokenEvent;
-use pegainfer_core::engine::TokenSink;
-use pegainfer_core::sampler::SamplingParams;
+use pegainfer_frontend::engine::EngineLoadOptions;
+use pegainfer_frontend::engine::FinishReason;
+use pegainfer_frontend::engine::Terminal;
+use pegainfer_frontend::sampler::SamplingParams;
 
 mod common;
 
-const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3.5-4B");
+use common::EngineHarness;
+
 const CHUNK_BUDGET: usize = 16;
 const BASELINE_PREFILL_BUDGET: usize = 1 << 20;
 const MAX_BATCH: usize = 2;
 const GENERATED_TOKENS: usize = 8;
 
-fn model_path_or_skip() -> Option<String> {
-    match std::env::var("PEGAINFER_TEST_MODEL_PATH") {
-        Ok(path) => Some(path),
-        Err(_) if Path::new(MODEL_PATH).join("config.json").exists() => {
-            Some(MODEL_PATH.to_string())
-        }
-        Err(_) => {
-            eprintln!(
-                "skipping qwen35 chunked_prefill: {MODEL_PATH}/config.json is missing; set PEGAINFER_TEST_MODEL_PATH to run it"
-            );
-            None
-        }
-    }
-}
-
-fn start_engine(model_path: &str, max_prefill_tokens: usize) -> EngineHandle {
+fn start_engine(model_path: &str, max_prefill_tokens: usize) -> EngineHarness {
     pegainfer_qwen35::start_engine(
         Path::new(model_path),
         EngineLoadOptions {
@@ -51,51 +34,44 @@ fn start_engine(model_path: &str, max_prefill_tokens: usize) -> EngineHandle {
         MAX_BATCH,
         max_prefill_tokens,
     )
+    .map(EngineHarness::new)
     .expect("failed to start Qwen3.5 engine")
 }
 
-fn generate(handle: &EngineHandle, prompt_tokens: Vec<u32>) -> (Vec<u32>, FinishReason) {
-    let (token_tx, mut rx) = TokenSink::standalone();
-    handle
-        .submit(GenerateRequest {
-            trace_parent: None,
-            request_id: None,
-            queued_at_unix_s: None,
-            data_parallel_rank: None,
-            prompt_tokens,
-            params: SamplingParams {
-                ignore_eos: true,
-                ..SamplingParams::default()
-            },
-            max_tokens: GENERATED_TOKENS,
-            lora_adapter: None,
-            kv_transfer_params: None,
-            token_tx,
-            logprobs: 0,
-            echo: false,
-        })
-        .expect("submit failed");
-
+fn generate(handle: &mut EngineHarness, prompt_tokens: Vec<u32>) -> (Vec<u32>, FinishReason) {
+    let control = handle.submit(common::request(
+        prompt_tokens,
+        SamplingParams {
+            ignore_eos: true,
+            ..SamplingParams::default()
+        },
+        GENERATED_TOKENS,
+    ));
     let mut tokens = Vec::new();
     loop {
-        match rx.blocking_recv().map(|(_, event)| event) {
-            Some(TokenEvent::Token { id, .. }) => tokens.push(id),
-            Some(
-                TokenEvent::Scheduled { .. }
-                | TokenEvent::PromptTokens { .. }
-                | TokenEvent::KvTransfer { .. },
-            ) => {}
-            Some(TokenEvent::Finished { finish_reason, .. }) => return (tokens, finish_reason),
-            Some(TokenEvent::Error { message, .. }) => panic!("generation failed: {message}"),
-            Some(TokenEvent::Rejected { message, .. }) => panic!("generation rejected: {message}"),
-            None => panic!("scheduler channel closed without Finished"),
+        let update = handle.next(control.id());
+        tokens.extend(update.tokens);
+        if let Some(terminal) = update.terminal {
+            match terminal {
+                Terminal::Finished {
+                    reason,
+                    completion_tokens,
+                    ..
+                } => {
+                    assert_eq!(completion_tokens, GENERATED_TOKENS);
+                    return (tokens, reason);
+                }
+                terminal => panic!("generation did not finish: {terminal:?}"),
+            }
         }
     }
 }
 
 #[test]
 fn chunked_prefill_matches_unchunked_prefill_for_resumed_paged_kv() {
-    let Some(model_path) = model_path_or_skip() else {
+    let Some(model_path) = common::model_path_or_skip(
+        "chunked_prefill_matches_unchunked_prefill_for_resumed_paged_kv",
+    ) else {
         return;
     };
     let tokenizer = common::load_tokenizer(&model_path);
@@ -116,8 +92,8 @@ fn chunked_prefill_matches_unchunked_prefill_for_resumed_paged_kv() {
     );
 
     let (baseline_tokens, baseline_finish) = {
-        let handle = start_engine(&model_path, BASELINE_PREFILL_BUDGET);
-        generate(&handle, prompt_tokens.clone())
+        let mut handle = start_engine(&model_path, BASELINE_PREFILL_BUDGET);
+        generate(&mut handle, prompt_tokens.clone())
     };
     assert_eq!(
         baseline_finish,
@@ -126,8 +102,8 @@ fn chunked_prefill_matches_unchunked_prefill_for_resumed_paged_kv() {
     );
 
     let (chunked_tokens, chunked_finish) = {
-        let handle = start_engine(&model_path, CHUNK_BUDGET);
-        generate(&handle, prompt_tokens)
+        let mut handle = start_engine(&model_path, CHUNK_BUDGET);
+        generate(&mut handle, prompt_tokens)
     };
     assert_eq!(
         chunked_finish,

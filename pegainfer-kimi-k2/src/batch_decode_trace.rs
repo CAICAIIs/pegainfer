@@ -1,17 +1,17 @@
 use anyhow::Result;
 use anyhow::ensure;
 #[cfg(feature = "kernel-call-trace")]
-use pegainfer_core::engine::EngineLoadOptions;
-#[cfg(feature = "kernel-call-trace")]
-use pegainfer_core::engine::GenerateRequest;
-#[cfg(feature = "kernel-call-trace")]
-use pegainfer_core::engine::TokenEvent;
-#[cfg(feature = "kernel-call-trace")]
-use pegainfer_core::engine::TokenSink;
-#[cfg(feature = "kernel-call-trace")]
 use pegainfer_core::ops::call_trace;
 #[cfg(feature = "kernel-call-trace")]
-use pegainfer_core::sampler::SamplingParams;
+use pegainfer_frontend::engine::EngineLoadOptions;
+#[cfg(feature = "kernel-call-trace")]
+use pegainfer_frontend::engine::GenerateRequest;
+#[cfg(feature = "kernel-call-trace")]
+use pegainfer_frontend::engine::TokenEvent;
+#[cfg(feature = "kernel-call-trace")]
+use pegainfer_frontend::engine::TokenSink;
+#[cfg(feature = "kernel-call-trace")]
+use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_kernels::ops::KIMI_K2_EXPERT_INTERMEDIATE;
 use pegainfer_kernels::ops::KIMI_K2_MLA_ABS_Q_LOCAL_OUT_TP8;
 use pegainfer_kernels::ops::KIMI_K2_MLA_KV_B_LOCAL_OUT_TP8;
@@ -156,8 +156,8 @@ pub fn trace_runtime_decode_kernel_calls(
                 lora_adapter: None,
                 kv_transfer_params: None,
                 token_tx,
-                logprobs: 0,
-                echo: false,
+                logprobs: None,
+                prompt_logprobs: None,
             })?;
             receivers.push(std::thread::spawn(move || -> Result<()> {
                 while let Some((_, event)) = token_rx.blocking_recv() {

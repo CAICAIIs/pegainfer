@@ -6,8 +6,8 @@ use anyhow::Result;
 use anyhow::ensure;
 use log::debug;
 use log::info;
-use pegainfer_engine::engine::EngineLoadOptions;
-use pegainfer_engine::engine::FinishReason;
+use pegainfer_frontend::engine::EngineLoadOptions;
+use pegainfer_frontend::engine::FinishReason;
 
 use super::DeepSeekV2LiteEp2Generator;
 use super::backend::EpBackendRuntime;
@@ -16,6 +16,7 @@ use super::helpers::append_generated_token;
 use super::helpers::duration_micros;
 use super::helpers::ensure_same_prompt_batch_rows_match;
 use super::helpers::token_sha256;
+use super::moe::DeviceRoutedMoeRuntime;
 use super::types::BatchedGenerationResult;
 use super::types::GenerationResult;
 use super::types::GenerationStats;
@@ -136,14 +137,21 @@ impl DeepSeekV2LiteEp2Generator {
             started.elapsed().as_secs_f64()
         );
 
-        Ok(Self {
-            model_path: model_path.to_path_buf(),
+        let mut generator = Self {
             device_ordinals: options.device_ordinals,
             config,
             rank0,
             rank1,
             backend,
-        })
+            device_routed_moe: None,
+        };
+        if generator.backend.kind() == super::backend::EpBackendKind::Nccl {
+            generator.device_routed_moe = Some(std::sync::Mutex::new(
+                DeviceRoutedMoeRuntime::new(&generator)
+                    .context("initialize DeepSeek-V2-Lite device-routed MoE")?,
+            ));
+        }
+        Ok(generator)
     }
 
     pub fn generate_greedy(
@@ -178,7 +186,6 @@ impl DeepSeekV2LiteEp2Generator {
 
     pub(crate) fn new_generation_stats(&self, prompt_tokens: usize) -> GenerationStats {
         GenerationStats {
-            model_path: self.model_path.clone(),
             device_ordinals: self.device_ordinals.clone(),
             ep_backend: self.backend.kind().as_str().to_string(),
             ep_size: 2,
@@ -346,7 +353,7 @@ impl DeepSeekV2LiteEp2Generator {
 
         for step in 0..max_new_tokens {
             if let Some(reason) =
-                append_generated_token(&mut generated, next, self.config.eos_token_id, ignore_eos)
+                append_generated_token(&mut generated, next, &self.config.eos_token_ids, ignore_eos)
             {
                 finish_reason = reason;
                 break;

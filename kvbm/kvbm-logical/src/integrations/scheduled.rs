@@ -437,10 +437,23 @@ impl<T: BlockMetadata> SchedulableSequence<T> {
         &mut self,
         manager: &BlockManager<T>,
     ) -> Result<usize, ScheduleError> {
+        self.match_and_add_prefix_up_to(manager, usize::MAX)
+    }
+
+    /// Match and add at most `requested_max_blocks` prefix blocks.
+    ///
+    /// This is useful for hybrid models whose auxiliary state
+    /// may only be restorable at a boundary shorter than the longest KV hit.
+    pub fn match_and_add_prefix_up_to(
+        &mut self,
+        manager: &BlockManager<T>,
+        requested_max_blocks: usize,
+    ) -> Result<usize, ScheduleError> {
         self.require_idle()?;
 
         let bs = self.inner.block_size();
-        let max_blocks = self.inner.num_input_tokens().saturating_sub(1) / bs;
+        let max_blocks =
+            (self.inner.num_input_tokens().saturating_sub(1) / bs).min(requested_max_blocks);
         let count = self
             .inner
             .match_and_add_prefix(manager, max_blocks)
@@ -636,13 +649,12 @@ impl<T: BlockMetadata> SchedulableSequence<T> {
             }
         };
 
+        // The forward computed KV for the existing dangling token. Register
+        // that token before appending the newly sampled, still-dangling token.
+        self.inner.complete_and_register_pending(manager);
+
         let crossed = self.inner.append_token(token);
         let block_completed = crossed.is_some();
-
-        // Always stage pending completions — handles both:
-        // 1. Blocks completed during prefill's token append (deferred staging)
-        // 2. Block just completed by this decode token
-        self.inner.complete_and_register_pending(manager);
 
         self.kv_position += 1;
         self.state = SequenceState::Idle;
@@ -875,6 +887,26 @@ impl<T: BlockMetadata> SchedulableSequence<T> {
             self.inner.append_token(token);
         }
         Ok(())
+    }
+
+    /// Complete the trailing partial block with `pad` and register it, so a
+    /// handoff seal can save it under the padded hash. Naming only: no token
+    /// count moves, `kv_position` is untouched, no block is allocated. No-op
+    /// when `kv_position` sits on a block boundary — the partial block would
+    /// hold no computed rows, and a name for pure garbage serves no one.
+    /// Requires Idle state; the sequence must not schedule prefill again.
+    pub fn pad_tail_block(
+        &mut self,
+        pad: Token,
+        manager: &BlockManager<T>,
+    ) -> Result<usize, ApplyError> {
+        self.require_idle_for_apply()?;
+        if self.kv_position.is_multiple_of(self.inner.block_size()) {
+            return Ok(0);
+        }
+        let appended = self.inner.pad_tail_block(pad);
+        self.inner.complete_and_register_pending(manager);
+        Ok(appended)
     }
 
     /// Finish an externally restored prefill by promoting its final input
@@ -1145,6 +1177,50 @@ mod tests {
     // =========================================================================
     // State machine enforcement
     // =========================================================================
+
+    #[test]
+    fn test_pad_tail_block_names_the_partial_block() {
+        let manager = create_test_manager::<TestMeta>(20);
+        let mut seq = SchedulableSequence::<TestMeta>::new(
+            make_tokens(6),
+            10,
+            BLOCK_SIZE,
+            noop_delegate(),
+            None,
+        );
+        seq.schedule_prefill(6, &manager).unwrap();
+        seq.apply_prefill(Some(100), &manager).unwrap();
+        assert_eq!(seq.kv_position(), 6);
+        assert_eq!(seq.assigned_blocks(), 1);
+
+        let appended = seq.pad_tail_block(999, &manager).unwrap();
+        assert_eq!(appended, 1, "tokens 4,5 + anchor + one pad fill the block");
+        assert_eq!(seq.kv_position(), 6, "naming only");
+        assert_eq!(seq.generated_tokens(), 1, "pads are not generated tokens");
+        assert_eq!(seq.assigned_blocks(), 2, "the padded block registered");
+        assert_eq!(seq.state(), SequenceState::Idle);
+        assert_eq!(seq.inner().sequence().all_sequence_hashes().len(), 2);
+    }
+
+    #[test]
+    fn test_pad_tail_block_noop_on_boundary() {
+        let manager = create_test_manager::<TestMeta>(20);
+        let mut seq = SchedulableSequence::<TestMeta>::new(
+            make_tokens(4),
+            10,
+            BLOCK_SIZE,
+            noop_delegate(),
+            None,
+        );
+        seq.schedule_prefill(4, &manager).unwrap();
+        seq.apply_prefill(Some(100), &manager).unwrap();
+        assert_eq!(seq.kv_position(), 4);
+
+        let appended = seq.pad_tail_block(999, &manager).unwrap();
+        assert_eq!(appended, 0, "no computed rows in the partial block");
+        assert_eq!(seq.assigned_blocks(), 1, "nothing new registered");
+        assert_eq!(seq.tail_tokens(), 1, "the dangling anchor stays unnamed");
+    }
 
     #[test]
     fn test_schedule_prefill_requires_idle() {
@@ -1481,7 +1557,7 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_block_completed() {
+    fn test_decode_defers_dangling_boundary_registration() {
         let manager = create_test_manager::<TestMeta>(20);
         let mut seq = prefilled_seq(4, 10, &manager);
         // After prefill: total=5, kv=4, assigned=1, unassigned=0
@@ -1495,6 +1571,10 @@ mod tests {
         seq.schedule_decode(&manager).unwrap();
         let outcome = seq.apply_decode(100, &manager).unwrap();
         assert_eq!(outcome, DecodeOutcome::BlockCompleted);
+        assert_eq!(seq.assigned_blocks(), 1);
+
+        seq.schedule_decode(&manager).unwrap();
+        seq.apply_decode(100, &manager).unwrap();
         assert_eq!(seq.assigned_blocks(), 2);
     }
 
@@ -1549,7 +1629,7 @@ mod tests {
         seq.schedule_decode(&manager).unwrap();
         let outcome = seq.apply_decode(102, &manager).unwrap(); // total=8, crosses boundary
         assert_eq!(outcome, DecodeOutcome::BlockCompleted);
-        assert_eq!(seq.unassigned_blocks(), 0);
+        assert_eq!(seq.unassigned_blocks(), 1);
 
         // Next schedule_decode should allocate 1 gen block
         seq.schedule_decode(&manager).unwrap();
@@ -1559,7 +1639,7 @@ mod tests {
                 blocks_allocated: 1
             }
         );
-        assert_eq!(seq.unassigned_blocks(), 1);
+        assert_eq!(seq.unassigned_blocks(), 2);
     }
 
     #[test]
@@ -1733,12 +1813,12 @@ mod tests {
         let mut seq = prefilled_seq(4, 10, &manager);
         // After prefill: total=5, assigned=1, unassigned=0
 
-        // Decode until boundary at total=8 → unassigned drops to 0
+        // Decode until boundary at total=8
         for _ in 0..3 {
             seq.schedule_decode(&manager).unwrap();
             seq.apply_decode(100, &manager).unwrap();
         }
-        assert_eq!(seq.unassigned_blocks(), 0);
+        assert_eq!(seq.unassigned_blocks(), 1);
 
         let avail_before = manager.available_blocks();
         seq.schedule_decode(&manager).unwrap();

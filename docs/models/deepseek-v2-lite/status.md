@@ -1,8 +1,8 @@
 # DeepSeek-V2-Lite Status And Benchmark Ledger
 
-> **TL;DR:** DeepSeek-V2-Lite keeps correctness, direct decode diagnostics, retained HTTP SLO reports, and sustained soak evidence as separate gates. HF/host-staged/NCCL exactness, HTTP lifecycle evidence, #466 SLO artifacts, and #465 host-staged/NCCL soak artifacts are retained without claiming production readiness.
+> **TL;DR:** DeepSeek-V2-Lite keeps correctness, direct decode diagnostics, retained HTTP SLO reports, and sustained soak evidence as separate gates. NCCL MoE forwards with rows 1..8 now use device-routed pointer-batched experts with exact retained token/text outputs. HF/host-staged/NCCL exactness, HTTP lifecycle evidence, #466 SLO artifacts, and #465 host-staged/NCCL soak artifacts are retained without claiming parity or production readiness.
 
-Last touched: 2026-07
+Last touched: 2026-09
 
 ## Capability Contract
 
@@ -18,6 +18,7 @@ Last touched: 2026-07
 | Device-resident NCCL combine | Available | Issue #275 keeps NCCL combine contributions/results on reusable f32 device scratch and preserves the HF / host-staged / NCCL exact gate on 2x RTX 5090. |
 | Device-resident NCCL dense exchange | Available | Issue #276 reuses backend-owned bf16 dense-exchange scratch, clears rank1 zero-send every exchange, removes dense-exchange stream sync from the backend call, and preserves HF / host-staged / NCCL exactness on 2x RTX 5090. |
 | NCCL route-plan replay | Available | Issue #277 builds a token-major host route plan once after top-k routing, replays that plan for NCCL expert launches and device contribution accumulation, keeps route counters visible, and preserves HF / host-staged / NCCL exactness on 2x RTX 5090. This remains the eager NCCL oracle path. |
+| Device-routed NCCL small-row MoE | Available for rows 1..8 | Decode and short prefill keep routing and routed-expert execution on GPU through fixed route slots and pointer-batched GEMMs; the eager route-plan path remains the rollback oracle. Correctness and performance evidence lives in `device-routed-moe.md`. |
 | NCCL CUDA Graph readiness | Covered-shape diagnostic | Schema-2 `cuda_graph_readiness` now includes a fail-closed `full_decode_graph_probe`. The 2026-06-20 run reports capture, instantiate, replay, and verification success with `8/8` verified replays for the retained batch-1 NCCL decode step. |
 | First mixed-request serving gate | Available | Issue #281 adds greedy-only request admission, FCFS deferral, explicit request-local rejection/error/finish events, and one owned `DecodeCache` per active request. The 2026-06-23 2x RTX 5090 run passed HF / host-staged / NCCL exactness and the mixed-serving E2E for host-staged and NCCL. |
 | Long-shape NCCL collectives | Available | Issue #280 chunks large bf16 dense-exchange and f32 combine all-reduces. The 2026-06-24 2x RTX 5090 NCCL checks preserve HF / host-staged / NCCL exactness and complete 24/64/128-word direct long-shape probes. |
@@ -81,7 +82,7 @@ The combined retained report passed child gates for both backends, commit consis
 
 ### Retained vLLM TP2/EP2 Matrix
 
-The retained matrix lives in `docs/benchmarks/deepseek-v2-lite-vllm-tp2-ep2.md` and tracks [#279](https://github.com/openinfer-project/openinfer/issues/279). It is the current source for PegaInfer host-staged/NCCL versus vLLM TP2/TP2+EP2 under the `prompt_words=64`, `max_tokens=64`, `num_prompts=32`, `max_concurrency=1/4/8`, `temperature=0`, `ignore_eos=true` HTTP pressure contract. Prompt words are a workload-generator input, not a token count.
+The retained matrix lives in `docs/benchmarks/deepseek-v2-lite-vllm-tp2-ep2.md` and tracks [#279](https://github.com/pegainfer-project/pegainfer/issues/279). It is the current source for PegaInfer host-staged/NCCL versus vLLM TP2/TP2+EP2 under the `prompt_words=64`, `max_tokens=64`, `num_prompts=32`, `max_concurrency=1/4/8`, `temperature=0`, `ignore_eos=true` HTTP pressure contract. Prompt words are a workload-generator input, not a token count.
 
 Latest 2026-06-28 result on 2x RTX 5090:
 

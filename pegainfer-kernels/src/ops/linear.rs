@@ -10,6 +10,7 @@ use cudarc::driver::DevicePtrMut;
 use half::bf16;
 
 use crate::ffi;
+use crate::ops::ffi_status_detail;
 use crate::tensor::DeviceContext;
 use crate::tensor::DeviceMatrix;
 use crate::tensor::DeviceVec;
@@ -92,6 +93,84 @@ pub fn gemm_strided_batched_bf16(
     ensure!(
         status == 0,
         "gemm_strided_batched_bf16 failed: status={status} (m={m} n={n} k={k} batch={batch})"
+    );
+    Ok(())
+}
+
+/// f32 strided-batched GEMM, same cuBLAS boundary as
+/// [`gemm_strided_batched_bf16`] but with f32 operands and an `accumulate`
+/// switch (`C += A·B` instead of `C = A·B`). The consumer is the K3 KCP state
+/// merge (per-head fp32 `S' = M·S + D`), which pre-fills `C` with `D` and
+/// accumulates the transition product in one call.
+#[allow(clippy::too_many_arguments, clippy::many_single_char_names)]
+pub fn gemm_strided_batched_f32(
+    ctx: &DeviceContext,
+    transpose_a: bool,
+    transpose_b: bool,
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &impl cudarc::driver::DevicePtr<f32>,
+    lda: usize,
+    stride_a: usize,
+    b: &impl cudarc::driver::DevicePtr<f32>,
+    ldb: usize,
+    stride_b: usize,
+    accumulate: bool,
+    c: &mut cudarc::driver::CudaSlice<f32>,
+    ldc: usize,
+    stride_c: usize,
+    batch: usize,
+) -> Result<()> {
+    ensure!(
+        m > 0 && n > 0 && k > 0 && batch > 0,
+        "gemm_strided_batched_f32 empty dims: m={m} n={n} k={k} batch={batch}"
+    );
+    ensure!(
+        a.len() >= stride_a * batch,
+        "gemm_strided_batched_f32 A too small: have {}, need {}",
+        a.len(),
+        stride_a * batch
+    );
+    ensure!(
+        b.len() >= stride_b * batch,
+        "gemm_strided_batched_f32 B too small: have {}, need {}",
+        b.len(),
+        stride_b * batch
+    );
+    ensure!(
+        c.len() >= stride_c * batch,
+        "gemm_strided_batched_f32 C too small: have {}, need {}",
+        c.len(),
+        stride_c * batch
+    );
+    let (a_ptr, _ga) = a.device_ptr(&ctx.stream);
+    let (b_ptr, _gb) = b.device_ptr(&ctx.stream);
+    let (c_ptr, _gc) = c.device_ptr_mut(&ctx.stream);
+    let status = unsafe {
+        ffi::gemm_strided_batched_f32_cuda(
+            i32::from(transpose_a),
+            i32::from(transpose_b),
+            m as i32,
+            n as i32,
+            k as i32,
+            a_ptr as *const f32,
+            lda as i32,
+            stride_a as i64,
+            b_ptr as *const f32,
+            ldb as i32,
+            stride_b as i64,
+            if accumulate { 1.0 } else { 0.0 },
+            c_ptr as *mut f32,
+            ldc as i32,
+            stride_c as i64,
+            batch as i32,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    ensure!(
+        status == 0,
+        "gemm_strided_batched_f32 failed: status={status} (m={m} n={n} k={k} batch={batch})"
     );
     Ok(())
 }
@@ -304,16 +383,9 @@ pub fn gemm_lt_pin_into_checked(
             weight.rows,
             weight.cols
         ),
-        s if s >= 100_000 => bail!(
-            "cublasLt pin GEMM failed: cublas_status={}, m={}, n={}, k={}",
-            s - 100_000,
-            weight.rows,
-            x.seq_len,
-            weight.cols
-        ),
         s => bail!(
-            "cublasLt pin GEMM launch failed: cuda_status={}, m={}, n={}, k={}",
-            s,
+            "cublasLt pin GEMM failed: {}, m={}, n={}, k={}",
+            ffi_status_detail(s),
             weight.rows,
             x.seq_len,
             weight.cols
@@ -381,6 +453,46 @@ pub fn gemm_rows_into_checked(
         x.seq_len,
         weight.cols,
         x.seq_len == 1,
+        ctx,
+    )
+}
+
+/// Row-range GEMM over a token span of `x`:
+/// `Y = W[row_offset..row_offset+num_rows, :] @ X[x_row0..x_row0+out.seq_len]`.
+/// The span length is `out.seq_len`; `x.seq_len` bounds the readable rows.
+pub fn gemm_rows_span_into_checked(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    row_offset: usize,
+    num_rows: usize,
+    x: &HiddenStates,
+    x_row0: usize,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    assert!(row_offset + num_rows <= weight.rows);
+    assert_eq!(weight.cols, x.hidden_dim);
+    assert_eq!(out.hidden_dim, num_rows);
+    assert!(
+        x_row0 + out.seq_len <= x.seq_len,
+        "x span [{x_row0}, {x_row0}+{}) exceeds x.seq_len {}",
+        out.seq_len,
+        x.seq_len
+    );
+
+    let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
+    let w_sub = w_ptr + (row_offset * weight.cols * std::mem::size_of::<half::bf16>()) as u64;
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let x_sub = x_ptr + (x_row0 * x.hidden_dim * std::mem::size_of::<half::bf16>()) as u64;
+    let (y_ptr, _gy) = out.data.device_ptr_mut(&ctx.stream);
+
+    launch_gemm(
+        w_sub as *const ffi::Half,
+        x_sub as *const ffi::Half,
+        y_ptr as *mut ffi::Half,
+        num_rows,
+        out.seq_len,
+        weight.cols,
+        out.seq_len == 1,
         ctx,
     )
 }
@@ -521,7 +633,7 @@ pub fn gemm_graphsafe_ref_into_checked(
     gemm_ref_into_with_policy(ctx, weight, x, out, true)
 }
 
-pub(crate) fn gemm_per_token_into_checked(
+fn gemm_per_token_into_checked(
     ctx: &DeviceContext,
     weight: &DeviceMatrix,
     x: &HiddenStates,
@@ -558,18 +670,9 @@ pub(crate) fn gemm_per_token_into_checked(
             crate::tensor::active_cu_stream(ctx),
         );
         if status != 0 {
-            if status >= 100_000 {
-                bail!(
-                    "cuBLAS per-token GEMM failed: cublas_status={}, m={}, batch={}, k={}",
-                    status - 100_000,
-                    weight.rows,
-                    x.seq_len,
-                    weight.cols
-                );
-            }
             bail!(
-                "CUDA per-token GEMM launch failed: cuda_status={}, m={}, batch={}, k={}",
-                status,
+                "per-token GEMM failed: {}, m={}, batch={}, k={}",
+                ffi_status_detail(status),
                 weight.rows,
                 x.seq_len,
                 weight.cols
@@ -742,13 +845,10 @@ fn launch_gemm_pin(
                  LoRA prefill-delta shape), or the numeric policy was set after executor \
                  construction. Run without --batch-invariant or report this shape"
             ),
-            s if s >= 100_000 => {
-                bail!(
-                    "cuBLAS pin GEMM failed: cublas_status={}, m={m}, n={n}, k={k}",
-                    s - 100_000
-                )
-            }
-            s => bail!("CUDA pin GEMM launch failed: cuda_status={s}, m={m}, n={n}, k={k}"),
+            s => bail!(
+                "pin GEMM failed: {}, m={m}, n={n}, k={k}",
+                ffi_status_detail(s)
+            ),
         }
     }
 }
@@ -774,13 +874,10 @@ fn launch_gemm_pertoken(
             crate::tensor::active_cu_stream(ctx),
         );
         if status != 0 {
-            if status >= 100_000 {
-                bail!(
-                    "cuBLAS per-token GEMM failed: cublas_status={}, m={m}, n={n}, k={k}",
-                    status - 100_000
-                );
-            }
-            bail!("CUDA per-token GEMM launch failed: cuda_status={status}, m={m}, n={n}, k={k}");
+            bail!(
+                "per-token GEMM failed: {}, m={m}, n={n}, k={k}",
+                ffi_status_detail(status)
+            );
         }
     }
     PER_TOKEN_SERVED.fetch_add(1, Ordering::Relaxed);
@@ -803,6 +900,9 @@ fn launch_gemm(
         NumericPolicy::PerToken => return launch_gemm_pertoken(w_ptr, x_ptr, y_ptr, m, n, k, ctx),
         NumericPolicy::Tuned => {}
     }
+    // Split-concurrent prefill must keep even N=1 projections on its dedicated
+    // handle so it cannot rebind the graph-safe decode handle.
+    let graphsafe = graphsafe && !crate::tensor::has_prefill_stream_override();
     unsafe {
         // Small-N projections run the cublasLt algo selected by gemm_lt_tune.
         // Shapes this thread never tuned report GEMM_LT_UNTUNED and keep their
@@ -848,19 +948,9 @@ fn launch_gemm(
             };
         }
         if status != 0 {
-            if status >= 100_000 {
-                bail!(
-                    "cuBLAS GEMM failed: cublas_status={}, m={}, n={}, k={}, graphsafe={}",
-                    status - 100_000,
-                    m,
-                    n,
-                    k,
-                    graphsafe
-                );
-            }
             bail!(
-                "CUDA GEMM launch failed: cuda_status={}, m={}, n={}, k={}, graphsafe={}",
-                status,
+                "GEMM failed: {}, m={}, n={}, k={}, graphsafe={}",
+                ffi_status_detail(status),
                 m,
                 n,
                 k,

@@ -21,9 +21,9 @@ use cudarc::nccl::safe::Comm;
 use cudarc::nccl::safe::Id;
 use log::debug;
 use pegainfer_core::cuda_graph::CudaGraphState;
-use pegainfer_core::engine::TokenLogprob;
 #[cfg(feature = "kernel-call-trace")]
 use pegainfer_core::ops::call_trace;
+use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_kernels::ops::KIMI_K2_LOCAL_EXPERTS;
 use pegainfer_kernels::ops::KIMI_K2_MLA_KV_A_OUT;
 use pegainfer_kernels::ops::KIMI_K2_MLA_KV_LORA_RANK;
@@ -35,6 +35,7 @@ use pegainfer_kernels::ops::KIMI_O_PROJ_CUBLASLT_INPUT;
 use pegainfer_kernels::ops::KimiMarlinRouteWorkspace;
 use pegainfer_kernels::ops::KimiMarlinWna16Workspace;
 use pegainfer_kernels::ops::KimiMlaPagedKvLayout;
+use pegainfer_kernels::ops::ffi_status_detail;
 use pegainfer_kernels::ops::flashinfer_top1_row_states_bytes;
 use pegainfer_kernels::ops::kimi_flashinfer_batch_decode_mla_rt;
 use pegainfer_kernels::ops::kimi_flashinfer_single_prefill_mla_rt;
@@ -186,8 +187,8 @@ pub(super) struct KimiRankWeightLoadReport {
 /// and how many logprobs to report for it.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct KimiRowOptions {
-    pub(crate) logprobs: usize,
-    pub(crate) sampling: pegainfer_core::sampler::SamplingParams,
+    pub(crate) logprobs: Option<usize>,
+    pub(crate) sampling: pegainfer_frontend::sampler::SamplingParams,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -204,7 +205,7 @@ pub(super) struct KimiOneTokenForwardReport {
     pub moe_layers_executed: usize,
     /// Exact log-softmax of the picked token plus the top-K, computed on the
     /// host from the full-vocab logits row. `Some` only when the request
-    /// asked for logprobs (`GenerateRequest::logprobs > 0`); the serving
+    /// asked for logprobs (`GenerateRequest::logprobs` is `Some`); the serving
     /// path never pays for it.
     pub logprob: Option<TokenLogprob>,
 }
@@ -680,37 +681,25 @@ fn bind_rank_thread(
         pegainfer_kernels::ffi::cublas_init();
         let status = pegainfer_kernels::ffi::kimi_shared_gate_up_cublaslt_init_cuda();
         if status != 0 {
-            if status >= 100_000 {
-                anyhow::bail!(
-                    "Kimi shared_gate_up cuBLASLt init failed: cublas_status={}",
-                    status - 100_000
-                );
-            }
             anyhow::bail!(
-                "Kimi shared_gate_up cuBLASLt init failed: cuda_status={}",
-                status
+                "Kimi shared_gate_up cuBLASLt init failed: {}",
+                ffi_status_detail(status)
             );
         }
         let status = pegainfer_kernels::ffi::kimi_mla_cublaslt_init_cuda();
         if status != 0 {
-            if status >= 100_000 {
-                anyhow::bail!(
-                    "Kimi MLA cuBLASLt init failed: cublas_status={}",
-                    status - 100_000
-                );
-            }
-            anyhow::bail!("Kimi MLA cuBLASLt init failed: cuda_status={}", status);
+            anyhow::bail!(
+                "Kimi MLA cuBLASLt init failed: {}",
+                ffi_status_detail(status)
+            );
         }
         if local_dims.o_proj_in == KIMI_O_PROJ_CUBLASLT_INPUT {
             let status = pegainfer_kernels::ffi::kimi_o_proj_cublaslt_init_cuda();
             if status != 0 {
-                if status >= 100_000 {
-                    anyhow::bail!(
-                        "Kimi o_proj cuBLASLt init failed: cublas_status={}",
-                        status - 100_000
-                    );
-                }
-                anyhow::bail!("Kimi o_proj cuBLASLt init failed: cuda_status={}", status);
+                anyhow::bail!(
+                    "Kimi o_proj cuBLASLt init failed: {}",
+                    ffi_status_detail(status)
+                );
             }
         }
     }

@@ -2,20 +2,27 @@
 #include <cublas_v2.h>
 #include <cublasLt.h>
 
+#include "ffi_guard.cuh"
+
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <array>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
 #include <map>
 #include <mutex>
-
-static constexpr int CUBLAS_STATUS_ERROR_OFFSET = 100000;
 
 static int cublas_status_to_error(cublasStatus_t status) {
   if (status == CUBLAS_STATUS_SUCCESS) {
     return static_cast<int>(cudaSuccess);
   }
-  return CUBLAS_STATUS_ERROR_OFFSET + static_cast<int>(status);
+  return PEGAINFER_CUBLAS_STATUS_BASE + static_cast<int>(status);
 }
 
 // cuBLAS handle management.
@@ -23,11 +30,8 @@ static int cublas_status_to_error(cublasStatus_t status) {
 // CUDA context/device without racing on a process-global singleton.
 thread_local cublasHandle_t g_cublas_handle = nullptr;
 thread_local cublasHandle_t g_cublas_prefill_handle = nullptr;
-thread_local void *g_cublas_workspace = nullptr;
 thread_local std::map<int, cublasHandle_t> g_cublas_handles_by_device;
 thread_local std::map<int, cublasHandle_t> g_cublas_prefill_handles_by_device;
-thread_local std::map<int, void *> g_cublas_workspaces_by_device;
-static const size_t CUBLAS_WORKSPACE_SIZE = 32 * 1024 * 1024; // 32MB
 
 // cublasLt path for small-N decode GEMMs. cuBLAS's default heuristic leaves
 // 4-6% bandwidth on the table for these shapes; gemm_lt_tune_cuda times every
@@ -184,6 +188,131 @@ static cublasStatus_t lt_plan_create(LtGemmPlan &plan, int M, int N, int K) {
   return cublasLtMatrixLayoutCreate(&plan.c, CUDA_R_16BF, M, N, M);
 }
 
+// The tuned table above dies with the process, so every start re-searches shapes
+// whose winner was already known here. Behind PEGAINFER_GEMM_LT_CACHE a winner is
+// carried across processes. It is a cache and never a source of truth: every
+// failure below falls back to the online search, changing start-up time and never
+// a result. The record format and the file live in lt_algo_store.cu.
+extern "C" int pegainfer_lt_store_lookup(const char *path, const char *key,
+                                         unsigned long long out[8]);
+extern "C" void pegainfer_lt_store_append(const char *path, const char *key,
+                                          const unsigned long long words[8]);
+
+static const char *lt_store_path() {
+  static const char *cached = [] {
+    const char *s = std::getenv("PEGAINFER_GEMM_LT_CACHE");
+    return (s != nullptr && *s != '\0') ? s : nullptr;
+  }();
+  return cached;
+}
+
+// A stored winner only means anything under the conditions that produced it, and
+// the device ordinal the in-process key uses is not one of them — ordinal 0 on
+// another machine is other hardware. So the on-disk key carries what actually
+// decides the ranking, plus the runtime, driver and library versions, because
+// cublasLtMatmulAlgo_t is opaque and is not promised to survive a version change.
+static bool lt_store_key(int device, int M, int N, int K, std::string &out) {
+  cudaDeviceProp prop{};
+  if (cudaGetDeviceProperties(&prop, device) != cudaSuccess) {
+    return false;
+  }
+  int runtime = 0;
+  if (cudaRuntimeGetVersion(&runtime) != cudaSuccess) {
+    return false;
+  }
+  // Reports the CUDA level the installed driver supports, not its build number,
+  // so a driver update that keeps the same level is not distinguished here.
+  int driver = 0;
+  if (cudaDriverGetVersion(&driver) != cudaSuccess) {
+    return false;
+  }
+  std::string name(prop.name);
+  for (char &c : name) {
+    if (c == ' ') {
+      c = '_';
+    }
+  }
+  char buf[512];
+  // dtype and layout are constants of this translation unit; recorded anyway so
+  // a future width cannot silently adopt a bf16 winner.
+  const int n = std::snprintf(buf, sizeof(buf), "%s %d.%d %d %d %d %zu %d %d %d bf16 TN %zu",
+                              name.c_str(), prop.major, prop.minor, prop.multiProcessorCount,
+                              runtime, driver, cublasLtGetVersion(), M, N, K, LT_WORKSPACE_SIZE);
+  if (n <= 0 || static_cast<size_t>(n) >= sizeof(buf)) {
+    return false;
+  }
+  out.assign(buf);
+  return true;
+}
+
+// A matching key is not enough. The stored bytes are an opaque struct another
+// process wrote; ask cublasLt whether they still describe something runnable
+// against these descriptors, and whether it fits the workspace we will hand it.
+static bool lt_algo_usable(const LtGemmPlan &plan, const cublasLtMatmulAlgo_t &algo) {
+  cublasLtMatmulHeuristicResult_t result{};
+  const cublasStatus_t status = cublasLtMatmulAlgoCheck(g_lt_handle, plan.op, plan.a, plan.b,
+                                                        plan.c, plan.c, &algo, &result);
+  return status == CUBLAS_STATUS_SUCCESS && result.state == CUBLAS_STATUS_SUCCESS &&
+         result.workspaceSize <= LT_WORKSPACE_SIZE;
+}
+
+// One launch before an algo is published. `gemm_lt_cuda` says the tuned kernel has
+// already executed and CUDA Graph capture leans on that; the search path gets it from
+// its timing loop, while an algo adopted from the store has never run in this process.
+static bool lt_algo_warm(const LtGemmPlan &plan, const __nv_bfloat16 *W, int M, int N, int K,
+                         cudaStream_t stream) {
+  __nv_bfloat16 *x = nullptr;
+  __nv_bfloat16 *y = nullptr;
+  bool ok = cudaMalloc(&x, static_cast<size_t>(K) * N * sizeof(__nv_bfloat16)) == cudaSuccess;
+  if (ok) {
+    ok = cudaMemset(x, 0, static_cast<size_t>(K) * N * sizeof(__nv_bfloat16)) == cudaSuccess;
+  }
+  if (ok) {
+    ok = cudaMalloc(&y, static_cast<size_t>(M) * N * sizeof(__nv_bfloat16)) == cudaSuccess;
+  }
+  if (ok) {
+    const float h_alpha = 1.0f;
+    const float h_beta = 0.0f;
+    ok = cublasLtMatmul(g_lt_handle, plan.op, &h_alpha,
+                        W, plan.a,
+                        x, plan.b,
+                        &h_beta,
+                        y, plan.c,
+                        y, plan.c,
+                        &plan.algo, g_lt_workspace, LT_WORKSPACE_SIZE,
+                        stream) == CUBLAS_STATUS_SUCCESS;
+  }
+  if (ok) {
+    ok = cudaStreamSynchronize(stream) == cudaSuccess;
+  }
+  if (x != nullptr) {
+    cudaFree(x);
+  }
+  if (y != nullptr) {
+    cudaFree(y);
+  }
+  return ok;
+}
+
+// Repeats a tuning pass spends on one candidate. Timing noise is roughly a fixed
+// cost per launch, so a GEMM reading more weight bytes settles into a stable
+// ranking in fewer repeats.
+static const double LT_TUNE_BUDGET_BYTES = 1024.0 * 1024.0 * 1024.0;
+static const int LT_TUNE_MIN_ITERS = 5;
+static const int LT_TUNE_MAX_ITERS = 20;
+
+static int lt_tune_iters(int M, int K) {
+  const double weight_bytes = static_cast<double>(M) * static_cast<double>(K) * 2.0;
+  const long n = static_cast<long>(LT_TUNE_BUDGET_BYTES / weight_bytes + 0.5);
+  if (n < LT_TUNE_MIN_ITERS) {
+    return LT_TUNE_MIN_ITERS;
+  }
+  if (n > LT_TUNE_MAX_ITERS) {
+    return LT_TUNE_MAX_ITERS;
+  }
+  return static_cast<int>(n);
+}
+
 static cublasStatus_t lt_plan_heuristics(const LtGemmPlan &plan,
                                          cublasLtMatmulHeuristicResult_t *results,
                                          int max_results, int *returned) {
@@ -227,16 +356,11 @@ void cublas_init() {
   auto prefill_it = g_cublas_prefill_handles_by_device.find(device);
   if (prefill_it == g_cublas_prefill_handles_by_device.end()) {
     cublasHandle_t handle = nullptr;
-    void *workspace = nullptr;
     cublasCreate(&handle);
     cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH);
-    cudaMalloc(&workspace, CUBLAS_WORKSPACE_SIZE);
-    cublasSetWorkspace(handle, workspace, CUBLAS_WORKSPACE_SIZE);
     prefill_it = g_cublas_prefill_handles_by_device.emplace(device, handle).first;
-    g_cublas_workspaces_by_device.emplace(device, workspace);
   }
   g_cublas_prefill_handle = prefill_it->second;
-  g_cublas_workspace = g_cublas_workspaces_by_device[device];
 }
 
 int cublas_activate_device_handles() {
@@ -248,16 +372,13 @@ int cublas_activate_device_handles() {
 
   auto handle_it = g_cublas_handles_by_device.find(device);
   auto prefill_it = g_cublas_prefill_handles_by_device.find(device);
-  auto workspace_it = g_cublas_workspaces_by_device.find(device);
   if (handle_it == g_cublas_handles_by_device.end() ||
-      prefill_it == g_cublas_prefill_handles_by_device.end() ||
-      workspace_it == g_cublas_workspaces_by_device.end()) {
+      prefill_it == g_cublas_prefill_handles_by_device.end()) {
     return static_cast<int>(cudaErrorInvalidResourceHandle);
   }
 
   g_cublas_handle = handle_it->second;
   g_cublas_prefill_handle = prefill_it->second;
-  g_cublas_workspace = workspace_it->second;
   return static_cast<int>(cudaSuccess);
 }
 
@@ -274,15 +395,8 @@ void cublas_destroy() {
     }
   }
   g_cublas_prefill_handles_by_device.clear();
-  for (auto &entry : g_cublas_workspaces_by_device) {
-    if (entry.second != nullptr) {
-      cudaFree(entry.second);
-    }
-  }
-  g_cublas_workspaces_by_device.clear();
   g_cublas_handle = nullptr;
   g_cublas_prefill_handle = nullptr;
-  g_cublas_workspace = nullptr;
   for (auto &entry : g_lt_plans) {
     lt_plan_destroy(entry.second);
   }
@@ -308,7 +422,7 @@ void cublas_destroy() {
 
 // General GEMM: Y = W @ X where W is [M, K] row-major, X is [K, N] col-major, Y is [M, N] col-major
 // N=1 is equivalent to GEMV. N>1 enables batched prefill.
-// Uses prefill handle (with workspace) — only called from prefill path, never under CUDA Graphs.
+// Uses the prefill handle — only called from prefill path, never under CUDA Graphs.
 int gemm_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X, __nv_bfloat16 *Y,
               int M, int N, int K, cudaStream_t stream) {
   if (g_cublas_prefill_handle == nullptr) {
@@ -396,6 +510,35 @@ int gemm_strided_batched_bf16_cuda(int op_a, int op_b, int m, int n, int k,
   return static_cast<int>(cudaPeekAtLastError());
 }
 
+int gemm_strided_batched_f32_cuda(int op_a, int op_b, int m, int n, int k,
+                                  const float *A, int lda, long long stride_a,
+                                  const float *B, int ldb, long long stride_b,
+                                  float beta, float *C, int ldc,
+                                  long long stride_c, int batch_count,
+                                  cudaStream_t stream) {
+  if (g_cublas_handle == nullptr) {
+    return static_cast<int>(cudaErrorInvalidResourceHandle);
+  }
+  if (m <= 0 || n <= 0 || k <= 0 || batch_count <= 0) {
+    return static_cast<int>(cudaErrorInvalidValue);
+  }
+  const cublasOperation_t ta = op_a != 0 ? CUBLAS_OP_T : CUBLAS_OP_N;
+  const cublasOperation_t tb = op_b != 0 ? CUBLAS_OP_T : CUBLAS_OP_N;
+  const float h_alpha = 1.0f;
+  cublasStatus_t status = cublasSetStream(g_cublas_handle, stream);
+  if (status != CUBLAS_STATUS_SUCCESS) {
+    return cublas_status_to_error(status);
+  }
+  status = cublasGemmStridedBatchedEx(
+      g_cublas_handle, ta, tb, m, n, k, &h_alpha, A, CUDA_R_32F, lda, stride_a,
+      B, CUDA_R_32F, ldb, stride_b, &beta, C, CUDA_R_32F, ldc, stride_c,
+      batch_count, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+  if (status != CUBLAS_STATUS_SUCCESS) {
+    return cublas_status_to_error(status);
+  }
+  return static_cast<int>(cudaPeekAtLastError());
+}
+
 int gemm_bf16_f32_cuda(int op_a, int op_b, int m, int n, int k,
                        const __nv_bfloat16 *A, int lda,
                        const __nv_bfloat16 *B, int ldb, float *C, int ldc,
@@ -455,7 +598,7 @@ int gemm_lt_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X, __nv_bfloat16 *
 // Must run on the executor thread before graph capture; not capture-safe.
 int gemm_lt_tune_cuda(const __nv_bfloat16 *const *Ws, int num_ws, int M, int N, int K,
                       cudaStream_t stream) {
-  if (num_ws <= 0) {
+  if (num_ws <= 0 || M <= 0 || N <= 0 || K <= 0) {
     return static_cast<int>(cudaErrorInvalidValue);
   }
   // Lt resources are created here rather than in cublas_init so only threads
@@ -512,6 +655,47 @@ int gemm_lt_tune_cuda(const __nv_bfloat16 *const *Ws, int num_ws, int M, int N, 
     }
   } claim{shared_key};
 
+  // A winner an earlier process on this machine already paid for, if the store
+  // has one that still checks out. Publishing follows the same path the search
+  // would, so the in-process table and every waiter see one behaviour.
+  const char *const store_path = lt_store_path();
+  std::string store_key;
+  const bool store_keyed = store_path != nullptr && lt_store_key(device, M, N, K, store_key);
+  if (store_keyed) {
+    unsigned long long words[8];
+    if (pegainfer_lt_store_lookup(store_path, store_key.c_str(), words) == 1) {
+      cublasLtMatmulAlgo_t stored{};
+      static_assert(sizeof(stored.data) == sizeof(words), "algo blob is eight 64-bit words");
+      std::memcpy(&stored.data, words, sizeof(words));
+      LtGemmPlan reused;
+      bool adopted = false;
+      if (lt_plan_create(reused, M, N, K) == CUBLAS_STATUS_SUCCESS &&
+          lt_algo_usable(reused, stored)) {
+        reused.algo = stored;
+        adopted = lt_algo_warm(reused, Ws[0], M, N, K, stream);
+      }
+      if (adopted) {
+        {
+          std::lock_guard<std::mutex> lock(g_lt_tuned_mu);
+          g_lt_tuned_algos[shared_key] = LtTunedEntry{true, stored};
+        }
+        g_lt_tuned_cv.notify_all();
+        claim.published = true;
+        g_lt_plans.emplace(key, reused);
+        return static_cast<int>(cudaSuccess);
+      }
+      // The one store outcome worth saying out loud: a key that matches but no
+      // longer applies — or no longer runs — is a library or driver change under
+      // a file written before it, and staying silent would make a whole stale
+      // file look like a miss.
+      std::fprintf(stderr,
+                   "gemm_lt_tune: stored algo rejected for [%s]; retuning "
+                   "(cublasLt or driver moved under this cache?)\n",
+                   store_key.c_str());
+      lt_plan_destroy(reused);
+    }
+  }
+
   LtGemmPlan plan;
   cublasStatus_t status = lt_plan_create(plan, M, N, K);
   cublasLtMatmulHeuristicResult_t results[16];
@@ -548,7 +732,7 @@ int gemm_lt_tune_cuda(const __nv_bfloat16 *const *Ws, int num_ws, int M, int N, 
     const float h_alpha = 1.0f;
     const float h_beta = 0.0f;
     const int warmup = 3;
-    const int iters = 20;
+    const int iters = lt_tune_iters(M, K);
     for (int i = 0; i < returned; ++i) {
       bool ok = true;
       for (int j = 0; j < warmup + iters && ok; ++j) {
@@ -609,6 +793,11 @@ int gemm_lt_tune_cuda(const __nv_bfloat16 *const *Ws, int num_ws, int M, int N, 
   }
   g_lt_tuned_cv.notify_all();
   claim.published = true;
+  if (store_keyed) {
+    unsigned long long words[8];
+    std::memcpy(words, &plan.algo.data, sizeof(words));
+    pegainfer_lt_store_append(store_path, store_key.c_str(), words);
+  }
   g_lt_plans.emplace(key, plan);
   return static_cast<int>(cudaSuccess);
 }

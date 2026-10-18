@@ -26,10 +26,10 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use anyhow::Result;
-use pegainfer_core::engine::EngineHandle;
-use pegainfer_core::engine::GenerateRequest;
-use pegainfer_core::engine::TokenEvent;
-use pegainfer_core::engine::TokenSink;
+use pegainfer_frontend::engine::EngineHandle;
+use pegainfer_frontend::engine::GenerateRequest;
+use pegainfer_frontend::engine::TokenEvent;
+use pegainfer_frontend::engine::TokenSink;
 use pegainfer_sample::SamplingParams;
 
 use super::mtp_production::PATHOLOGICAL_PROMPT;
@@ -99,8 +99,8 @@ fn run_request(
         lora_adapter: None,
         kv_transfer_params: None,
         token_tx,
-        logprobs: 0,
-        echo: false,
+        logprobs: None,
+        prompt_logprobs: None,
     })?;
     let mut completion = Vec::new();
     loop {

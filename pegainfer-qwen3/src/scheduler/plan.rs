@@ -19,7 +19,7 @@ use crate::speculative::VerifyPlan;
 use crate::speculative::VerifyResult;
 use crate::speculative::VerifyStepItem;
 
-pub(super) enum ExecutionPlan {
+pub(crate) enum ExecutionPlan {
     Prefill {
         pending: Vec<PendingRequest>,
     },
@@ -31,14 +31,10 @@ pub(super) enum ExecutionPlan {
     },
 }
 
-pub(super) enum ExecutionArtifacts {
+pub(crate) enum ExecutionArtifacts {
     Prefill {
         pending: Vec<PendingRequest>,
         result: PrefillResult,
-        /// Stamped before the forward pass ran — downstream metrics split
-        /// queue time (queued→scheduled) from prefill time (scheduled→first
-        /// token), so stamping after execution would fold prefill into queue.
-        scheduled_at_unix_s: f64,
     },
     Decode {
         result: DecodeResult,
@@ -49,32 +45,32 @@ pub(super) enum ExecutionArtifacts {
     Unified {
         pending: Vec<PendingRequest>,
         result: UnifiedResult,
-        scheduled_at_unix_s: f64,
     },
 }
 
-pub(super) fn build_next_plan(
+pub(crate) fn build_next_plan(
     have_active: bool,
     pending: Vec<PendingRequest>,
     speculative: bool,
 ) -> Option<ExecutionPlan> {
-    // echo+logprobs requests need all-position logits, which the unified forward
-    // does not compute (it passes all_position_logits=None). And under DFlash
-    // speculation, an eligible request must capture its target hidden context
-    // during prefill — the unified forward skips that capture, so a request
-    // prefilled via Unified would never become draft-ready and DFlash would
-    // silently no-op for it forever. Either way, route pending through a
+    // Prompt-logprobs requests need all-position logits, which the unified
+    // forward does not compute (it passes all_position_logits=None). And under
+    // DFlash speculation, an eligible request must capture its target hidden
+    // context during prefill — the unified forward skips that capture, so a
+    // request prefilled via Unified would never become draft-ready and DFlash
+    // would silently no-op for it forever. Either way, route pending through a
     // dedicated prefill step instead of degrading silently.
-    let needs_prompt_logprobs = pending.iter().any(|r| r.echo && r.logprobs > 0);
+    let needs_prompt_logprobs = pending.iter().any(|req| req.prompt_logprobs.is_some());
     // Deliberately a loose superset of the real capture eligibility
-    // (`dflash_prefill_supported`, which also needs `cached_tokens == 0 && !echo`):
-    // over-routing an ineligible request to a dedicated prefill only costs one
-    // fusion, but under-routing a capture-eligible one into Unified would silently
-    // break its readiness. Never tighten this into the dangerous direction.
+    // (`dflash_prefill_supported`, which also needs `cached_tokens == 0 && no
+    // prompt logprobs`): over-routing an ineligible request to a dedicated
+    // prefill only costs one fusion, but under-routing a capture-eligible one
+    // into Unified would silently break its readiness. Never tighten this into
+    // the dangerous direction.
     let needs_dflash_capture = speculative
         && pending
             .iter()
-            .any(|r| r.lora_adapter.is_none() && r.logprobs == 0);
+            .any(|r| r.lora_adapter.is_none() && r.logprobs.is_none());
     if !pending.is_empty() && have_active && !needs_prompt_logprobs && !needs_dflash_capture {
         Some(ExecutionPlan::Unified { pending })
     } else if !pending.is_empty() {
@@ -86,7 +82,7 @@ pub(super) fn build_next_plan(
     }
 }
 
-pub(super) fn execute_plan(
+pub(crate) fn execute_plan(
     executor: &mut impl ModelExecutor,
     active: &mut [ActiveRequestState],
     plan: ExecutionPlan,
@@ -94,21 +90,14 @@ pub(super) fn execute_plan(
 ) -> Result<ExecutionArtifacts> {
     match plan {
         ExecutionPlan::Prefill { pending } => {
-            let scheduled_at_unix_s = pegainfer_core::engine::unix_now_s();
             let indices: Vec<usize> = (0..pending.len()).collect();
             let requests = build_prefill_items(&pending, &indices);
-            let any_echo = pending.iter().any(|req| req.echo);
             let mut result = executor.execute_prefill(PrefillPlan {
                 requests: &requests,
-                echo: any_echo,
                 sample_seed: rand::RngExt::random(rng),
             })?;
             sort_prefill_results(&mut result.requests);
-            Ok(ExecutionArtifacts::Prefill {
-                pending,
-                result,
-                scheduled_at_unix_s,
-            })
+            Ok(ExecutionArtifacts::Prefill { pending, result })
         }
         ExecutionPlan::Decode => {
             let indices: Vec<usize> = (0..active.len()).collect();
@@ -138,7 +127,6 @@ pub(super) fn execute_plan(
             Ok(ExecutionArtifacts::SpeculativeDecode { verify })
         }
         ExecutionPlan::Unified { pending } => {
-            let scheduled_at_unix_s = pegainfer_core::engine::unix_now_s();
             let pending_indices: Vec<usize> = (0..pending.len()).collect();
             let active_indices: Vec<usize> = (0..active.len()).collect();
             let prefill_requests = build_prefill_items(&pending, &pending_indices);
@@ -150,11 +138,7 @@ pub(super) fn execute_plan(
             })?;
             sort_prefill_results(&mut result.prefill_requests);
             sort_decode_results(&mut result.decode_requests);
-            Ok(ExecutionArtifacts::Unified {
-                pending,
-                result,
-                scheduled_at_unix_s,
-            })
+            Ok(ExecutionArtifacts::Unified { pending, result })
         }
     }
 }
@@ -165,7 +149,7 @@ pub(super) fn execute_plan(
 /// params are NOT a gate: sampled-verify (#512) runs the regular sampler over
 /// the verify rows, so the full surface — temperature/top_k/top_p/min_p/seed —
 /// rides the speculative path.
-pub(super) fn should_speculative_decode(
+pub(crate) fn should_speculative_decode(
     executor: &impl ModelExecutor,
     active: &[ActiveRequestState],
 ) -> bool {
@@ -174,14 +158,24 @@ pub(super) fn should_speculative_decode(
         && active.iter().all(|req| {
             executor.speculative_request_ready(req.request_id)
                 && req.lora_adapter.is_none()
-                && req.logprobs == 0
+                && req.logprobs.is_none()
         })
 }
 
 fn build_speculative_draft_items(active: &[ActiveRequestState]) -> Vec<DraftStepItem> {
     active
         .iter()
-        .map(|r| DraftStepItem::new(r.request_id, r.last_token))
+        .map(|r| {
+            // Only greedy requests may hedge; the draft lane turns the
+            // remaining budget into eligibility against its effective branch
+            // positions (a chain must survive the verify-side span clamp).
+            let budget = if r.params.is_greedy() {
+                r.max_tokens.saturating_sub(r.generated_count)
+            } else {
+                0
+            };
+            DraftStepItem::new(r.request_id, r.last_token, budget)
+        })
         .collect()
 }
 
@@ -189,26 +183,30 @@ fn build_speculative_verify_items(
     active: &[ActiveRequestState],
     draft_results: &[DraftRequestResult],
 ) -> Vec<VerifyStepItem> {
-    draft_results
-        .iter()
-        .map(|draft| {
-            let active = active
-                .iter()
-                .find(|req| req.request_id == draft.request_id)
-                .expect("draft request_id must exist in active set");
-            // Clamp the verify span to the request's remaining output budget so
-            // a long accepted run can't overshoot max_tokens.
-            let remaining = active.max_tokens.saturating_sub(active.generated_count);
-            // A continuing active request always has budget left (resolve emits
-            // EmitManyAndFinish the moment generated_count hits max_tokens), so
-            // this is a true invariant, not a runtime condition — don't crash the
-            // scheduler thread in release on a state we've proven unreachable.
-            debug_assert!(remaining > 0, "active request must have output budget");
-            let mut token_ids = draft.token_ids.clone();
-            token_ids.truncate(remaining);
-            VerifyStepItem::new(draft.request_id, token_ids, active.params)
-        })
-        .collect()
+    let mut requests = Vec::with_capacity(draft_results.len());
+    for draft in draft_results {
+        let active = active
+            .iter()
+            .find(|req| req.request_id == draft.request_id)
+            .expect("draft request_id must exist in active set");
+        // Clamp the verify span to the request's remaining output budget so
+        // a long accepted run can't overshoot max_tokens.
+        let remaining = active.max_tokens.saturating_sub(active.generated_count);
+        // A continuing active request always has budget left (resolve emits
+        // FinishMany the moment generated_count hits max_tokens), so
+        // this is a true invariant, not a runtime condition — don't crash the
+        // scheduler thread in release on a state we've proven unreachable.
+        debug_assert!(remaining > 0, "active request must have output budget");
+        let mut token_ids = draft.token_ids.clone();
+        token_ids.truncate(remaining);
+        requests.push(VerifyStepItem::new(
+            draft.request_id,
+            token_ids,
+            active.params,
+            active.stop_policy.clone(),
+        ));
+    }
+    requests
 }
 
 fn build_prefill_items(pending: &[PendingRequest], indices: &[usize]) -> Vec<PrefillStepItem> {
@@ -222,7 +220,7 @@ fn build_prefill_items(pending: &[PendingRequest], indices: &[usize]) -> Vec<Pre
                 max_output_tokens: r.max_tokens,
                 params: r.params,
                 logprobs: r.logprobs,
-                echo: r.echo,
+                prompt_logprobs: r.prompt_logprobs,
                 lora_adapter: r.lora_adapter.clone(),
                 cached_tokens: r.cached_tokens,
                 chunk_budget: r.step_chunk,
@@ -259,23 +257,22 @@ fn sort_decode_results(results: &mut [crate::executor::DecodeRequestResult]) {
 
 #[cfg(test)]
 mod tests {
-    use pegainfer_core::sampler::SamplingParams;
+    use pegainfer_frontend::engine::StopPolicy;
+    use pegainfer_frontend::sampler::SamplingParams;
 
     use super::*;
     use crate::executor::RequestId;
 
     fn pending() -> PendingRequest {
-        let (token_tx, _rx) = pegainfer_core::engine::TokenSink::standalone();
         PendingRequest {
             request_id: RequestId::new(0),
             lora_adapter: None,
             prompt_tokens: vec![1, 2, 3],
             params: SamplingParams::default(),
+            stop_policy: StopPolicy::default(),
             max_tokens: 8,
-            token_tx,
-            logprobs: 0,
-            echo: false,
-            queued_at_unix_s: None,
+            logprobs: None,
+            prompt_logprobs: None,
             prefetch_offered: false,
             prefill_pos: 0,
             step_chunk: 3,
@@ -284,18 +281,29 @@ mod tests {
     }
 
     fn active(generated_count: usize, max_tokens: usize) -> ActiveRequestState {
-        let (token_tx, _rx) = pegainfer_core::engine::TokenSink::standalone();
         ActiveRequestState {
             request_id: RequestId::new(7),
             lora_adapter: None,
-            token_tx,
             last_token: 42,
             generated_count,
             max_tokens,
             prompt_len: 10,
             params: SamplingParams::default(),
-            logprobs: 0,
+            stop_policy: StopPolicy::default(),
+            logprobs: None,
         }
+    }
+
+    #[test]
+    fn draft_items_carry_the_remaining_budget_for_greedy_requests_only() {
+        let exhausted = active(31, 32);
+        let fresh = active(0, 32);
+        let mut sampled = active(0, 32);
+        sampled.params.temperature = 0.7;
+        let items = build_speculative_draft_items(&[exhausted, fresh, sampled]);
+        assert_eq!(items[0].hedge_budget, 1);
+        assert_eq!(items[1].hedge_budget, 32);
+        assert_eq!(items[2].hedge_budget, 0);
     }
 
     #[test]
@@ -312,6 +320,7 @@ mod tests {
         // 32 - 24 = 8 remaining → the 16-token span truncates to 8.
         assert_eq!(verify[0].as_slice().len(), 8);
         assert_eq!(verify[0].as_slice(), (0..8).collect::<Vec<_>>());
+        assert_eq!(verify[0].stop_policy, StopPolicy::default());
     }
 
     // The plan selector is the whole batch-formation policy: what the scheduler
@@ -344,27 +353,36 @@ mod tests {
             ),
             "active + pending fuses prefill and decode into one unified step"
         );
-        // echo+logprobs requests need all-position logits; route to Prefill
+        // Prompt-logprobs requests need all-position logits; route to Prefill
         // even when decodes are active so prompt logprobs are not silently lost.
-        let mut echo_req = pending();
-        echo_req.echo = true;
-        echo_req.logprobs = 5;
+        let mut scored_req = pending();
+        scored_req.prompt_logprobs = Some(5);
         assert!(
             matches!(
-                build_next_plan(true, vec![echo_req], false),
+                build_next_plan(true, vec![scored_req], false),
                 Some(ExecutionPlan::Prefill { pending }) if pending.len() == 1
             ),
-            "active + pending echo+logprobs request routes to prefill not unified"
+            "active + pending prompt_logprobs request routes to prefill not unified"
         );
-        // echo without logprobs (no prompt logprobs needed) can still use unified.
-        let mut echo_no_lp = pending();
-        echo_no_lp.echo = true;
+        // prompt_logprobs=0 still needs every position's logits (the scored
+        // token's logprob is a full-row reduction), so it routes to Prefill too.
+        let mut zero_count_req = pending();
+        zero_count_req.prompt_logprobs = Some(0);
         assert!(
             matches!(
-                build_next_plan(true, vec![echo_no_lp], false),
+                build_next_plan(true, vec![zero_count_req], false),
+                Some(ExecutionPlan::Prefill { pending }) if pending.len() == 1
+            ),
+            "active + pending prompt_logprobs=0 request routes to prefill not unified"
+        );
+        // No prompt logprobs requested → the unified fusion is fine.
+        let plain = pending();
+        assert!(
+            matches!(
+                build_next_plan(true, vec![plain], false),
                 Some(ExecutionPlan::Unified { pending }) if pending.len() == 1
             ),
-            "active + pending echo-only request (no logprobs) can use unified"
+            "active + pending plain request (no prompt logprobs) can use unified"
         );
         // Under DFlash speculation, an eligible pending must capture its
         // target context during prefill — the unified forward skips that capture,

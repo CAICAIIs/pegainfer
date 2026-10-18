@@ -6,7 +6,7 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
-use pegainfer_core::sampler::SamplingParams;
+use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_qwen3::runtime::DecodePlan;
 use pegainfer_qwen3::runtime::DecodeStepItem;
 use pegainfer_qwen3::runtime::PrefillPlan;
@@ -193,12 +193,11 @@ fn prefill_one(
         prompt.to_vec(),
         4096,
         params,
-        0,
-        false,
+        None,
+        None,
     )];
     let result = executor.execute_prefill(PrefillPlan {
         requests: &requests,
-        echo: false,
         sample_seed: rng.random(),
     })?;
     Ok(result.requests[0].first_token)
@@ -211,7 +210,7 @@ fn decode_one_step(
     params: SamplingParams,
     rng: &mut StdRng,
 ) -> Result<Duration> {
-    let requests = [DecodeStepItem::new(request_id, *token, params, 0)];
+    let requests = [DecodeStepItem::new(request_id, *token, params, None)];
     let start = Instant::now();
     let result = executor.execute_decode(DecodePlan {
         requests: &requests,
@@ -250,7 +249,7 @@ fn decode_batch_step(
 ) -> Result<Duration> {
     let requests: Vec<DecodeStepItem> = batch
         .iter()
-        .map(|&(request_id, token)| DecodeStepItem::new(request_id, token, params, 0))
+        .map(|&(request_id, token)| DecodeStepItem::new(request_id, token, params, None))
         .collect();
     let start = Instant::now();
     let result = executor.execute_decode(DecodePlan {

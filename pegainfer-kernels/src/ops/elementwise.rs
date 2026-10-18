@@ -1,10 +1,12 @@
 use anyhow::Result;
 use anyhow::anyhow;
+use anyhow::bail;
 use cudarc::driver::CudaSlice;
 use cudarc::driver::DevicePtr;
 use cudarc::driver::DevicePtrMut;
 
 use crate::ffi;
+use crate::tensor::Columns;
 use crate::tensor::DeviceContext;
 use crate::tensor::DeviceVec;
 use crate::tensor::HiddenStates;
@@ -45,6 +47,53 @@ pub fn add_batch_into(
     };
     result.result()?;
 
+    Ok(())
+}
+
+/// Advance the per-row decode tables written by a regular graph replay.
+pub fn advance_decode_metadata(
+    ctx: &DeviceContext,
+    positions: &mut CudaSlice<i32>,
+    local_last: &mut CudaSlice<i32>,
+    pseudo_last: &mut CudaSlice<i32>,
+    kv_chunk: &mut CudaSlice<i32>,
+    rows: usize,
+    factor: usize,
+) -> Result<()> {
+    anyhow::ensure!(rows > 0, "advance_decode_metadata: rows must be positive");
+    anyhow::ensure!(
+        factor > 0,
+        "advance_decode_metadata: factor must be positive"
+    );
+    let pseudo_rows = rows
+        .checked_mul(factor)
+        .filter(|n| i32::try_from(*n).is_ok())
+        .ok_or_else(|| anyhow!("advance_decode_metadata: rows x factor exceeds i32"))?;
+    anyhow::ensure!(
+        positions.len() >= rows
+            && local_last.len() >= rows
+            && kv_chunk.len() >= rows
+            && pseudo_last.len() >= pseudo_rows,
+        "advance_decode_metadata: {rows} rows x {factor} exceeds a table"
+    );
+    let rows = super::checked_i32(rows, "advance decode metadata rows")?;
+    let factor = super::checked_i32(factor, "advance decode metadata factor")?;
+    let (positions_ptr, _positions_guard) = positions.device_ptr_mut(&ctx.stream);
+    let (local_ptr, _local_guard) = local_last.device_ptr_mut(&ctx.stream);
+    let (pseudo_ptr, _pseudo_guard) = pseudo_last.device_ptr_mut(&ctx.stream);
+    let (chunk_ptr, _chunk_guard) = kv_chunk.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::advance_decode_metadata_cuda(
+            positions_ptr as *mut i32,
+            local_ptr as *mut i32,
+            pseudo_ptr as *mut i32,
+            chunk_ptr as *mut i32,
+            rows,
+            factor,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    result.result()?;
     Ok(())
 }
 
@@ -219,7 +268,7 @@ pub fn scaled_add_rows_token_range_into(
 pub fn gather_hidden_tokens_into(
     ctx: &DeviceContext,
     input: &HiddenStates,
-    token_indices: &CudaSlice<i32>,
+    token_indices: &impl DevicePtr<i32>,
     token_count: usize,
     out: &mut HiddenStates,
 ) -> Result<()> {
@@ -792,6 +841,106 @@ pub fn silu_mul_fused_batch_into(
     Ok(())
 }
 
+/// Split contiguous `[Q; K; V]` projection output into compact Q/K/V tensors.
+///
+/// This is a BF16 bitwise copy. The checked shape boundary matters because a
+/// wrong local TP dimension would otherwise corrupt the following attention
+/// buffers and surface only at a later CUDA call.
+pub fn split_qkv_into(
+    ctx: &DeviceContext,
+    qkv: &HiddenStates,
+    q: &mut HiddenStates,
+    k: &mut HiddenStates,
+    v: &mut HiddenStates,
+) -> Result<()> {
+    anyhow::ensure!(
+        q.hidden_dim > 0 && k.hidden_dim > 0 && qkv.seq_len > 0,
+        "split_qkv requires non-empty Q, KV, and token dimensions; got q_dim={}, kv_dim={}, tokens={}",
+        q.hidden_dim,
+        k.hidden_dim,
+        qkv.seq_len
+    );
+    anyhow::ensure!(
+        k.hidden_dim == v.hidden_dim,
+        "K/V dimensions must match: k_dim={}, v_dim={}",
+        k.hidden_dim,
+        v.hidden_dim
+    );
+    anyhow::ensure!(
+        qkv.hidden_dim == q.hidden_dim + k.hidden_dim + v.hidden_dim,
+        "QKV input dimension {} must equal Q + K + V ({} + {} + {})",
+        qkv.hidden_dim,
+        q.hidden_dim,
+        k.hidden_dim,
+        v.hidden_dim
+    );
+    anyhow::ensure!(
+        qkv.seq_len == q.seq_len,
+        "QKV/Q token count mismatch: qkv={}, q={}",
+        qkv.seq_len,
+        q.seq_len
+    );
+    anyhow::ensure!(
+        qkv.seq_len == k.seq_len,
+        "QKV/K token count mismatch: qkv={}, k={}",
+        qkv.seq_len,
+        k.seq_len
+    );
+    anyhow::ensure!(
+        qkv.seq_len == v.seq_len,
+        "QKV/V token count mismatch: qkv={}, v={}",
+        qkv.seq_len,
+        v.seq_len
+    );
+
+    let q_dim = i32::try_from(q.hidden_dim)
+        .map_err(|_| anyhow!("Q dimension {} exceeds i32", q.hidden_dim))?;
+    let kv_dim = i32::try_from(k.hidden_dim)
+        .map_err(|_| anyhow!("KV dimension {} exceeds i32", k.hidden_dim))?;
+    let tokens = i32::try_from(qkv.seq_len)
+        .map_err(|_| anyhow!("QKV token count {} exceeds i32", qkv.seq_len))?;
+    i32::try_from(qkv.hidden_dim)
+        .map_err(|_| anyhow!("QKV dimension {} exceeds i32", qkv.hidden_dim))?;
+    i32::try_from(
+        qkv.hidden_dim
+            .checked_mul(qkv.seq_len)
+            .ok_or_else(|| anyhow!("QKV element count overflow"))?,
+    )
+    .map_err(|_| {
+        anyhow!(
+            "QKV element count {}×{} exceeds CUDA kernel i32 indexing",
+            qkv.hidden_dim,
+            qkv.seq_len
+        )
+    })?;
+
+    let (qkv_ptr, _gqkv) = qkv.data.device_ptr(&ctx.stream);
+    let (q_ptr, _gq) = q.data.device_ptr_mut(&ctx.stream);
+    let (k_ptr, _gk) = k.data.device_ptr_mut(&ctx.stream);
+    let (v_ptr, _gv) = v.data.device_ptr_mut(&ctx.stream);
+    let status = unsafe {
+        ffi::split_qkv_cuda(
+            qkv_ptr as *const ffi::Half,
+            q_ptr as *mut ffi::Half,
+            k_ptr as *mut ffi::Half,
+            v_ptr as *mut ffi::Half,
+            q_dim,
+            kv_dim,
+            tokens,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    if status != 0 {
+        return Err(anyhow!(
+            "split_qkv CUDA launch failed: cuda_status={status}, q_dim={}, kv_dim={}, tokens={}",
+            q.hidden_dim,
+            k.hidden_dim,
+            qkv.seq_len
+        ));
+    }
+    Ok(())
+}
+
 /// Extract a single token's vector from a HiddenStates batch (GPU copy)
 pub fn extract_vec(
     ctx: &DeviceContext,
@@ -861,12 +1010,246 @@ pub fn write_vec_into(
     Ok(())
 }
 
+/// Batched GELU-tanh+mul into a pre-allocated output buffer:
+/// `out = gelu_tanh(gate) * up` (Gemma 4 MLP, `gelu_pytorch_tanh`). The
+/// kernel matches HF's op-sequence rounding: activation in f32, cast to
+/// bf16, then multiplied in f32 and rounded once more. `gate` and `up` are
+/// column bands read at their own row strides, so both may come from one
+/// fused gate|up projection row.
+pub fn gelu_tanh_mul_batch_into<'a>(
+    ctx: &DeviceContext,
+    gate: impl Into<Columns<'a>>,
+    up: impl Into<Columns<'a>>,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    let (gate, up) = (gate.into(), up.into());
+    anyhow::ensure!(
+        gate.width == up.width && gate.states.seq_len == up.states.seq_len,
+        "gelu_tanh_mul gate {}x{} != up {}x{}",
+        gate.width,
+        gate.states.seq_len,
+        up.width,
+        up.states.seq_len
+    );
+    anyhow::ensure!(
+        out.hidden_dim == gate.width && out.seq_len == gate.states.seq_len,
+        "gelu_tanh_mul out {}x{} != gate {}x{}",
+        out.hidden_dim,
+        out.seq_len,
+        gate.width,
+        gate.states.seq_len
+    );
+    for (band, what) in [(gate, "gelu_tanh_mul gate"), (up, "gelu_tanh_mul up")] {
+        anyhow::ensure!(
+            band.col
+                .checked_add(band.width)
+                .is_some_and(|end| end <= band.states.hidden_dim),
+            "{what} columns [{}..+{}) exceed the row's {}",
+            band.col,
+            band.width,
+            band.states.hidden_dim
+        );
+        band.states.checked_extent(what)?;
+    }
+    let n = out.checked_extent("gelu_tanh_mul out")?;
+    let n = super::checked_i32(n, "gelu_tanh_mul extent")?;
+    let cols = super::checked_i32(gate.width, "gelu_tanh_mul width")?;
+    let gate_stride = super::checked_i32(gate.states.hidden_dim, "gelu_tanh_mul gate stride")?;
+    let up_stride = super::checked_i32(up.states.hidden_dim, "gelu_tanh_mul up stride")?;
+    let band_bytes = |band: &Columns<'_>| (band.col * std::mem::size_of::<half::bf16>()) as u64;
+    let (g_ptr, _gg) = gate.states.data.device_ptr(&ctx.stream);
+    let g_ptr = g_ptr + band_bytes(&gate);
+    let (u_ptr, _gu) = up.states.data.device_ptr(&ctx.stream);
+    let u_ptr = u_ptr + band_bytes(&up);
+    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+
+    let result = unsafe {
+        ffi::gelu_tanh_mul_cuda(
+            g_ptr as *const ffi::Half,
+            u_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            cols,
+            gate_stride,
+            up_stride,
+            n,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    result
+        .result()
+        .map_err(|e| anyhow!("gelu_tanh_mul_cuda failed: {e}"))?;
+
+    Ok(())
+}
+
+/// In-place final-logit softcap: `x = cap * tanh(x / cap)` in f32 with a
+/// single rounding back to bf16, matching the reference's compute-dtype
+/// application. Gemma 4 declares `final_logit_softcapping` 30.0 at every
+/// published size.
+pub fn softcap_bf16_in_place(ctx: &DeviceContext, buf: &mut HiddenStates, cap: f32) -> Result<()> {
+    if !cap.is_finite() || cap <= 0.0 {
+        return Err(anyhow!(
+            "softcap_bf16_in_place cap {cap} must be positive and finite"
+        ));
+    }
+    let n = buf.checked_extent("softcap_bf16 buf")?;
+    let n = super::checked_i32(n, "softcap_bf16 extent")?;
+    let (buf_ptr, _gb) = buf.data.device_ptr_mut(&ctx.stream);
+
+    let result = unsafe {
+        ffi::softcap_bf16_in_place_cuda(
+            buf_ptr as *mut ffi::Half,
+            cap,
+            n,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    result
+        .result()
+        .map_err(|e| anyhow!("softcap_bf16_in_place_cuda failed: {e}"))?;
+
+    Ok(())
+}
+
+/// Device-resident suppression ids that were held against a head width when
+/// they were uploaded. The kernel indexes `logits` by these ids without
+/// re-reading them on the host, so the bound has to be structural: this type
+/// is the only way to reach it, and it cannot be built without the check.
+pub struct SuppressIds {
+    ids: CudaSlice<u32>,
+    vocab: usize,
+}
+
+impl SuppressIds {
+    /// Upload `ids` for a head that spans `vocab` columns, refusing any id
+    /// the head does not contain.
+    pub fn upload(ctx: &DeviceContext, ids: &[u32], vocab: usize) -> Result<Self> {
+        for &id in ids {
+            if id as usize >= vocab {
+                bail!("suppression id {id} is outside the {vocab} columns the head spans");
+            }
+        }
+        let ids = ctx
+            .stream
+            .clone_htod(ids)
+            .map_err(|e| anyhow!("uploading suppression ids failed: {e}"))?;
+        Ok(Self { ids, vocab })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+}
+
+/// Write negative infinity into every `(row, id)` slot in `logits` with one
+/// launch.
+pub fn suppress_logits_bf16_in_place(
+    ctx: &DeviceContext,
+    logits: &mut HiddenStates,
+    ids: &SuppressIds,
+) -> Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    if logits.hidden_dim != ids.vocab {
+        bail!(
+            "suppression ids were checked against {} columns but these logits span {}",
+            ids.vocab,
+            logits.hidden_dim
+        );
+    }
+    logits.checked_extent("suppress_logits_bf16 logits")?;
+    let vocab = super::checked_i32(logits.hidden_dim, "suppression vocabulary")?;
+    let rows = super::checked_i32(logits.seq_len, "suppression rows")?;
+    let id_count = super::checked_i32(ids.ids.len(), "suppression id count")?;
+    let (logits_ptr, _logits_guard) = logits.data.device_ptr_mut(&ctx.stream);
+    let (ids_ptr, _ids_guard) = ids.ids.device_ptr(&ctx.stream);
+    let result = unsafe {
+        ffi::suppress_logits_bf16_in_place_cuda(
+            logits_ptr as *mut ffi::Half,
+            ids_ptr as *const u32,
+            vocab,
+            rows,
+            id_count,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    result
+        .result()
+        .map_err(|e| anyhow!("suppress_logits_bf16_in_place_cuda failed: {e}"))
+}
+
+/// In-place multiply by a host scalar — Gemma 4's per-layer `layer_scalar`,
+/// a `[1]` weight the model reads to the host at load.
+pub fn scale_bf16_in_place(ctx: &DeviceContext, buf: &mut HiddenStates, scale: f32) -> Result<()> {
+    if !scale.is_finite() {
+        return Err(anyhow!("scale_bf16_in_place scale must be finite"));
+    }
+    let n = buf.checked_extent("scale_bf16 buf")?;
+    let n = super::checked_i32(n, "scale_bf16 extent")?;
+    let (buf_ptr, _gb) = buf.data.device_ptr_mut(&ctx.stream);
+
+    let result = unsafe {
+        ffi::scale_bf16_in_place_cuda(
+            buf_ptr as *mut ffi::Half,
+            scale,
+            n,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    result
+        .result()
+        .map_err(|e| anyhow!("scale_bf16_in_place_cuda failed: {e}"))?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use half::bf16;
 
     use super::*;
-    use crate::tensor::DeviceMatrix;
+
+    /// The suppression contract, beside the kernel that owns it: writes are
+    /// exactly the given ids, the upload refuses an id at the head's width,
+    /// and ids validated against a different head never reach these logits.
+    #[test]
+    #[ignore = "requires a GPU"]
+    fn the_suppression_mask_writes_only_the_ids_it_is_given() {
+        let ctx = DeviceContext::new().expect("GPU required");
+        let (vocab, rows) = (8usize, 2usize);
+        let mut logits = HiddenStates::zeros(&ctx, vocab, rows).expect("logits");
+        let suppress_ids = SuppressIds::upload(&ctx, &[3u32, 5], vocab).expect("ids");
+        suppress_logits_bf16_in_place(&ctx, &mut logits, &suppress_ids).expect("suppress");
+
+        let host = logits.to_host(&ctx).expect("D2H");
+        for row in 0..rows {
+            for id in 0..vocab {
+                let value = host[row * vocab + id];
+                if id == 3 || id == 5 {
+                    assert!(
+                        value == f32::NEG_INFINITY,
+                        "row {row} id {id} is {value}, not suppressed"
+                    );
+                } else {
+                    assert!(value == 0.0, "row {row} id {id} moved to {value}");
+                }
+            }
+        }
+
+        // The bound is structural: an id the head does not span cannot reach
+        // the kernel, and neither can ids checked against a different head.
+        let past_the_head = SuppressIds::upload(&ctx, &[vocab as u32], vocab);
+        assert!(
+            past_the_head.is_err(),
+            "an id at the head's width must be refused at upload"
+        );
+        let other_head = SuppressIds::upload(&ctx, &[1u32], vocab + 1).expect("ids");
+        assert!(
+            suppress_logits_bf16_in_place(&ctx, &mut logits, &other_head).is_err(),
+            "ids checked against a wider head must not be applied to these logits"
+        );
+    }
 
     fn hidden_from_host(
         ctx: &DeviceContext,
@@ -885,6 +1268,21 @@ mod tests {
         let host = ctx.stream.clone_dtoh(&hidden.data)?;
         ctx.sync()?;
         Ok(host)
+    }
+
+    fn assert_bf16_bits_eq(actual: &[bf16], expected: &[bf16], context: &str) {
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "{context}: element count mismatch"
+        );
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_eq!(
+                actual.to_bits(),
+                expected.to_bits(),
+                "{context}: BF16 bits mismatch at index {index}"
+            );
+        }
     }
 
     #[test]
@@ -935,52 +1333,66 @@ mod tests {
     }
 
     #[test]
-    fn vstacked_gate_up_gemm_matches_split_mlp_projection() -> Result<()> {
+    fn split_qkv_is_a_bitwise_copy_for_tp_shapes_and_tails() -> Result<()> {
         let ctx = DeviceContext::new()?;
-        let hidden_dim = 2;
-        let intermediate = 4;
-        let seq_len = 3;
+        for (q_dim, kv_dim, tokens) in [
+            // Qwen3-4B/8B production decode geometry at the largest target batch.
+            (4096, 1024, 8),
+            // Deliberately not aligned to the 256-thread launch width.
+            (5, 3, 7),
+        ] {
+            let qkv_dim = q_dim + 2 * kv_dim;
+            let source: Vec<_> = (0..qkv_dim * tokens)
+                .map(|idx| bf16::from_bits((idx as u16).wrapping_mul(977).wrapping_add(13)))
+                .collect();
+            let qkv = hidden_from_host(&ctx, &source, qkv_dim, tokens)?;
+            let mut q = HiddenStates::zeros(&ctx, q_dim, tokens)?;
+            let mut k = HiddenStates::zeros(&ctx, kv_dim, tokens)?;
+            let mut v = HiddenStates::zeros(&ctx, kv_dim, tokens)?;
 
-        let gate_w: Vec<_> = [1.0, -0.5, -2.0, 0.25, 0.75, 1.5, -1.25, -0.75]
-            .into_iter()
-            .map(bf16::from_f32)
-            .collect();
-        let up_w: Vec<_> = [-0.25, 2.0, 1.25, -1.0, 0.5, 0.75, -1.5, 1.0]
-            .into_iter()
-            .map(bf16::from_f32)
-            .collect();
-        let input: Vec<_> = [0.5, -1.0, 2.0, 0.25, -0.75, 1.5]
-            .into_iter()
-            .map(bf16::from_f32)
-            .collect();
+            split_qkv_into(&ctx, &qkv, &mut q, &mut k, &mut v)?;
 
-        let gate_w = DeviceMatrix::from_host(&ctx, &gate_w, intermediate, hidden_dim)?;
-        let up_w = DeviceMatrix::from_host(&ctx, &up_w, intermediate, hidden_dim)?;
-        let gate_up_w = DeviceMatrix::vstack(&ctx, &[&gate_w, &up_w])?;
-        let input = hidden_from_host(&ctx, &input, hidden_dim, seq_len)?;
-
-        let gate = crate::ops::gemm(&ctx, &gate_w, &input)?;
-        let up = crate::ops::gemm(&ctx, &up_w, &input)?;
-        let split = silu_mul_batch(&ctx, &gate, &up)?;
-
-        let gate_up = crate::ops::gemm(&ctx, &gate_up_w, &input)?;
-        let mut fused = HiddenStates::zeros(&ctx, intermediate, seq_len)?;
-        silu_mul_fused_batch_into(&ctx, &gate_up, &mut fused)?;
-
-        let split_host = hidden_to_host(&ctx, &split)?;
-        let fused_host = hidden_to_host(&ctx, &fused)?;
-        assert_eq!(split_host.len(), fused_host.len());
-        for (idx, (split_value, fused_value)) in
-            split_host.iter().zip(fused_host.iter()).enumerate()
-        {
-            let split_f32 = split_value.to_f32();
-            let fused_f32 = fused_value.to_f32();
-            let diff = (split_f32 - fused_f32).abs();
-            assert!(
-                diff <= 0.02,
-                "vstacked gate_up GEMM mismatch at index {idx}: split={split_f32} fused={fused_f32} diff={diff}"
-            );
+            let q_host = hidden_to_host(&ctx, &q)?;
+            let k_host = hidden_to_host(&ctx, &k)?;
+            let v_host = hidden_to_host(&ctx, &v)?;
+            for token in 0..tokens {
+                let src = token * qkv_dim;
+                let q_start = token * q_dim;
+                let kv_start = token * kv_dim;
+                assert_bf16_bits_eq(
+                    &q_host[q_start..q_start + q_dim],
+                    &source[src..src + q_dim],
+                    &format!("Q q_dim={q_dim} kv_dim={kv_dim} tokens={tokens} token={token}"),
+                );
+                assert_bf16_bits_eq(
+                    &k_host[kv_start..kv_start + kv_dim],
+                    &source[src + q_dim..src + q_dim + kv_dim],
+                    &format!("K q_dim={q_dim} kv_dim={kv_dim} tokens={tokens} token={token}"),
+                );
+                assert_bf16_bits_eq(
+                    &v_host[kv_start..kv_start + kv_dim],
+                    &source[src + q_dim + kv_dim..src + qkv_dim],
+                    &format!("V q_dim={q_dim} kv_dim={kv_dim} tokens={tokens} token={token}"),
+                );
+            }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn split_qkv_rejects_mismatched_shapes_without_launching() -> Result<()> {
+        let ctx = DeviceContext::new()?;
+        let qkv = HiddenStates::zeros(&ctx, 12, 1)?;
+        let mut q = HiddenStates::zeros(&ctx, 5, 1)?;
+        let mut k = HiddenStates::zeros(&ctx, 3, 1)?;
+        let mut v = HiddenStates::zeros(&ctx, 3, 1)?;
+
+        let error = split_qkv_into(&ctx, &qkv, &mut q, &mut k, &mut v)
+            .expect_err("mismatched QKV dimensions must fail before launch");
+        assert!(
+            error.to_string().contains("must equal Q + K + V"),
+            "unexpected shape error: {error:#}"
+        );
         Ok(())
     }
 

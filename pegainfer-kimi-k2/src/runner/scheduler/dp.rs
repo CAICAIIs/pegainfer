@@ -3,11 +3,11 @@ use crossbeam_channel::Receiver;
 use crossbeam_channel::Sender;
 use crossbeam_channel::bounded;
 use log::error;
-use pegainfer_core::engine::FinishReason;
-use pegainfer_core::engine::GenerateRequest;
-use pegainfer_core::engine::SubmittedRequest;
-use pegainfer_core::engine::TokenEvent;
-use pegainfer_core::engine::TokenSink;
+use pegainfer_frontend::engine::FinishReason;
+use pegainfer_frontend::engine::GenerateRequest;
+use pegainfer_frontend::engine::SubmittedRequest;
+use pegainfer_frontend::engine::TokenEvent;
+use pegainfer_frontend::engine::TokenSink;
 use pegainfer_kv_cache::BlockPool;
 use pegainfer_kv_cache::RequestKv;
 use rand::rngs::StdRng;
@@ -1095,7 +1095,7 @@ fn rank_forward_loop(
 
 #[cfg(test)]
 mod tests {
-    use pegainfer_core::sampler::SamplingParams;
+    use pegainfer_frontend::sampler::SamplingParams;
 
     use super::*;
 
@@ -1112,8 +1112,8 @@ mod tests {
             lora_adapter: None,
             kv_transfer_params: None,
             token_tx,
-            logprobs: 0,
-            echo: false,
+            logprobs: None,
+            prompt_logprobs: None,
         }
     }
 
@@ -1223,7 +1223,7 @@ mod tests {
         assert_eq!(positions, vec![6]);
         assert_eq!(slots, vec![MAX_BATCH_PER_DP - 1]);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].logprobs, 0);
+        assert_eq!(rows[0].logprobs, None);
         // 6 KV tokens + this step's append fit one 16-token page.
         assert_eq!(kv_pages.rows(), 1);
         assert_eq!(kv_pages.row(0).expect("row 0").len(), 1);
@@ -1246,7 +1246,7 @@ mod tests {
                 append_position: 5,
                 slot: 3,
                 options: KimiRowOptions {
-                    logprobs: 4,
+                    logprobs: Some(4),
                     sampling: SamplingParams::default(),
                 },
                 pages: vec![5],
@@ -1275,9 +1275,9 @@ mod tests {
         assert_eq!(token_ids, vec![11, 99]);
         assert_eq!(positions, vec![5, 0]);
         assert_eq!(slots, vec![3, 7]);
-        assert_eq!(rows[0].logprobs, 4);
+        assert_eq!(rows[0].logprobs, Some(4));
         assert!(rows[0].sampling.is_greedy());
-        assert_eq!(rows[1].logprobs, 0);
+        assert_eq!(rows[1].logprobs, None);
         assert!(!rows[1].sampling.is_greedy());
         assert!((rows[1].sampling.temperature - 0.8).abs() < f32::EPSILON);
         assert_eq!(kv_pages.rows(), 2);
@@ -1367,7 +1367,7 @@ mod tests {
             max_tokens: 16,
             last_token: 7,
             options: KimiRowOptions {
-                logprobs: 0,
+                logprobs: None,
                 sampling: SamplingParams {
                     ignore_eos: true,
                     ..SamplingParams::default()

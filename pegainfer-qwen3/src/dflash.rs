@@ -252,7 +252,7 @@ impl DFlashBatchScratch {
             up_out: HiddenStates::zeros(ctx, inter_dim, batch_rows)?,
             act_out: HiddenStates::zeros(ctx, inter_dim, batch_rows)?,
             logits_normed: HiddenStates::zeros(ctx, hidden_size, batch_rows)?,
-            logits: HiddenStates::zeros(ctx, config.vocab_size, batch_rows)?,
+            logits: HiddenStates::zeros(ctx, config.logits_rows, batch_rows)?,
             tail_input: HiddenStates::zeros(ctx, hidden_size, tail_capacity)?,
             k_tail: HiddenStates::zeros(ctx, kv_dim, tail_capacity)?,
             v_tail: HiddenStates::zeros(ctx, kv_dim, tail_capacity)?,
@@ -263,8 +263,16 @@ impl DFlashBatchScratch {
         })
     }
 
-    /// The batched backbone draft logits `[active_batch * block_size, vocab]`,
-    /// request-major, as produced by [`DFlashDraftModel::draft_logits_batched`].
+    /// Markov scratch's max batch (chain-rows), `0` for a plain DFlash
+    /// drafter — the hedge ladder's capacity guard.
+    pub(crate) fn markov_max_batch(&self) -> usize {
+        self.markov
+            .as_ref()
+            .map_or(0, crate::dspark::MarkovScratch::max_batch)
+    }
+
+    /// The batched backbone draft logits `[active_batch * block_size, logits_rows]`,
+    /// request-major, as produced by `DFlashDraftModel::draft_logits_batched`.
     pub(crate) fn logits(&self) -> &HiddenStates {
         &self.logits
     }
@@ -757,7 +765,7 @@ impl DFlashDraftModel {
         for (i, state) in states.iter_mut().enumerate() {
             state.committed_len += context_lens[i];
         }
-        self.compute_logits_with_target_head_into(target, scratch);
+        self.compute_logits_with_target_head_into(target, scratch)?;
         Ok(&scratch.logits)
     }
 
@@ -794,6 +802,70 @@ impl DFlashDraftModel {
         )
     }
 
+    /// Chain-A markov proposal plus per-branch-position runner-up capture
+    /// (see [`crate::dspark::MarkovHead::sample_block_with_runners`]).
+    pub(crate) fn markov_draft_with_runners(
+        &self,
+        ctx: &DeviceContext,
+        current_tokens: &[u32],
+        branch_positions: &[usize],
+        scratch: &mut DFlashBatchScratch,
+    ) -> Result<Vec<u32>> {
+        let markov = self
+            .markov
+            .as_ref()
+            .context("markov_draft_with_runners called on a non-DSpark drafter")?;
+        let DFlashBatchScratch {
+            logits,
+            markov: markov_scratch,
+            ..
+        } = scratch;
+        let markov_scratch = markov_scratch
+            .as_mut()
+            .context("Markov scratch was not allocated for a DSpark drafter")?;
+        markov.sample_block_with_runners(
+            ctx,
+            logits,
+            current_tokens,
+            self.block_size(),
+            branch_positions,
+            markov_scratch,
+        )
+    }
+
+    /// Batched hedge-chain ladder (see
+    /// [`crate::dspark::MarkovHead::sample_chain_ladder`]).
+    pub(crate) fn markov_chain_ladder(
+        &self,
+        ctx: &DeviceContext,
+        chain_a: &[u32],
+        req_map: &[u32],
+        positions: &[usize],
+        scratch: &mut DFlashBatchScratch,
+    ) -> Result<Vec<u32>> {
+        let markov = self
+            .markov
+            .as_ref()
+            .context("markov_chain_ladder called on a non-DSpark drafter")?;
+        let DFlashBatchScratch {
+            logits,
+            markov: markov_scratch,
+            ..
+        } = scratch;
+        let markov_scratch = markov_scratch
+            .as_mut()
+            .context("Markov scratch was not allocated for a DSpark drafter")?;
+        markov.sample_chain_ladder(
+            ctx,
+            logits,
+            chain_a,
+            req_map,
+            positions,
+            self.block_size(),
+            markov_scratch,
+        )
+    }
+
     fn context_feature_dim(&self) -> usize {
         self.config.hidden_size * self.target_layer_ids().len()
     }
@@ -823,7 +895,7 @@ impl DFlashDraftModel {
         &self,
         target: &Qwen3Model,
         scratch: &mut DFlashBatchScratch,
-    ) {
+    ) -> Result<()> {
         let ctx = target.device_ctx();
         ops::rms_norm_batch_into(
             ctx,
@@ -832,12 +904,7 @@ impl DFlashDraftModel {
             self.config.rms_norm_eps,
             &mut scratch.logits_normed,
         );
-        ops::gemm_into(
-            ctx,
-            target.output_projection(),
-            &scratch.logits_normed,
-            &mut scratch.logits,
-        );
+        target.project_logits(ctx, &scratch.logits_normed, &mut scratch.logits)
     }
 }
 
@@ -886,7 +953,8 @@ mod tests {
         // 2560*5*2) drives the ~12% block haircut; a layer-count or geometry
         // regression here would silently over/under-reserve and risk OOM.
         let reservation =
-            super::DFlashMemoryReservation::from_config(&dflash, /*max_decode_batch*/ 256);
+            super::DFlashMemoryReservation::from_config(&dflash, /*max_decode_batch*/ 256)
+                .expect("reservation sizing");
         assert_eq!(
             reservation.kv_bytes_per_token, 65_536,
             "draft KV(20480) + scratch-ctx(19456) + pending(25600) per token"
@@ -894,7 +962,9 @@ mod tests {
         // Weights (~1.1 GiB) dominate the fixed term at batch=1; the block-sized
         // per-request scratch (~6.5 MiB, logits-heavy) plus the one-block KV/tail
         // headroom (~0.5 MiB) add across the decode batch.
-        let fixed_batch1 = super::DFlashMemoryReservation::from_config(&dflash, 1).fixed_bytes;
+        let fixed_batch1 = super::DFlashMemoryReservation::from_config(&dflash, 1)
+            .expect("reservation sizing")
+            .fixed_bytes;
         assert!(
             (1_150_000_000..1_220_000_000).contains(&fixed_batch1),
             "draft weights ~1.1GiB, got {fixed_batch1}"

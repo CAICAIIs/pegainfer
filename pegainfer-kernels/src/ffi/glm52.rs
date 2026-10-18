@@ -44,6 +44,27 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    /// CuTe DSL tcgen05 AOT twin of the groupwise GEMM (glm52_fp8_dsl_gemm.c).
+    /// Table-dispatched on exact (m, n, k); load once before any CUDA-graph
+    /// capture. Returns cudaError_t values (0 = success).
+    pub fn glm52_fp8_dsl_gemm_load_cuda() -> i32;
+
+    pub fn glm52_fp8_dsl_gemm_supported_cuda(m: i32, n: i32, k: i32) -> i32;
+
+    pub fn glm52_fp8_dsl_gemm_cuda(
+        activation: *const u8,
+        activation_scale: *const f32,
+        weight: *const u8,
+        weight_scale: *const f32,
+        output: *mut Half,
+        workspace: *mut u8,
+        workspace_bytes: usize,
+        m: i32,
+        n: i32,
+        k: i32,
+        stream: CUstream,
+    ) -> i32;
+
     pub fn glm52_fp8_grouped_gemm_sm100_cuda(
         activation: *const u8,
         activation_scale: *const f32,
@@ -203,6 +224,7 @@ unsafe extern "C" {
         cache: *mut u8,
         slot_mapping: *const i64,
         max_slots: i64,
+        block_stride_bytes: i64,
         tokens: i32,
         stream: CUstream,
     ) -> CUresult;
@@ -389,6 +411,7 @@ unsafe extern "C" {
         block_ids: *const i32,
         blocks: i32,
         packed_bytes: i32,
+        packed_block_stride: i64,
         max_slots: i64,
         unpacked: *mut Half,
         stream: CUstream,

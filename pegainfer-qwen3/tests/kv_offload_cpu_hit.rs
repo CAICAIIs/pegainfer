@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use pegainfer_core::sampler::SamplingParams;
+use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_qwen3::Qwen3LoraOptions;
 use pegainfer_qwen3::Qwen3OffloadOptions;
 use pegainfer_qwen3::runtime::PrefillPlan;
@@ -73,8 +73,8 @@ fn prefill_item(id: u64, prompt: &[u32]) -> PrefillStepItem {
         prompt.to_vec(),
         MAX_OUTPUT,
         SamplingParams::default(),
-        LOGPROBS,
-        false,
+        Some(LOGPROBS),
+        None,
     )
 }
 
@@ -144,7 +144,6 @@ fn live_gpu_and_cpu_prefix_hits() {
         pegainfer_qwen3::DEFAULT_MAX_PREFILL_TOKENS,
         None,
         pegainfer_qwen3::Qwen3MemoryOptions::default(),
-        false,
     )
     .expect("build offload executor");
     assert!(ex.offload_enabled(), "offload must be active");
@@ -164,7 +163,6 @@ fn cpu_tier_restores_evicted_prefix(ex: &mut Qwen3Executor) {
         .execute_prefill(PrefillPlan {
             sample_seed: 0,
             requests: &[prefill_item(1, &p)],
-            echo: false,
         })
         .expect("cold prefill");
     assert_eq!(
@@ -194,7 +192,6 @@ fn cpu_tier_restores_evicted_prefix(ex: &mut Qwen3Executor) {
         .execute_prefill(PrefillPlan {
             sample_seed: 0,
             requests: &[prefill_item(2, &p)],
-            echo: false,
         })
         .expect("warm prefill");
     assert_eq!(
@@ -222,7 +219,6 @@ fn gpu_and_cpu_combined_hit(ex: &mut Qwen3Executor) {
         .execute_prefill(PrefillPlan {
             sample_seed: 0,
             requests: &[prefill_item(1, &full)],
-            echo: false,
         })
         .expect("cold full prefill");
     assert_eq!(
@@ -241,7 +237,6 @@ fn gpu_and_cpu_combined_hit(ex: &mut Qwen3Executor) {
         .execute_prefill(PrefillPlan {
             sample_seed: 0,
             requests: &[prefill_item(2, &short)],
-            echo: false,
         })
         .expect("short prefill");
     assert_eq!(
@@ -269,7 +264,6 @@ fn gpu_and_cpu_combined_hit(ex: &mut Qwen3Executor) {
         .execute_prefill(PrefillPlan {
             sample_seed: 0,
             requests: &[prefill_item(3, &full)],
-            echo: false,
         })
         .expect("warm full prefill");
     assert_eq!(

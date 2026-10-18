@@ -1,6 +1,9 @@
 #include "common.cuh"
+#include "ffi_guard.cuh"
+#include <climits>
 #include <cstdint>
 #include <cuda.h>
+#include <math_constants.h>
 
 // ============================================================================
 // Element-wise add: out = a + b (bf16, computed in f32)
@@ -177,10 +180,42 @@ __global__ void scaled_add_rows_indexed_kernel(
          row < rows;
          row += gridDim.x * blockDim.x) {
       int delta_idx = token * rows + row;
-      int out_idx = out_token * out_hidden_dim + row_offset + row;
+      // out_token * out_hidden_dim overflows i32 for large row pools (the K3
+      // paged-KV slab exceeds 2^31 elements), so the element index is size_t.
+      size_t out_idx =
+          (size_t)out_token * out_hidden_dim + row_offset + row;
       float base = __bfloat162float(out[out_idx]);
       float add = __bfloat162float(delta[delta_idx]) * scale;
       out[out_idx] = __float2bfloat16(base + add);
+    }
+  }
+}
+
+__global__ void store_rows_indexed_kernel(
+    const __nv_bfloat16 *__restrict__ src,
+    const int *__restrict__ token_indices,
+    __nv_bfloat16 *__restrict__ out,
+    int out_hidden_dim,
+    int row_offset,
+    int rows,
+    int token_count,
+    int out_seq_len) {
+  for (int token = blockIdx.y * blockDim.y + threadIdx.y;
+       token < token_count;
+       token += gridDim.y * blockDim.y) {
+    int out_token = token_indices[token];
+    if (out_token < 0 || out_token >= out_seq_len) {
+      continue;
+    }
+    for (int row = blockIdx.x * blockDim.x + threadIdx.x;
+         row < rows;
+         row += gridDim.x * blockDim.x) {
+      int src_idx = token * rows + row;
+      // out_token * out_hidden_dim overflows i32 for large row pools (the K3
+      // paged-KV slab exceeds 2^31 elements), so the element index is size_t.
+      size_t out_idx =
+          (size_t)out_token * out_hidden_dim + row_offset + row;
+      out[out_idx] = src[src_idx];
     }
   }
 }
@@ -269,6 +304,99 @@ __global__ void silu_mul_kernel(
     float silu_g = g / (1.0f + expf(-g));
     // Match Triton rounding: silu result cast to bf16 before multiply
     out[idx] = __float2bfloat16(__bfloat162float(__float2bfloat16(silu_g)) * u);
+  }
+}
+
+// ============================================================================
+// GELU-tanh-mul from separate gate/up buffers: out = gelu_tanh(gate) * up
+// (Gemma 4 MLP, hidden_activation "gelu_pytorch_tanh" — the tanh
+// approximation, not erf). Matches the HF op sequence rounding: act_fn(gate)
+// materializes a bf16 tensor before the elementwise multiply, so the
+// activation is computed in f32, cast to bf16, then multiplied in f32 and
+// rounded once more.
+// ============================================================================
+
+// `gate` and `up` are column bands of row-major activations, `cols` wide and
+// each at its own row stride, so both may sit in one fused gate|up row; the
+// output is contiguous and `n = rows * cols`.
+__global__ void gelu_tanh_mul_kernel(
+    const __nv_bfloat16 *__restrict__ gate,
+    const __nv_bfloat16 *__restrict__ up,
+    __nv_bfloat16 *__restrict__ out,
+    int cols,
+    int gate_stride,
+    int up_stride,
+    int n) {
+  // sqrt(2/pi), the gelu_pytorch_tanh constant.
+  const float kSqrt2OverPi = 0.7978845608028654f;
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+       idx < n;
+       idx += gridDim.x * blockDim.x) {
+    int row = idx / cols;
+    int col = idx - row * cols;
+    float g = __bfloat162float(gate[(int64_t)row * gate_stride + col]);
+    float u = __bfloat162float(up[(int64_t)row * up_stride + col]);
+    float inner = kSqrt2OverPi * (g + 0.044715f * g * g * g);
+    float gelu_g = 0.5f * g * (1.0f + tanhf(inner));
+    out[idx] = __float2bfloat16(__bfloat162float(__float2bfloat16(gelu_g)) * u);
+  }
+}
+
+// ============================================================================
+// In-place final-logit softcap: buf[i] = bf16(cap * tanh(f32(buf[i]) / cap)).
+// Gemma 4 declares final_logit_softcapping (30.0 at every published size) and
+// applies it to the LM head output in the compute dtype; f32 internal with a
+// single rounding matches the reference's bf16 elementwise chain.
+// ============================================================================
+
+__global__ void softcap_bf16_kernel(
+    __nv_bfloat16 *__restrict__ buf,
+    float cap,
+    int n) {
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+       idx < n;
+       idx += gridDim.x * blockDim.x) {
+    float x = __bfloat162float(buf[idx]);
+    buf[idx] = __float2bfloat16(cap * tanhf(x / cap));
+  }
+}
+
+// ============================================================================
+// In-place logit suppression. Ids reach here only through the Rust
+// `SuppressIds` type, which refuses any id outside the head at upload.
+// ============================================================================
+
+__global__ void suppress_logits_bf16_kernel(
+    __nv_bfloat16 *__restrict__ logits,
+    const uint32_t *__restrict__ ids,
+    int vocab,
+    int id_count,
+    int total) {
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+       idx < total;
+       idx += gridDim.x * blockDim.x) {
+    int row = idx / id_count;
+    int id_slot = idx % id_count;
+    logits[(size_t)row * vocab + ids[id_slot]] =
+        __float2bfloat16(-CUDART_INF_F);
+  }
+}
+
+// ============================================================================
+// In-place multiply by a host scalar: buf[i] = bf16(f32(buf[i]) * scale).
+// Serves Gemma 4's per-layer layer_scalar, a [1] weight the model reads to
+// the host at load; f32 compute with a single rounding matches HF's bf16
+// elementwise multiply.
+// ============================================================================
+
+__global__ void scale_bf16_kernel(
+    __nv_bfloat16 *__restrict__ buf,
+    float scale,
+    int n) {
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+       idx < n;
+       idx += gridDim.x * blockDim.x) {
+    buf[idx] = __float2bfloat16(__bfloat162float(buf[idx]) * scale);
   }
 }
 
@@ -399,6 +527,27 @@ __global__ void embedding_batched_vocab_shard_vec4_kernel(
   }
 }
 
+// Advances the device tables a regular decode step will consume next.
+static const int ADVANCE_DECODE_METADATA_BLOCK = 32;
+
+__global__ void advance_decode_metadata_kernel(
+    int *__restrict__ positions,
+    int *__restrict__ local_last,
+    int *__restrict__ pseudo_last,
+    int *__restrict__ kv_chunk,
+    int rows,
+    int factor) {
+  int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row < rows) {
+    positions[row] += 1;
+    local_last[row] += 1;
+    kv_chunk[row] += 1;
+    for (int copy = 0; copy < factor; ++copy) {
+      pseudo_last[row * factor + copy] += 1;
+    }
+  }
+}
+
 extern "C" {
 
 CUresult add_cuda(
@@ -407,7 +556,7 @@ CUresult add_cuda(
   int block = 256;
   int grid = (n + block - 1) / block;
   add_kernel<<<grid, block, 0, stream>>>(a, b, out, n);
-  return (CUresult)cudaGetLastError();
+  return map_cuda_error(cudaGetLastError());
 }
 
 CUresult add_scaled_bf16_cuda(
@@ -422,7 +571,7 @@ CUresult add_scaled_bf16_cuda(
   int grid = (n + block - 1) / block;
   add_scaled_bf16_kernel<<<grid, block, 0, stream>>>(
       routed, scale, shared, out, n);
-  return (CUresult)cudaGetLastError();
+  return map_cuda_error(cudaGetLastError());
 }
 
 CUresult scaled_add_rows_cuda(
@@ -447,7 +596,7 @@ CUresult scaled_add_rows_cuda(
   dim3 grid(grid_x, grid_y);
   scaled_add_rows_kernel<<<grid, block, 0, stream>>>(
       delta, scale, out, out_hidden_dim, row_offset, rows, seq_len);
-  return (CUresult)cudaGetLastError();
+  return map_cuda_error(cudaGetLastError());
 }
 
 CUresult gather_hidden_tokens_cuda(
@@ -467,7 +616,7 @@ CUresult gather_hidden_tokens_cuda(
   int grid = (total + block - 1) / block;
   gather_hidden_tokens_kernel<<<grid, block, 0, stream>>>(
       input, token_indices, out, hidden_dim, token_count, input_seq_len);
-  return (CUresult)cudaGetLastError();
+  return map_cuda_error(cudaGetLastError());
 }
 
 CUresult extract_hidden_rows_cuda(
@@ -489,7 +638,7 @@ CUresult extract_hidden_rows_cuda(
   int grid = (total + block - 1) / block;
   extract_hidden_rows_kernel<<<grid, block, 0, stream>>>(
       src, dst, src_hidden_dim, dst_hidden_dim, col_offset, rows, seq_len);
-  return (CUresult)cudaGetLastError();
+  return map_cuda_error(cudaGetLastError());
 }
 
 CUresult copy_hidden_rows_cuda(
@@ -511,7 +660,7 @@ CUresult copy_hidden_rows_cuda(
   int grid = (total + block - 1) / block;
   copy_hidden_rows_kernel<<<grid, block, 0, stream>>>(
       src, dst, src_hidden_dim, dst_hidden_dim, row_offset, rows, seq_len);
-  return (CUresult)cudaGetLastError();
+  return map_cuda_error(cudaGetLastError());
 }
 
 CUresult mask_position_zero_rows_cuda(
@@ -530,7 +679,7 @@ CUresult mask_position_zero_rows_cuda(
   int grid = (total + block - 1) / block;
   mask_position_zero_rows_kernel<<<grid, block, 0, stream>>>(
       src, positions, dst, hidden_dim, rows);
-  return (CUresult)cudaGetLastError();
+  return map_cuda_error(cudaGetLastError());
 }
 
 CUresult copy_hidden_token_range_cuda(
@@ -555,7 +704,7 @@ CUresult copy_hidden_token_range_cuda(
   int grid = (total + block - 1) / block;
   copy_hidden_token_range_kernel<<<grid, block, 0, stream>>>(
       src, dst, hidden_dim, src_token_offset, dst_token_offset, token_count);
-  return (CUresult)cudaGetLastError();
+  return map_cuda_error(cudaGetLastError());
 }
 
 CUresult scaled_add_rows_indexed_cuda(
@@ -584,7 +733,35 @@ CUresult scaled_add_rows_indexed_cuda(
   scaled_add_rows_indexed_kernel<<<grid, block, 0, stream>>>(
       delta, scale, token_indices, out, out_hidden_dim, row_offset, rows,
       token_count, out_seq_len);
-  return (CUresult)cudaGetLastError();
+  return map_cuda_error(cudaGetLastError());
+}
+
+CUresult store_rows_indexed_cuda(
+    const __nv_bfloat16 *src,
+    const int *token_indices,
+    __nv_bfloat16 *out,
+    int out_hidden_dim,
+    int row_offset,
+    int rows,
+    int token_count,
+    int out_seq_len,
+    cudaStream_t stream) {
+  if (src == nullptr || token_indices == nullptr || out == nullptr ||
+      out_hidden_dim <= 0 || row_offset < 0 || rows <= 0 ||
+      token_count <= 0 || out_seq_len <= 0 ||
+      row_offset + rows > out_hidden_dim) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  dim3 block(32, 8);
+  int grid_x = (rows + block.x - 1) / block.x;
+  int grid_y = (token_count + block.y - 1) / block.y;
+  grid_x = grid_x > 65535 ? 65535 : grid_x;
+  grid_y = grid_y > 65535 ? 65535 : grid_y;
+  dim3 grid(grid_x, grid_y);
+  store_rows_indexed_kernel<<<grid, block, 0, stream>>>(
+      src, token_indices, out, out_hidden_dim, row_offset, rows,
+      token_count, out_seq_len);
+  return map_cuda_error(cudaGetLastError());
 }
 
 CUresult bf16_to_f32_cuda(
@@ -592,7 +769,7 @@ CUresult bf16_to_f32_cuda(
   int block = 256;
   int grid = (n + block - 1) / block;
   bf16_to_f32_kernel<<<grid, block, 0, stream>>>(input, output, n);
-  return (CUresult)cudaGetLastError();
+  return map_cuda_error(cudaGetLastError());
 }
 
 CUresult f32_to_bf16_cuda(
@@ -600,14 +777,14 @@ CUresult f32_to_bf16_cuda(
   int block = 256;
   int grid = (n + block - 1) / block;
   f32_to_bf16_kernel<<<grid, block, 0, stream>>>(input, output, n);
-  return (CUresult)cudaGetLastError();
+  return map_cuda_error(cudaGetLastError());
 }
 
 CUresult scale_f32_cuda(float *values, float scale, int n, cudaStream_t stream) {
   int block = 256;
   int grid = (n + block - 1) / block;
   scale_f32_kernel<<<grid, block, 0, stream>>>(values, scale, n);
-  return (CUresult)cudaGetLastError();
+  return map_cuda_error(cudaGetLastError());
 }
 
 CUresult accumulate_bf16_token_scaled_to_f32_cuda(
@@ -626,7 +803,7 @@ CUresult accumulate_bf16_token_scaled_to_f32_cuda(
   int grid = (hidden_dim + block - 1) / block;
   accumulate_bf16_token_scaled_to_f32_kernel<<<grid, block, 0, stream>>>(
       token, scale, out, hidden_dim, token_idx, seq_len);
-  return (CUresult)cudaGetLastError();
+  return map_cuda_error(cudaGetLastError());
 }
 
 CUresult repeat_f32_for_reduce_scatter_cuda(
@@ -637,7 +814,7 @@ CUresult repeat_f32_for_reduce_scatter_cuda(
   int grid = (total + block - 1) / block;
   repeat_f32_rows_for_reduce_scatter_kernel<<<grid, block, 0, stream>>>(
       local, repeated, local_elems, world_size);
-  return (CUresult)cudaGetLastError();
+  return map_cuda_error(cudaGetLastError());
 }
 
 CUresult silu_mul_triton_aot_cuda(
@@ -646,7 +823,99 @@ CUresult silu_mul_triton_aot_cuda(
   int block = 256;
   int grid = (n + block - 1) / block;
   silu_mul_kernel<<<grid, block, 0, stream>>>(gate, up, out, n);
-  return (CUresult)cudaGetLastError();
+  return map_cuda_error(cudaGetLastError());
+}
+
+// Eight elements a thread through 16-byte loads and stores, the same
+// per-element arithmetic as the scalar form, so the two round alike; the
+// launcher picks it whenever every band and row is eight elements aligned.
+__global__ void gelu_tanh_mul_vec8_kernel(
+    const __nv_bfloat16 *__restrict__ gate,
+    const __nv_bfloat16 *__restrict__ up,
+    __nv_bfloat16 *__restrict__ out,
+    int cols8,
+    int gate_stride,
+    int up_stride,
+    int n8) {
+  const float kSqrt2OverPi = 0.7978845608028654f;
+  union Pack8 {
+    uint4 u;
+    __nv_bfloat16 h[8];
+  };
+  for (int v = blockIdx.x * blockDim.x + threadIdx.x;
+       v < n8;
+       v += gridDim.x * blockDim.x) {
+    int row = v / cols8;
+    int col = (v - row * cols8) * 8;
+    Pack8 g, u, o;
+    g.u = *reinterpret_cast<const uint4 *>(gate + (int64_t)row * gate_stride + col);
+    u.u = *reinterpret_cast<const uint4 *>(up + (int64_t)row * up_stride + col);
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+      float gv = __bfloat162float(g.h[i]);
+      float uv = __bfloat162float(u.h[i]);
+      float inner = kSqrt2OverPi * (gv + 0.044715f * gv * gv * gv);
+      float gelu_g = 0.5f * gv * (1.0f + tanhf(inner));
+      o.h[i] = __float2bfloat16(__bfloat162float(__float2bfloat16(gelu_g)) * uv);
+    }
+    *reinterpret_cast<uint4 *>(out + (int64_t)v * 8) = o.u;
+  }
+}
+
+CUresult gelu_tanh_mul_cuda(
+    const __nv_bfloat16 *gate, const __nv_bfloat16 *up,
+    __nv_bfloat16 *out, int cols, int gate_stride, int up_stride, int n,
+    cudaStream_t stream) {
+  if (cols <= 0 || gate_stride < cols || up_stride < cols || n % cols != 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  int block = 256;
+  bool vec8 = cols % 8 == 0 && gate_stride % 8 == 0 && up_stride % 8 == 0 &&
+              (reinterpret_cast<uintptr_t>(gate) & 15) == 0 &&
+              (reinterpret_cast<uintptr_t>(up) & 15) == 0 &&
+              (reinterpret_cast<uintptr_t>(out) & 15) == 0;
+  if (vec8) {
+    int n8 = n / 8;
+    int grid = n8 / block + (n8 % block != 0);
+    gelu_tanh_mul_vec8_kernel<<<grid, block, 0, stream>>>(
+        gate, up, out, cols / 8, gate_stride, up_stride, n8);
+  } else {
+    int grid = n / block + (n % block != 0);
+    gelu_tanh_mul_kernel<<<grid, block, 0, stream>>>(
+        gate, up, out, cols, gate_stride, up_stride, n);
+  }
+  return map_cuda_error(cudaGetLastError());
+}
+
+CUresult scale_bf16_in_place_cuda(
+    __nv_bfloat16 *buf, float scale, int n, cudaStream_t stream) {
+  int block = 256;
+  int grid = n / block + (n % block != 0);
+  scale_bf16_kernel<<<grid, block, 0, stream>>>(buf, scale, n);
+  return map_cuda_error(cudaGetLastError());
+}
+
+CUresult softcap_bf16_in_place_cuda(
+    __nv_bfloat16 *buf, float cap, int n, cudaStream_t stream) {
+  int block = 256;
+  int grid = n / block + (n % block != 0);
+  softcap_bf16_kernel<<<grid, block, 0, stream>>>(buf, cap, n);
+  return map_cuda_error(cudaGetLastError());
+}
+
+CUresult suppress_logits_bf16_in_place_cuda(
+    __nv_bfloat16 *logits, const uint32_t *ids,
+    int vocab, int rows, int id_count, cudaStream_t stream) {
+  if (logits == nullptr || ids == nullptr || vocab <= 0 || rows <= 0 ||
+      id_count <= 0 || id_count > INT_MAX / rows) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  int total = rows * id_count;
+  int block = 256;
+  int grid = total / block + (total % block != 0);
+  suppress_logits_bf16_kernel<<<grid, block, 0, stream>>>(
+      logits, ids, vocab, id_count, total);
+  return map_cuda_error(cudaGetLastError());
 }
 
 CUresult embedding_decode_cuda(
@@ -655,7 +924,7 @@ CUresult embedding_decode_cuda(
   int block = 256;
   int grid = (hidden_size + block - 1) / block;
   embedding_decode_kernel<<<grid, block, 0, stream>>>(embed, token_id, out, hidden_size);
-  return (CUresult)cudaGetLastError();
+  return map_cuda_error(cudaGetLastError());
 }
 
 // Whether the vectorized row-copy embedding kernels can serve this call:
@@ -684,13 +953,13 @@ CUresult embedding_batched_cuda(
     embedding_batched_vec4_kernel<<<grid, EMBEDDING_VEC4_BLOCK, 0, stream>>>(
         reinterpret_cast<const uint4 *>(embed), token_ids,
         reinterpret_cast<uint4 *>(out), hidden_vec, seq_len);
-    return (CUresult)cudaGetLastError();
+    return map_cuda_error(cudaGetLastError());
   }
   int block = 256;
   int total = hidden_size * seq_len;
   int grid = (total + block - 1) / block;
   embedding_batched_kernel<<<grid, block, 0, stream>>>(embed, token_ids, out, hidden_size, seq_len);
-  return (CUresult)cudaGetLastError();
+  return map_cuda_error(cudaGetLastError());
 }
 
 CUresult embedding_batched_vocab_shard_cuda(
@@ -707,14 +976,28 @@ CUresult embedding_batched_vocab_shard_cuda(
         reinterpret_cast<const uint4 *>(embed), token_ids,
         reinterpret_cast<uint4 *>(out), hidden_vec, seq_len,
         vocab_start, part_vocab_size);
-    return (CUresult)cudaGetLastError();
+    return map_cuda_error(cudaGetLastError());
   }
   int block = 256;
   int total = hidden_size * seq_len;
   int grid = (total + block - 1) / block;
   embedding_batched_vocab_shard_kernel<<<grid, block, 0, stream>>>(
       embed, token_ids, out, hidden_size, seq_len, vocab_start, part_vocab_size);
-  return (CUresult)cudaGetLastError();
+  return map_cuda_error(cudaGetLastError());
+}
+
+CUresult advance_decode_metadata_cuda(
+    int *positions, int *local_last, int *pseudo_last, int *kv_chunk,
+    int rows, int factor, cudaStream_t stream) {
+  if (positions == nullptr || local_last == nullptr || pseudo_last == nullptr ||
+      kv_chunk == nullptr || rows <= 0 || factor <= 0 || rows > INT_MAX / factor) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  int block = ADVANCE_DECODE_METADATA_BLOCK;
+  int grid = 1 + (rows - 1) / block;
+  advance_decode_metadata_kernel<<<grid, block, 0, stream>>>(
+      positions, local_last, pseudo_last, kv_chunk, rows, factor);
+  return map_cuda_error(cudaGetLastError());
 }
 
 } // extern "C"

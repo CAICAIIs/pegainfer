@@ -5,7 +5,7 @@
 //! isolated, the path choice is the only thing that can move its decode output across the boundary.
 //! The isolation is asserted, not assumed.
 
-use pegainfer_core::sampler::SamplingParams;
+use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_kernels::ops::NumericPolicy;
 use pegainfer_kernels::ops::set_numeric_policy;
 use pegainfer_qwen3::runtime::DecodePlan;
@@ -40,8 +40,8 @@ fn pitem(id: RequestId, prompt: Vec<u32>) -> PrefillStepItem {
         prompt,
         MAX_OUTPUT_TOKENS,
         SamplingParams::default(),
-        LOGPROBS,
-        false,
+        Some(LOGPROBS),
+        None,
     )
 }
 
@@ -60,7 +60,6 @@ fn prefill_chunked(ex: &mut Qwen3Executor, id: RequestId, prompt: &[u32]) -> (u3
             .execute_prefill(PrefillPlan {
                 sample_seed: 0,
                 requests: std::slice::from_ref(&item),
-                echo: false,
             })
             .expect("prefill chunk");
         let r = &pr.requests[0];
@@ -91,7 +90,7 @@ fn a_decode_at_batch(
         id_a,
         a_first,
         SamplingParams::default(),
-        LOGPROBS,
+        Some(LOGPROBS),
     )];
     let mut cofill_ids = Vec::with_capacity(n_cofill);
     for i in 0..n_cofill {
@@ -101,7 +100,7 @@ fn a_decode_at_batch(
             id,
             f_first,
             SamplingParams::default(),
-            LOGPROBS,
+            Some(LOGPROBS),
         ));
         cofill_ids.push(id);
     }

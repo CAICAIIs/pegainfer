@@ -26,15 +26,57 @@ impl KvCacheManager {
         block_size: usize,
         num_blocks: usize,
     ) -> anyhow::Result<Self> {
-        let buffer = KvBuffer::new(
+        Self::new_with_scratch_pages(
             stream,
             num_layers,
             num_kv_heads,
             head_dim,
             block_size,
             num_blocks,
+            0,
+        )
+    }
+
+    /// Like [`new`](Self::new), plus `scratch_pages` extra pages in the GPU
+    /// buffer that the pool never hands out. Their page ids are
+    /// `num_blocks..num_blocks + scratch_pages`; ownership and content are the
+    /// caller's business (e.g. the speculative hedge's alternative-chain verify
+    /// KV). The transaction layer is unaware of them by construction.
+    pub fn new_with_scratch_pages(
+        stream: &Arc<CudaStream>,
+        num_layers: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        block_size: usize,
+        num_blocks: usize,
+        scratch_pages: usize,
+    ) -> anyhow::Result<Self> {
+        let buffer = KvBuffer::new(
+            stream,
+            num_layers,
+            num_kv_heads,
+            head_dim,
+            block_size,
+            num_blocks.checked_add(scratch_pages).ok_or_else(|| {
+                anyhow::anyhow!("KV pages {num_blocks} + scratch {scratch_pages} overflow")
+            })?,
         )?;
         let pool = BlockPool::new(block_size, num_blocks)?;
+        Ok(Self { pool, buffer })
+    }
+
+    /// Pair an existing physical KV buffer with a new logical block pool.
+    ///
+    /// `num_blocks` may be smaller than the physical allocation. Tensor-parallel
+    /// executors use this to choose the minimum common logical capacity across
+    /// rank-local buffers while keeping one shared page-id namespace.
+    pub fn from_buffer(buffer: KvBuffer, num_blocks: usize) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            num_blocks <= buffer.num_blocks(),
+            "logical KV block count {num_blocks} exceeds physical buffer capacity {}",
+            buffer.num_blocks()
+        );
+        let pool = BlockPool::new(buffer.layout().page_size, num_blocks)?;
         Ok(Self { pool, buffer })
     }
 

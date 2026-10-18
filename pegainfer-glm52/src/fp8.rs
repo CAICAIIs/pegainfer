@@ -48,6 +48,9 @@ impl Glm52Fp8GemmScratch {
             rows > 0 && rows.is_multiple_of(4) && width.is_multiple_of(FP8_BLOCK),
             "GLM5.2 FP8 GEMM scratch requires rows%4=0 and width%128=0"
         );
+        // Scratch construction runs before the bucket's CUDA-graph capture —
+        // the only legal window for the DSL AOT module load.
+        pegainfer_kernels::ops::glm52_fp8_dsl_preload();
         Ok(Self {
             rows,
             width,
@@ -501,16 +504,6 @@ impl Glm52MlpScratch {
                 })
                 .transpose()?,
         })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn gate_up(&self) -> &CudaSlice<bf16> {
-        &self.gate_up
-    }
-
-    #[cfg(test)]
-    pub(crate) fn silu_out(&self) -> &CudaSlice<bf16> {
-        &self.silu_out
     }
 }
 
