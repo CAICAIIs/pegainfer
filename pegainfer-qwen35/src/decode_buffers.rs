@@ -23,6 +23,11 @@ use super::config::LocalGeometry;
 /// 1235 GB/s load-only floor. See `docs/models/qwen35/decode-kernel-attribution.md`.
 pub(crate) const SPLIT_DECODE_MAX_BATCH: usize = 64;
 
+/// Query heads per kv head the split-KV kernel is built for, one warp each. A
+/// checkpoint with another GQA group (the 27B sizes run 6) keeps the FlashInfer
+/// path at every bucket, since the kernel refuses that geometry.
+pub(crate) const SPLIT_DECODE_GQA_GROUP: usize = 4;
+
 /// KV splits per (kv head, request) CTA group, for a decode bucket.
 ///
 /// Fixed per bucket rather than derived from KV length because the grid shape
