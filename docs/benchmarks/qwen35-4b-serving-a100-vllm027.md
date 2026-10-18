@@ -2,7 +2,7 @@
 
 **Created**: 2026-09
 
-**TL;DR**: Same-session, same-client comparison of PegaInfer `upstream/main` + #1072 + #1073 against vLLM 0.27.0 on 1x A100-40GB, four cells, zero failed requests. PegaInfer beats vLLM's mean TPOT at bs1 (8.16 against 8.21 ms) and c8 (9.81 against 10.07), stays 6.1% behind at c16 (11.79 against 11.12) and 23% behind at qps16 (29.71 against 24.06), wins single-request TTFT by 2.5x, and — under the opt-in `--decode-overlap stream` + `--qwen35-scheduler-policy auto` pose, measured on the tree before #1073 — wins qps16 mean TPOT (20.89 against 24.06 ms), qps16 ITL p99 (39.0 against 97.0) and c16 ITL p99 (34.2 against 85.5). Output throughput is within 2% of vLLM at bs1, c8 and c16 and 7.3% behind at qps16. The prefill budget is a separate dial measured here: 4096 instead of the 1024 default improves TPOT, TTFT and throughput on all three cells and cuts the c8 and c16 tails five- to six-fold, but triples the qps16 p99 because the whole-run total falls while the longest step grows.
+**TL;DR**: Same-session, same-client comparison of PegaInfer `upstream/main` + #1072 + #1073 against vLLM 0.27.0 on 1x A100-40GB, four cells, zero failed requests. With `--max-prefill-tokens 4096`, PegaInfer beats vLLM's mean TPOT at bs1 (8.16 against 8.21 ms) and c8 (9.81 against 10.07), stays 6.1% behind at c16 (11.79 against 11.12) and 23% behind at qps16 (29.71 against 24.06), wins single-request TTFT by 2.5x, and — under the opt-in `--decode-overlap stream` + `--qwen35-scheduler-policy auto` pose, measured on the tree before #1073 — wins qps16 mean TPOT (20.89 against 24.06 ms), qps16 ITL p99 (39.0 against 97.0) and c16 ITL p99 (34.2 against 85.5). Output throughput is within 2% of vLLM at bs1, c8 and c16 and 7.3% behind at qps16. The prefill budget is a separate dial measured here: 4096 instead of the 1024 default improves TPOT, TTFT and throughput on all three cells and cuts the c8 and c16 tails five- to six-fold, but triples the qps16 p99 because the whole-run total falls while the longest step grows.
 
 ## Setup
 
@@ -12,16 +12,16 @@
 | Model | Qwen3.5-4B, BF16, TP1, text-only serving, `/mnt/data/models/Qwen3.5-4B` |
 | PegaInfer | `upstream/main` `8f455a18` + #1072 (split-KV decode) + #1073 (fused linear-attention projections), release build `--features qwen35` |
 | vLLM | 0.27.0 (`~/vllm-omni-venv`), FLASH_ATTN + FLA Triton GDN + FlashInfer sampler, piecewise CUDA graphs |
-| PegaInfer flags | default, and `--decode-overlap stream --max-batch 32 --qwen35-scheduler-policy auto` |
+| PegaInfer flags | `--max-prefill-tokens 4096`, and `--decode-overlap stream --max-batch 32 --qwen35-scheduler-policy auto` |
 | vLLM flags | `--dtype bfloat16 --max-model-len 8192 --gpu-memory-utilization 0.90 --no-enable-prefix-caching` |
 | Client | `vllm bench serve` from the same venv, OpenAI `/v1/completions`, `--dataset-name random --random-range-ratio 0 --temperature 0 --ignore-eos --seed 42` |
 | Cells | bs1 and c8 and c16 at 1024 in / 256 out; qps16 at 1024 in / 128 out, `--request-rate 16`, 64 prompts |
 
 ## Results
 
-Mean TPOT, and the tail and first-token metrics beside it. Lower is better everywhere except output tok/s. The default column is the current tree (#1072 and #1073, two runs a side); the auto+stream column was measured on the tree before #1073 and is kept as the record of that pose.
+Mean TPOT, and the tail and first-token metrics beside it. Lower is better everywhere except output tok/s. The 4096 column is the current tree (#1072 and #1073, two runs a side) at `--max-prefill-tokens 4096`; at the 1024 default the c8, c16 and qps16 rows move the way the prefill budget section below shows; the auto+stream column was measured on the tree before #1073 and is kept as the record of that pose.
 
-| cell | metric | vLLM 0.27 | PegaInfer default | PegaInfer auto+stream |
+| cell | metric | vLLM 0.27 | PegaInfer 4096 | PegaInfer auto+stream |
 | --- | --- | --- | --- | --- |
 | bs1 @1024/256 | TPOT | 8.21 | **8.16** | 8.55 |
 | | TTFT | 198.3 | **78** | 88 |
@@ -72,7 +72,7 @@ Against vLLM 0.27 this moves c8 to parity (10.15 against 10.07 ms) with an ITL p
 
 ## Claim boundary
 
-Two runs per PegaInfer configuration and one run per vLLM cell, zero failed requests on every row. The default column is four runs a side across two cards: two interleaved a/b/b/a sessions on device 1, and two more a side on device 0 against the same baseline binary, which reproduced the fusion's delta at every cell (bs1 −2.6%, c8 −3.0%, c16 −3.7%, qps16 −1.1%) with the absolute rows agreeing to 0.05 ms between the cards. The vLLM column is one same-session run per cell on device 1. These are single-host snapshot numbers: the c16 and qps16 rows are not parity claims and the run-to-run spread on this card is around 0.5% on mean TPOT at c16. bs1 TTFT is measured at `max-concurrency 1` and includes the engine's own startup of that request only.
+Two runs per PegaInfer configuration and one run per vLLM cell, zero failed requests on every row. The 4096 column is four runs a side across two cards: two interleaved a/b/b/a sessions on device 1, and two more a side on device 0 against the same baseline binary, which reproduced the fusion's delta at every cell (bs1 −2.6%, c8 −3.0%, c16 −3.7%, qps16 −1.1%) with the absolute rows agreeing to 0.05 ms between the cards. The vLLM column is one same-session run per cell on device 1. These are single-host snapshot numbers: the c16 and qps16 rows are not parity claims and the run-to-run spread on this card is around 0.5% on mean TPOT at c16. bs1 TTFT is measured at `max-concurrency 1` and includes the engine's own startup of that request only.
 
 ## Next step
 
