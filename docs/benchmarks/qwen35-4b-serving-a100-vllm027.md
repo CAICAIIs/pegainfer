@@ -47,13 +47,13 @@ Every row completed with zero failed requests on both engines.
 - **Prefill admission is what the overlap pose costs.** qps16 TTFT goes 772 → 1024 ms and c16 stays 23% behind vLLM. vLLM holds both a low TTFT and a low TPOT, so it is overlapping without starving prefill. This is a scheduler question, not a kernel one.
 - **The c8 tail is a separate loss.** 31.4 ms p99 against vLLM's 26.9 under the same pose, while c16 and qps16 are won. Whatever blocks decode during a prefill at concurrency 8 is not what blocks it at 16.
 
-## The prefill budget is a latency/throughput dial, and it now ships at 4096
+## The prefill budget is a latency/throughput dial
 
-`--max-prefill-tokens` sets how many prompt tokens one step may prefill, and so how many admitted prompts ride in a single unified step. How finely prefill is chopped turns out to be the structural difference against vLLM on these cells: at the old 1024 default a 1024-token prompt consumes the whole budget and exactly one prompt is prefilled per step, so a ramp costs one step per request and c16 spends sixteen steps admitting sixteen requests. Per layer-step our GDN prefill is already the faster of the two — 247 µs against FLA's 433 — and the whole cost is in how many steps the same work is spread over.
+`--max-prefill-tokens` sets how many prompt tokens one step may prefill, and so how many admitted prompts ride in a single unified step. How finely prefill is chopped turns out to be the structural difference against vLLM on these cells: at the 1024 default a 1024-token prompt consumes the whole budget and exactly one prompt is prefilled per step, so a ramp costs one step per request and c16 spends sixteen steps admitting sixteen requests. Per layer-step our GDN prefill is already the faster of the two — 247 µs against FLA's 433 — and the whole cost is in how many steps the same work is spread over.
 
 Two runs a side, default pose, zero failed requests:
 
-| cell | metric | 1024 | **4096 (new default)** |
+| cell | metric | 1024 | **4096** |
 | --- | --- | --- | --- |
 | c8 | mean TPOT | 10.42 / 10.47 ms | **10.14 / 10.11 ms** |
 | c8 | ITL p99 | 64.9 / 65.8 ms | **10.2 / 10.2 ms** |
@@ -66,7 +66,7 @@ Two runs a side, default pose, zero failed requests:
 | qps16 | output throughput | 1140 / 1140 tok/s | **1289 / 1287 tok/s** |
 | qps16 | ITL p99 | 95.9 / 97.0 ms | 260.7 / 261.5 ms |
 
-Every metric this snapshot is about improves, and the c8 and c16 tails improve sixfold with them. The one regression is qps16's ITL p99, and it is the same mechanism viewed from the other side: that cell really does queue several prompts, and a step carrying five of them is longer than a step carrying two. The scheduler trace at 4096 shows the step count falling 203 → 172 and the total step time 7130 → 6291 ms while the longest step rises 97.5 → 267.4 ms, so the whole-run total and the tail move in opposite directions. `--max-prefill-tokens 1024` restores the old behaviour where that tail matters more than the throughput.
+Every metric this snapshot is about improves, and the c8 and c16 tails improve sixfold with them. The one regression is qps16's ITL p99, and it is the same mechanism viewed from the other side: that cell really does queue several prompts, and a step carrying five of them is longer than a step carrying two. The scheduler trace at 4096 shows the step count falling 203 → 172 and the total step time 7130 → 6291 ms while the longest step rises 97.5 → 267.4 ms, so the whole-run total and the tail move in opposite directions. The default stays at 1024, and `--max-prefill-tokens 4096` selects the other side of the dial where throughput matters more than that tail.
 
 Against vLLM 0.27 this moves c8 to parity (10.15 against 10.07 ms) with an ITL p99 2.5x better, c16 to −8.6% TPOT with a p99 6.8x better, and qps16 to −25% TPOT, half the TTFT and −7.8% throughput.
 

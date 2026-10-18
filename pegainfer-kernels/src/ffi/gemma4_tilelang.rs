@@ -1,10 +1,11 @@
-//! Gemma 4 TileLang-generated global-attention prefill (AOT), built by the
-//! `tilelang` section of `build.rs` from `pegainfer-gemma4/kernels/generate.py`.
+//! Gemma 4 TileLang-generated attention (AOT), built by the `tilelang` section
+//! of `build.rs` from `pegainfer-gemma4/kernels/generate.py`.
 //!
-//! The symbol is a hand-written launcher returning `cudaError_t` as `int`:
+//! Each symbol is a hand-written launcher returning `cudaError_t` as `int`:
 //! `cudaErrorInvalidValue` outside what the body was built for,
-//! `cudaErrorNotSupported` from the stub tier. It owns its own grid, which is
-//! why the query boundaries arrive twice, on the device and on the host.
+//! `cudaErrorNotSupported` from the stub tier. A launcher owns its own grid,
+//! which is why the prefill's query boundaries arrive twice, on the device and
+//! on the host.
 
 use core::ffi::c_void;
 
@@ -15,8 +16,8 @@ unsafe extern "C" {
     /// step's prompt segments. `q` and `out` are bf16 rows of
     /// `[num_qo_heads, head_dim]`, `kv` the pool in rows of
     /// `[num_kv_heads, head_dim]`, and the indptrs the prefill plan's own,
-    /// `host_q_indptr` its host copy. `sm_scale` multiplies the scores; the
-    /// serving path folds `1/sqrt(head_dim)` upstream and passes one.
+    /// `host_q_indptr` its host copy. `sm_scale` multiplies the scores; Gemma
+    /// 4 attends unscaled and passes one.
     /// `fold_rotary` is the pool's row format, zero for split K|V rows. The
     /// extents, `batch`, `page_size` and the head counts are refused rather
     /// than truncated when they exceed what the bodies were built for.
@@ -134,6 +135,39 @@ unsafe extern "C" {
         num_qo_heads: i32,
         num_kv_heads: i32,
         sm_scale: f32,
+        stream: CUstream,
+    ) -> i32;
+
+    /// The W4A16 decode GEMM `y[rows, n] = x[rows, k] @ W^T` for a weight
+    /// in the fragment layout of `gemma4_w4a16_pack_cuda`, from
+    /// `pegainfer-gemma4/kernels/w4a16_generate.py`; for the interleaved
+    /// gate|up shape `y` is `[rows, n / 2]`, gelu(gate) * up. `rows` is a bucket (1, 2,
+    /// 4, 8 or 16): the kernels read and write that many rows. `part` holds
+    /// `ctas * rows * block_n` floats and `flags` `ctas` zeroed ints, which
+    /// the kernels leave zeroed; `fin_off` / `fin_list` are the stream-K
+    /// fix-up table for (n, k). Any (n, k, rows) the bodies were not built
+    /// for is refused.
+    pub fn gemma4_w4a16_gemm(
+        x: *mut c_void,
+        wq: *mut i32,
+        sq: *mut i32,
+        y: *mut c_void,
+        part: *mut f32,
+        flags: *mut i32,
+        fin_off: *mut i32,
+        fin_list: *mut i32,
+        n: i32,
+        k: i32,
+        rows: i32,
+        stream: CUstream,
+    ) -> i32;
+
+    /// Blocks of the (n, k, rows) kernel one SM holds at once, into `blocks`.
+    pub fn gemma4_w4a16_occupancy(
+        n: i32,
+        k: i32,
+        rows: i32,
+        blocks: *mut i32,
         stream: CUstream,
     ) -> i32;
 }

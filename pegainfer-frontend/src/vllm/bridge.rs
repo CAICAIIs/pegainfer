@@ -4,7 +4,6 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU8;
-use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
@@ -18,6 +17,7 @@ use log::warn;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
+use vllm_engine_core_client::ENGINE_CORE_DEAD_SENTINEL;
 use vllm_engine_core_client::EngineId;
 use vllm_engine_core_client::protocol::dtype::ModelDtype;
 use vllm_engine_core_client::protocol::encode_msgpack;
@@ -79,11 +79,11 @@ pub(crate) struct LocalEngineBridge {
 
 impl LocalEngineBridge {
     pub(crate) async fn run(self, shutdown: CancellationToken) -> Result<()> {
-        let BridgeLink {
+        let Some(BridgeLink {
             mut input,
             output_tx,
             mut child_tasks,
-        } = connect_link(
+        }) = connect_link(
             &self.input_address,
             &self.output_address,
             self.engine_index,
@@ -91,9 +91,13 @@ impl LocalEngineBridge {
             self.max_model_len,
             self.handle.kv_capacity(),
             self.metrics_watch.clone(),
+            None,
             &shutdown,
         )
-        .await?;
+        .await?
+        else {
+            return Ok(());
+        };
 
         // One shared channel carries every request's token events, tagged by
         // request id; this loop is the sole consumer. Per-request state lives
@@ -704,22 +708,14 @@ async fn connect_link(
     max_model_len: u32,
     kv_capacity: Option<crate::engine::KvCapacity>,
     metrics_watch: Option<watch::Receiver<SchedulerMetrics>>,
+    engine_dead: Option<CancellationToken>,
     shutdown: &CancellationToken,
-) -> Result<BridgeLink> {
-    wait_for_ipc_endpoint(input_address, shutdown).await?;
-    wait_for_ipc_endpoint(output_address, shutdown).await?;
-
+) -> Result<Option<BridgeLink>> {
     let engine_id = EngineId::from_engine_index(
         u16::try_from(engine_index).context("engine_index exceeds u16 EngineId")?,
     );
     let mut socket_options = SocketOptions::default();
     socket_options.peer_identity(PeerIdentity::try_from(engine_id)?);
-
-    let mut input = DealerSocket::with_options(socket_options);
-    input
-        .connect(input_address)
-        .await
-        .with_context(|| format!("failed to connect local engine input {input_address}"))?;
 
     let (num_gpu_blocks, block_size, kv_cache_size_tokens, kv_cache_max_concurrency) =
         match kv_capacity {
@@ -757,6 +753,7 @@ async fn connect_link(
         max_loras: 0,
         kv_cache_size_tokens,
         kv_cache_max_concurrency,
+        effective_attention_block_size: kv_capacity.map(|c| c.block_size as u64),
         kv_events_config: None,
         weight_transfer_backend: None,
         enable_sleep_mode: false,
@@ -767,20 +764,38 @@ async fn connect_link(
          kv_cache_size_tokens={kv_cache_size_tokens:?} \
          kv_cache_max_concurrency={kv_cache_max_concurrency:?}"
     );
-    input
-        .send(ZmqMessage::from(encode_msgpack(&ready)?))
-        .await
-        .context("failed to send local engine ready response")?;
-
+    let mut input = DealerSocket::with_options(socket_options);
     let mut output = PushSocket::new();
-    output
-        .connect(output_address)
-        .await
-        .with_context(|| format!("failed to connect local engine output {output_address}"))?;
+    let handshake = async {
+        input
+            .connect(input_address)
+            .await
+            .with_context(|| format!("failed to connect local engine input {input_address}"))?;
+        input
+            .send(ZmqMessage::from(encode_msgpack(&ready)?))
+            .await
+            .context("failed to send local engine ready response")?;
+        output
+            .connect(output_address)
+            .await
+            .with_context(|| format!("failed to connect local engine output {output_address}"))
+    };
+    // zeromq retries a refused connect for 30 s, which outlives a server that
+    // failed its own startup and closed the listeners.
+    tokio::select! {
+        biased;
+        () = shutdown.cancelled() => return Ok(None),
+        handshake = handshake => handshake?,
+    }
 
     let (output_tx, output_rx) = mpsc::unbounded_channel();
     let mut child_tasks = tokio::task::JoinSet::new();
-    child_tasks.spawn(async move { ("output sender", output_loop(output, output_rx).await) });
+    child_tasks.spawn(async move {
+        (
+            "output sender",
+            output_loop(output, output_rx, engine_dead).await,
+        )
+    });
 
     // Legacy handle engines republish load snapshots as stats-only output
     // batches: their scheduler loops park when idle, so the watch cadence is
@@ -799,22 +814,34 @@ async fn connect_link(
         });
     }
 
-    Ok(BridgeLink {
+    Ok(Some(BridgeLink {
         input,
         output_tx,
         child_tasks,
-    })
+    }))
 }
 
 async fn output_loop(
     mut output: PushSocket,
     mut output_rx: mpsc::UnboundedReceiver<EngineCoreOutputs>,
+    engine_dead: Option<CancellationToken>,
 ) -> Result<()> {
     while let Some(outputs) = output_rx.recv().await {
         output
             .send(ZmqMessage::from(encode_msgpack(&outputs)?))
             .await
             .context("failed to send local engine output")?;
+    }
+    // Sent after the queued outputs: the client then fails every request it
+    // still tracks, including ones the bridge never read.
+    if engine_dead
+        .as_ref()
+        .is_some_and(CancellationToken::is_cancelled)
+    {
+        output
+            .send(ZmqMessage::from(ENGINE_CORE_DEAD_SENTINEL.to_vec()))
+            .await
+            .context("failed to send the engine dead sentinel")?;
     }
     Ok(())
 }
@@ -914,6 +941,7 @@ fn engine_output(
         mm_cache_miss_hashes: None,
         new_sampling_mask: None,
         spec_decode_metrics: None,
+        prompt_token_id_logprobs: None,
     }
 }
 
@@ -936,22 +964,6 @@ pub(crate) fn local_ipc_namespace() -> Result<PathBuf> {
 
 pub(crate) fn ipc_endpoint(namespace: &Path, name: &str) -> String {
     format!("ipc://{}", namespace.join(name).to_string_lossy())
-}
-
-async fn wait_for_ipc_endpoint(address: &str, shutdown: &CancellationToken) -> Result<()> {
-    let Some(path) = address.strip_prefix("ipc://") else {
-        return Ok(());
-    };
-    let path = Path::new(path);
-    loop {
-        if path.exists() {
-            return Ok(());
-        }
-        tokio::select! {
-            () = shutdown.cancelled() => bail!("shutdown before IPC endpoint appeared"),
-            () = tokio::time::sleep(Duration::from_millis(20)) => {}
-        }
-    }
 }
 
 mod stepped;

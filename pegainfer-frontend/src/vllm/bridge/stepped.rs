@@ -10,6 +10,7 @@
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::Context;
@@ -57,6 +58,7 @@ use crate::engine::SchedulerHandle;
 use crate::engine::StepOutputs;
 use crate::engine::StopCause;
 use crate::engine::Terminal;
+use crate::vllm::history::GENERATION_PROMPT_TOKENS;
 use crate::vllm::wire::convert_finish_reason;
 use crate::vllm::wire::convert_sampling;
 use crate::vllm::wire::convert_stop_policy;
@@ -65,6 +67,8 @@ use crate::vllm::wire::requested_logprobs;
 use crate::vllm::wire::requested_prompt_logprobs;
 use crate::vllm::wire::to_wire_position_logprobs;
 use crate::vllm::wire::to_wire_prompt_logprobs;
+
+const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub(crate) struct SteppedEngineBridge {
     pub(crate) input_address: String,
@@ -78,19 +82,17 @@ pub(crate) struct SteppedEngineBridge {
 
 impl SteppedEngineBridge {
     pub(crate) async fn run(mut self, shutdown: CancellationToken) -> Result<()> {
+        let engine_dead = CancellationToken::new();
         let mut steps = self
             .scheduler
             .take_steps()
             .context("partition step stream already taken")?;
         let mut spec = SpecDecodeTracker::default();
-        // Stats are pull-at-send: no push task, the load cell is read when a
-        // batch goes out (and once here, so the frontend's gauges initialize
-        // before any traffic). An idle engine publishes nothing.
-        let BridgeLink {
+        let Some(BridgeLink {
             mut input,
             output_tx,
             mut child_tasks,
-        } = connect_link(
+        }) = connect_link(
             &self.input_address,
             &self.output_address,
             self.engine_index,
@@ -98,9 +100,13 @@ impl SteppedEngineBridge {
             self.max_model_len,
             self.kv_capacity,
             None,
+            Some(engine_dead.clone()),
             &shutdown,
         )
-        .await?;
+        .await?
+        else {
+            return Ok(());
+        };
         send_outputs(
             &output_tx,
             RequestBatchOutputs {
@@ -154,6 +160,13 @@ impl SteppedEngineBridge {
                         break Err(error).context("failed to dispatch local engine step");
                     }
                 }
+                () = self.scheduler.exited() => {
+                    // Dispatch what the driver committed before it exited first.
+                    if !steps.is_empty() {
+                        continue;
+                    }
+                    break Err(anyhow::anyhow!("scheduler exited"));
+                }
                 recv = input.recv() => {
                     let message = match recv.context("failed to receive local engine request") {
                         Ok(message) => message,
@@ -177,7 +190,23 @@ impl SteppedEngineBridge {
         for state in streams.values() {
             state.control.abort();
         }
+        if run_result.is_err() {
+            engine_dead.cancel();
+        }
         drop(output_tx);
+        // Deliver what is already queued, and after a failure the dead engine
+        // notice, before stopping the link.
+        if tokio::time::timeout(OUTPUT_DRAIN_TIMEOUT, async {
+            while child_tasks.join_next().await.is_some() {}
+        })
+        .await
+        .is_err()
+        {
+            warn!(
+                "local engine {} output did not drain in time",
+                self.engine_index
+            );
+        }
         child_tasks.abort_all();
         while child_tasks.join_next().await.is_some() {}
 
@@ -226,28 +255,6 @@ impl SteppedEngineBridge {
             }
         }
 
-        if outputs.is_empty() {
-            // A drafted step with no batch to ride would strand its increment
-            // until the next batch, which may never come.
-            let stats = self.stats(spec);
-            if stats.spec_decoding_stats.is_some() {
-                send_outputs(
-                    output_tx,
-                    RequestBatchOutputs {
-                        engine_index: self.engine_index,
-                        scheduler_stats: Some(Box::new(stats)),
-                        timestamp: now_secs_f64(),
-                        ..Default::default()
-                    }
-                    .into(),
-                )?;
-            }
-            return Ok(());
-        }
-        // The cell already holds this step's snapshot (the driver publishes
-        // load before committing the step), so the batch carries stats that
-        // match its own tokens — a finishing batch reports the drained state
-        // and the gauges settle instead of freezing at the last busy value.
         send_outputs(
             output_tx,
             RequestBatchOutputs {
@@ -383,11 +390,19 @@ impl SteppedEngineBridge {
                 );
             }
         };
-        let kv_transfer_params = sampling_params
-            .extra_args
-            .as_ref()
-            .and_then(|args| args.get("kv_transfer_params"))
-            .cloned();
+        let extra_arg = |key: &str| {
+            sampling_params
+                .extra_args
+                .as_ref()
+                .and_then(|args| args.get(key))
+        };
+        let kv_transfer_params = extra_arg("kv_transfer_params").cloned();
+        // The chat layer measured the generation prompt's token count at the
+        // tail of a prompt only it saw as text; a count the prompt cannot hold
+        // is no boundary.
+        let history_tokens = extra_arg(GENERATION_PROMPT_TOKENS)
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|tail| prompt_tokens.len().checked_sub(tail as usize));
         // Older stepped model producers still suppress their terminal token
         // and report only `FinishReason::Stop`. Keep the legacy sentinel for
         // that producer shape; typed stop causes carry the real token and do
@@ -414,6 +429,7 @@ impl SteppedEngineBridge {
             // producers that have not migrated to StopPolicy. Qwen3 uses the
             // independent policy below for stop classification.
             params: convert_sampling(&sampling_params),
+            history_tokens,
             stop_policy: convert_stop_policy(&sampling_params),
             max_tokens: sampling_params.max_tokens as usize,
             lora_adapter,
@@ -439,7 +455,7 @@ struct SteppedStream {
     request_id: String,
     control: RequestControl,
     /// Queued/Scheduled wire events, held until the request's first shipped
-    /// output (a scheduled-only update ships nothing on its own).
+    /// output (a scheduled-only update produces no request output).
     first_token_events: Option<Vec<EngineCoreEvent>>,
     /// Set by `Scheduled`; a request refused or failed while still queued
     /// never prefilled and reports no prefill stats.
@@ -659,6 +675,7 @@ mod tests {
     use super::*;
     use crate::engine::PromptEcho;
     use crate::engine::RejectReason;
+    use crate::engine::ScheduledInfo;
     use crate::engine::StopPolicy;
     use crate::engine::TokenLogprob;
     use crate::engine::scheduler_pair;
@@ -667,6 +684,7 @@ mod tests {
         Request {
             prompt_tokens: vec![1, 2],
             params: crate::sampler::SamplingParams::default(),
+            history_tokens: None,
             stop_policy: StopPolicy::default(),
             max_tokens: 1,
             lora_adapter: None,
@@ -717,6 +735,49 @@ mod tests {
             engine_index: 0,
             data_parallel_size: 1,
         }
+    }
+
+    #[test]
+    fn scheduled_and_metrics_only_steps_publish_load_without_request_outputs() {
+        let (handle, backend) = scheduler_pair();
+        let control = handle.submit(request());
+        let mut scheduled = RequestUpdate::empty(control.id());
+        let now = Instant::now();
+        scheduled.scheduled = Some(ScheduledInfo {
+            queued_at: now,
+            scheduled_at: now,
+            prompt_tokens: 2,
+        });
+        let mut streams = HashMap::from([(
+            control.id(),
+            SteppedStream::new("scheduled".into(), control, Span::noop(), None),
+        )]);
+        let bridge = bridge(handle);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut spec = SpecDecodeTracker::default();
+        for (running, updates) in [(1, vec![scheduled]), (0, Vec::new())] {
+            backend.metrics.publish(&crate::engine::SchedulerMetrics {
+                num_running_reqs: running,
+                ..Default::default()
+            });
+            bridge
+                .dispatch_step(
+                    StepOutputs { updates },
+                    &UnixAnchor::now(),
+                    &mut streams,
+                    &mut HashMap::new(),
+                    &mut spec,
+                    &tx,
+                )
+                .unwrap();
+            let EngineCoreOutputs::RequestBatch(batch) = rx.try_recv().expect("load batch") else {
+                panic!("expected scheduler stats");
+            };
+            assert!(batch.outputs.is_empty());
+            let stats = batch.scheduler_stats.expect("scheduler stats");
+            assert_eq!(stats.num_running_reqs, running);
+        }
+        assert!(rx.try_recv().is_err());
     }
 
     fn wire_request(completion: Option<i32>, prompt: Option<i32>) -> EngineCoreRequest {

@@ -304,7 +304,12 @@ fn nvcc_job_count() -> usize {
 fn nvcc_task_priority(cu_file: &Path) -> usize {
     match cu_file.file_stem().and_then(|stem| stem.to_str()) {
         Some("paged_attention") => 0,
-        Some("paged_attention_hd512" | "flashinfer_sampling") => 1,
+        Some(
+            "paged_attention_hd512"
+            | "paged_attention_hd256"
+            | "paged_attention_window_hd256"
+            | "flashinfer_sampling",
+        ) => 1,
         Some("flashinfer_top1") => 2,
         Some("flashinfer_norm") => 3,
         _ => 10,
@@ -346,8 +351,21 @@ fn parse_sm_token(raw: &str) -> Option<String> {
     None
 }
 
+/// `nvcc`, prefixed by `PEGAINFER_NVCC_LAUNCHER` when that is set and non-empty.
+fn nvcc_command(nvcc: &str) -> Command {
+    println!("cargo:rerun-if-env-changed=PEGAINFER_NVCC_LAUNCHER");
+    match std::env::var_os("PEGAINFER_NVCC_LAUNCHER").filter(|value| !value.is_empty()) {
+        Some(launcher) => {
+            let mut command = Command::new(launcher);
+            command.arg(nvcc);
+            command
+        }
+        None => Command::new(nvcc),
+    }
+}
+
 fn nvcc_supported_arches(nvcc: &str) -> Option<BTreeSet<String>> {
-    let output = Command::new(nvcc).arg("--list-gpu-arch").output().ok()?;
+    let output = nvcc_command(nvcc).arg("--list-gpu-arch").output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -482,7 +500,7 @@ fn nvcc_accepts_gencode(nvcc: &str, compute: &str, sm: &str) -> bool {
         return false;
     }
 
-    let output = Command::new(nvcc)
+    let output = nvcc_command(nvcc)
         .args(["-c"])
         .arg(&cu_path)
         .arg("-o")
@@ -739,6 +757,17 @@ fn is_gemma4_source(csrc_dir: &Path, path: &Path) -> bool {
     }
 }
 
+/// Qwen3.5 model-local CUDA: the linear-attention recurrence and the
+/// head_dim 256 full-attention path.
+fn is_qwen35_source(csrc_dir: &Path, path: &Path) -> bool {
+    match path.strip_prefix(csrc_dir) {
+        Ok(relative) => relative
+            .components()
+            .any(|part| part.as_os_str() == "qwen35"),
+        Err(_) => false,
+    }
+}
+
 /// GLM5.2 model-local CUDA shims over DeepGEMM/FlashMLA contracts.
 fn is_glm52_source(csrc_dir: &Path, path: &Path) -> bool {
     match path.strip_prefix(csrc_dir) {
@@ -910,7 +939,7 @@ fn link_kernel_lab_shared(
         "-lstdc++".to_string(),
     ]);
     let status = time_phase("nvcc -shared libglm52_kernel_lab.so", || {
-        Command::new(nvcc)
+        nvcc_command(nvcc)
             .args(&args)
             .status()
             .expect("Failed to run nvcc for libglm52_kernel_lab.so")
@@ -1606,6 +1635,32 @@ const GEMMA4_TILELANG_LAUNCHERS: &[(&str, &str)] = &[
     ),
 ];
 
+const GEMMA4_W4A16_TILELANG: TileLangFamily = TileLangFamily {
+    label: "GEMMA4_W4A16",
+    generator: "pegainfer-gemma4/kernels/w4a16_generate.py",
+    sources: &[
+        "pegainfer-gemma4/kernels/w4a16_defs.py",
+        "pegainfer-gemma4/kernels/generate.py",
+    ],
+    launchers: GEMMA4_W4A16_TILELANG_LAUNCHERS,
+    // Plain cp.async and mma.sync: Ampere and newer.
+    min_sm: 80,
+    // GEOMETRY is `ctas,block_n,block_k,warps`; the crate refuses a device
+    // whose SM count is not ctas / 2.
+    required_manifest: &["ARCH", "GEOMETRY", "SMEM"],
+};
+
+/// The decode GEMM over (x, packed weight, packed scales, output, stream-K
+/// partials, flags, fix-up table) dispatched on (n, k, rows), and the
+/// residency query the crate checks those kernels against.
+const GEMMA4_W4A16_TILELANG_LAUNCHERS: &[(&str, &str)] = &[
+    (
+        "gemma4_w4a16_gemm",
+        "void*, int*, int*, void*, float*, int*, int*, int*, int, int, int",
+    ),
+    ("gemma4_w4a16_occupancy", "int, int, int, int*"),
+];
+
 const K3_TILELANG: TileLangFamily = TileLangFamily {
     label: "K3",
     generator: "pegainfer-k3/kernels/generate.py",
@@ -1758,7 +1813,9 @@ fn tilelang_gencode(arch: &str, nvcc: &str) -> Option<Vec<String>> {
 }
 
 /// Parse the `KEY=VALUE` contract the generator prints on stdout and mirrors
-/// into `manifest.txt`: one `CU_PATH` per emitted translation unit, the two
+/// into `manifest.txt` (a generator that cannot lower for this build prints
+/// one `UNAVAILABLE=<reason>` line instead, and the family takes the stub
+/// tier): one `CU_PATH` per emitted translation unit, the two
 /// header roots the generated CUDA includes, and the arch the bodies were
 /// lowered for. Paths resolve against `base`, the directory the manifest
 /// describes, so a vendored directory answers for its own files wherever it
@@ -1965,8 +2022,18 @@ fn generate_tilelang_artifacts(
         String::from_utf8_lossy(&output.stderr).trim(),
     );
 
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if let Some(reason) = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("UNAVAILABLE="))
+    {
+        println!(
+            "cargo:warning={label} TileLang generation unavailable: {reason}; its launchers are NOT_SUPPORTED stubs"
+        );
+        return None;
+    }
     let mut artifacts = parse_tilelang_manifest(
-        &String::from_utf8_lossy(&output.stdout),
+        &stdout,
         &format!("the {label} TileLang generator"),
         &artifact_dir,
     );
@@ -2211,6 +2278,9 @@ fn main() {
             if !kimi_k2_enabled && is_kimi_k2_source(&csrc_dir, path) {
                 return None;
             }
+            if !qwen35_enabled && is_qwen35_source(&csrc_dir, path) {
+                return None;
+            }
             // --- k3 ---
             if !k3_enabled && is_k3_source(&csrc_dir, path) {
                 return None;
@@ -2408,6 +2478,8 @@ fn main() {
         // Files that include FlashInfer headers (C++17, header-only)
         if stem == "paged_attention"
             || stem == "paged_attention_hd512"
+            || stem == "paged_attention_hd256"
+            || stem == "paged_attention_window_hd256"
             || stem == "flashinfer_norm"
             || stem == "flashinfer_sampling"
             || stem == "flashinfer_top1"
@@ -2419,6 +2491,7 @@ fn main() {
             }
             nvcc_args.extend([
                 "--std=c++17".to_string(),
+                "--expt-relaxed-constexpr".to_string(),
                 "-I".to_string(),
                 flashinfer.include.to_string_lossy().to_string(),
                 "-I".to_string(),
@@ -2655,6 +2728,15 @@ fn main() {
             &sm_targets,
             &nvcc,
         ));
+        println!("cargo:rerun-if-env-changed=PEGAINFER_GEMMA4_W4A16_SMS");
+        nvcc_tasks.extend(tilelang_nvcc_tasks(
+            &GEMMA4_W4A16_TILELANG,
+            &out_dir,
+            &cuda_include,
+            &arch_args,
+            &sm_targets,
+            &nvcc,
+        ));
     } else {
         println!(
             "cargo:warning=Gemma 4 TileLang kernels disabled; enable the pegainfer-kernels `gemma4` feature to build them"
@@ -2706,11 +2788,14 @@ fn main() {
                         };
 
                         let status = time_phase(format!("nvcc {}", task.cu_file.display()), || {
-                            Command::new(&nvcc)
+                            nvcc_command(&nvcc)
                                 .args(&task.args)
                                 .status()
-                                .unwrap_or_else(|_| {
-                                    panic!("Failed to run nvcc for {}", task.cu_file.display())
+                                .unwrap_or_else(|err| {
+                                    panic!(
+                                        "Failed to run nvcc for {}: {err}",
+                                        task.cu_file.display()
+                                    )
                                 })
                         });
                         completed.push((task.cu_file, task.obj_file, status));

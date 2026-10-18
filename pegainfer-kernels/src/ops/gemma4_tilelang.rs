@@ -1,7 +1,7 @@
-//! Gemma 4's TileLang global-attention prefill, behind the same interface as
-//! the FlashInfer one it stands in for. The prefill path folds
-//! `1/sqrt(head_dim)` into the query rows upstream and hands the kernel a
-//! scale of one; a kernel with the factor baked in would apply it twice.
+//! Gemma 4's TileLang attention bodies — the global family's prefill and
+//! split-KV decode at head dim 512, the sliding family's windowed prefill and
+//! decode at 256 — behind the interfaces of the FlashInfer entries they stand
+//! in for. Gemma 4 attends unscaled, so every caller passes a scale of one.
 
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
@@ -517,11 +517,6 @@ pub fn gemma4_hd256_decode_window_into(
         layout.format == crate::paged_kv::KvFormat::Split,
         "{WHAT} reads split K|V rows; the layout is {:?}",
         layout.format
-    );
-    anyhow::ensure!(
-        layout.storage == crate::paged_kv::KvStorage::Bf16,
-        "{WHAT} loads two-byte rows; the pool stores {:?}",
-        layout.storage
     );
     let args = split_decode_args(
         WHAT,

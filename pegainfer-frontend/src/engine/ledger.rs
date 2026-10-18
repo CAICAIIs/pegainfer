@@ -339,12 +339,10 @@ impl RequestLedger {
         }
     }
 
-    /// Ship the step's statement as one message; a step that touched nothing
-    /// ships nothing. Called once per driver iteration — model code never
-    /// calls this (the driver owns the cadence).
-    pub(crate) fn commit_step(&mut self) {
+    /// Commit the buffered updates as described by [`StepOutputs`].
+    pub(crate) fn commit_step(&mut self, metrics_changed: bool) {
         let updates = self.statement.take_updates();
-        if updates.is_empty() {
+        if updates.is_empty() && !metrics_changed {
             return;
         }
         // A closed receiver means the frontend is gone; the driver notices
@@ -406,6 +404,7 @@ mod tests {
         Request {
             prompt_tokens: prompt,
             params: crate::sampler::SamplingParams::default(),
+            history_tokens: None,
             stop_policy: StopPolicy::default(),
             max_tokens: 8,
             lora_adapter: None,
@@ -430,7 +429,7 @@ mod tests {
         backend
             .ledger
             .finish_with_cause(id, FinishReason::Stop, Some(StopCause::Token(11)));
-        backend.ledger.commit_step();
+        backend.ledger.commit_step(false);
 
         let mut steps = handle_steps(handle);
         let step = steps.try_recv().expect("one step message");
@@ -468,7 +467,7 @@ mod tests {
                 limit: 4,
             },
         );
-        backend.ledger.commit_step();
+        backend.ledger.commit_step(false);
 
         let step = handle_steps(handle).try_recv().expect("step");
         let update = &step.updates[0];
@@ -492,7 +491,7 @@ mod tests {
         backend.ledger.admit(id);
         backend.ledger.push_tokens(id, &[9], &[]);
         backend.ledger.retire(id);
-        backend.ledger.commit_step();
+        backend.ledger.commit_step(false);
 
         // Scheduled was buffered before the retire extracted the entry, so
         // nothing observable remains this step.
@@ -510,7 +509,7 @@ mod tests {
         let deferred = backend
             .ledger
             .defer_finish_with_cause(id, FinishReason::Length, None);
-        backend.ledger.commit_step();
+        backend.ledger.commit_step(false);
 
         let mut steps = handle_steps(handle);
         // The request's whole record rode into the deferred finish; the step

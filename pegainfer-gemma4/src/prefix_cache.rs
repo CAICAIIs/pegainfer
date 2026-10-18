@@ -8,9 +8,7 @@
 //! from the cached sequence only near the tail (the previous completion's
 //! re-rendering), which is exactly where the window lives.
 //!
-//! Fail-closed gate: without `PEGAINFER_PREFIX_CACHE=K` in the environment
-//! the cache holds nothing and resolves nothing, and the engine behaves as
-//! before.
+//! The engine builds one only when `PEGAINFER_PREFIX_CACHE=K` is set.
 
 use pegainfer_core::kv_pool::KvReservation;
 
@@ -34,11 +32,8 @@ fn resume_point(candidate: ResumeCandidate<'_>, window: usize, prompt: &[u32]) -
         .take_while(|(cached, requested)| cached == requested)
         .count();
     let resume = lcp.min(prompt.len().checked_sub(1)?);
-    let floor = if candidate.local_origin == 0 {
-        MIN_RESUME_TOKENS
-    } else {
-        (candidate.local_origin * LOCAL_PAGE_SIZE + window).max(MIN_RESUME_TOKENS)
-    };
+    let floor = crate::kv::frontier_reaching(candidate.local_origin, window, LOCAL_PAGE_SIZE)
+        .max(MIN_RESUME_TOKENS);
     (resume >= floor).then_some(resume)
 }
 
@@ -133,7 +128,7 @@ impl PrefixCache {
         let (best, t) = picked?;
         best.stamp = clock;
         log::debug!(
-            "gemma4 prefix-cache hit: resume at {t} of {} prompt tokens (entry {})",
+            "prefix-cache hit: resume at {t} of {} prompt tokens (entry {})",
             prompt.len(),
             best.token_ids.len()
         );

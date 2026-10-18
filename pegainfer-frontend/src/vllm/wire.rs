@@ -18,11 +18,21 @@ use crate::sampler::SamplingParams;
 
 pub(crate) const LORA_ADAPTER_XARG: &str = "pegainfer_lora_adapter";
 
+/// A sampled position: the chosen token, then its top-k without repeating it.
+/// The chat renderer takes the first `k` entries as the alternatives, so a
+/// repeat would push out a real candidate.
 pub(crate) fn to_wire_position_logprobs(
     token_id: u32,
     logprob: Option<TokenLogprob>,
 ) -> Option<PositionLogprobs> {
-    let lp = logprob?;
+    Some(position_logprobs(token_id, logprob?, false))
+}
+
+/// The scored token, then its top-k. A prompt position keeps a repeat of the
+/// scored token (`keep_repeat`): the encoder needs every row of one payload
+/// equally wide, and prompt positions render as per-token maps, where the
+/// repeat collapses.
+fn position_logprobs(token_id: u32, lp: TokenLogprob, keep_repeat: bool) -> PositionLogprobs {
     let mut entries = Vec::with_capacity(1 + lp.top_logprobs.len());
     entries.push(WireTokenLogprob {
         token_id,
@@ -30,7 +40,7 @@ pub(crate) fn to_wire_position_logprobs(
         rank: lp.rank,
     });
     for (index, (alt_id, alt_logprob)) in lp.top_logprobs.into_iter().enumerate() {
-        if alt_id == token_id {
+        if !keep_repeat && alt_id == token_id {
             continue;
         }
         entries.push(WireTokenLogprob {
@@ -39,7 +49,7 @@ pub(crate) fn to_wire_position_logprobs(
             rank: (index + 1) as u32,
         });
     }
-    Some(PositionLogprobs { entries })
+    PositionLogprobs { entries }
 }
 
 /// The engine includes the unscored leading token; vLLM restores it itself.
@@ -69,7 +79,8 @@ pub(crate) fn to_wire_prompt_logprobs(prompt: PromptEcho) -> Result<Option<Maybe
         .enumerate()
         .skip(1)
         .map(|(index, (id, logprob))| {
-            to_wire_position_logprobs(id, logprob)
+            logprob
+                .map(|lp| position_logprobs(id, lp, true))
                 .with_context(|| format!("missing prompt logprob at position {index}"))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -472,6 +483,29 @@ mod tests {
             })
             .collect();
         assert_eq!(scored, vec![8, 7]);
+    }
+
+    #[test]
+    fn prompt_rows_keep_one_width_whether_or_not_the_token_is_in_the_top_k() {
+        let scored = |top: Vec<(u32, f32)>| TokenLogprob {
+            rank: 1,
+            logprob: -0.5,
+            top_logprobs: top,
+        };
+        let prompt = PromptEcho {
+            ids: vec![9, 8, 7],
+            logprobs: vec![
+                None,
+                Some(scored(vec![(8, -0.5), (3, -2.0)])),
+                Some(scored(vec![(4, -0.1), (5, -2.0)])),
+            ],
+        };
+        let Some(MaybeWireLogprobs::Direct(payload)) = to_wire_prompt_logprobs(prompt).unwrap()
+        else {
+            panic!("expected direct prompt logprobs");
+        };
+        let widths: Vec<_> = payload.positions.iter().map(|p| p.entries.len()).collect();
+        assert_eq!(widths, vec![3, 3]);
     }
 
     #[test]

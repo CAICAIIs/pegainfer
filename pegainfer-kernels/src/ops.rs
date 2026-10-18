@@ -5,12 +5,28 @@ mod attention;
 mod deepep;
 #[cfg(feature = "deepseek-v2-lite")]
 mod deepseek_v2_lite;
+#[cfg(feature = "deepseek-v2-lite")]
+mod dsv2_routed_moe;
+#[cfg(feature = "deepseek-v2-lite")]
+pub use dsv2_routed_moe::DSV2_ROUTED_MOE_MAX_ROWS;
+#[cfg(feature = "deepseek-v2-lite")]
+pub use dsv2_routed_moe::Dsv2ExpertPointerTable;
+#[cfg(feature = "deepseek-v2-lite")]
+pub use dsv2_routed_moe::Dsv2RouteSummary;
+#[cfg(feature = "deepseek-v2-lite")]
+pub use dsv2_routed_moe::Dsv2RoutedMoeScratch;
+#[cfg(feature = "deepseek-v2-lite")]
+pub use dsv2_routed_moe::dsv2_lite_route_logits_into;
 mod elementwise;
 mod embedding;
 #[cfg(feature = "gemma4")]
 mod gemma4;
 #[cfg(feature = "gemma4")]
+mod gemma4_attention;
+#[cfg(feature = "gemma4")]
 mod gemma4_tilelang;
+#[cfg(feature = "gemma4")]
+mod gemma4_w4a16;
 #[cfg(feature = "glm52")]
 mod glm52;
 #[cfg(feature = "k3")]
@@ -24,34 +40,19 @@ mod lora;
 #[cfg(any(feature = "gemma4", feature = "kimi-k2"))]
 mod marlin_face;
 mod norm;
+#[cfg(feature = "qwen35")]
+mod qwen35;
 mod sampling;
 
-pub use attention::Hd512DecodeMetadata;
 pub use attention::PrefillPagedPlan;
 pub use attention::SUPPORTED_GQA_GROUP_SIZES;
-pub use attention::batch_prefill_paged_hd512_into;
-pub use attention::batch_prefill_paged_window_hd256_into;
 pub use attention::dflash_qk_norm_rope_into;
 pub use attention::eagle3_rope_into;
-pub use attention::paged_attention_batch_decode_hd256_into;
 pub use attention::paged_attention_batch_decode_into;
-pub use attention::paged_attention_batch_decode_split_hd256_into;
-pub use attention::paged_attention_batch_decode_split_kv_hd512_into;
 pub use attention::paged_attention_batch_decode_split_kv_into;
-pub use attention::paged_attention_batch_decode_via_prefill_hd256_into;
-pub use attention::paged_attention_batch_decode_via_prefill_hd512_into;
 pub use attention::prefill_attention_paged_into;
-pub use attention::qk_norm_partial_rope_batched_decode_hd256_into;
-pub use attention::qk_norm_partial_rope_batched_decode_hd512_into;
-pub use attention::qk_norm_partial_rope_paged_decode_hd512_into;
-pub use attention::qk_norm_partial_rope_paged_prefill_hd512_into;
 pub use attention::qk_norm_rope_batch_decode_into;
-pub use attention::qk_norm_rope_prefill_hd256_plain_into;
-pub use attention::qkv_norm_rope_paged_decode_hd256_plain_into;
-pub use attention::qkv_norm_rope_paged_prefill_hd256_plain_into;
 pub use attention::single_decode_nhd_into;
-pub use attention::single_prefill_hd256_into;
-pub use attention::single_prefill_hd512_into;
 pub use attention::single_prefill_nhd_causal_into;
 pub use attention::single_prefill_nhd_noncausal_into;
 #[cfg(feature = "moe")]
@@ -128,6 +129,22 @@ pub use embedding::embedding_rows_into;
 #[cfg(feature = "gemma4")]
 pub use gemma4::*;
 #[cfg(feature = "gemma4")]
+pub use gemma4_attention::Hd512DecodeMetadata;
+#[cfg(feature = "gemma4")]
+pub use gemma4_attention::batch_prefill_paged_hd512_into;
+#[cfg(feature = "gemma4")]
+pub use gemma4_attention::batch_prefill_paged_window_hd256_into;
+#[cfg(feature = "gemma4")]
+pub use gemma4_attention::paged_attention_batch_decode_split_kv_hd512_into;
+#[cfg(feature = "gemma4")]
+pub use gemma4_attention::qk_norm_partial_rope_paged_decode_hd512_into;
+#[cfg(feature = "gemma4")]
+pub use gemma4_attention::qk_norm_partial_rope_paged_prefill_hd512_into;
+#[cfg(feature = "gemma4")]
+pub use gemma4_attention::qkv_norm_rope_paged_decode_hd256_plain_into;
+#[cfg(feature = "gemma4")]
+pub use gemma4_attention::qkv_norm_rope_paged_prefill_hd256_plain_into;
+#[cfg(feature = "gemma4")]
 pub use gemma4_tilelang::GlobalDecodeAttend;
 #[cfg(feature = "gemma4")]
 pub use gemma4_tilelang::gemma4_hd256_decode_window_into;
@@ -145,6 +162,14 @@ pub use gemma4_tilelang::gemma4_hd512_prefill_is_built;
 pub use gemma4_tilelang::gemma4_hd512_prefill_smem;
 #[cfg(feature = "gemma4")]
 pub use gemma4_tilelang::gemma4_hd512_prefill_varlen_into;
+#[cfg(feature = "gemma4")]
+pub use gemma4_w4a16::W4a16Matrix;
+#[cfg(feature = "gemma4")]
+pub use gemma4_w4a16::W4a16Scratch;
+#[cfg(feature = "gemma4")]
+pub use gemma4_w4a16::gemma4_w4a16_gemm_into;
+#[cfg(feature = "gemma4")]
+pub use gemma4_w4a16::gemma4_w4a16_geometry;
 #[cfg(feature = "glm52")]
 pub use glm52::*;
 #[cfg(feature = "k3")]
@@ -186,6 +211,7 @@ pub use lora::LoraDecodeGroupedProjection;
 pub use lora::lora_decode_fused_delta_group3_into;
 pub use lora::lora_decode_fused_delta_into;
 pub use lora::pack_lora_b_rows_into;
+pub use norm::GatedNormActivation;
 pub use norm::dual_rms_norm_add_batch_into;
 pub use norm::fused_add_rms_norm_batch_into;
 pub use norm::fused_add_rms_norm_into;
@@ -202,6 +228,14 @@ pub use norm::rms_norm_gated_batch_into;
 pub use norm::rms_norm_into;
 pub use norm::rms_norm_offset_into;
 pub use norm::rms_norm_rows_into;
+#[cfg(feature = "qwen35")]
+pub use qwen35::paged_attention_batch_decode_hd256_into;
+#[cfg(feature = "qwen35")]
+pub use qwen35::paged_attention_batch_decode_split_hd256_into;
+#[cfg(feature = "qwen35")]
+pub use qwen35::paged_attention_batch_decode_via_prefill_hd256_into;
+#[cfg(feature = "qwen35")]
+pub use qwen35::qk_norm_partial_rope_batched_decode_hd256_into;
 pub use sampling::BatchSamplingRow;
 pub use sampling::BatchSamplingScratch;
 pub use sampling::argmax;
@@ -243,5 +277,19 @@ pub fn ffi_exception_message(result: i32) -> String {
         String::new()
     } else {
         format!(": {text}")
+    }
+}
+
+/// `PEGAINFER_CUBLAS_STATUS_BASE` in `csrc/shared/ffi_guard.cuh`: an entry
+/// point that calls cuBLAS returns it plus the `cublasStatus_t` on a cuBLAS
+/// failure, and the `cudaError_t` otherwise.
+pub const CUBLAS_STATUS_BASE: i32 = 100_000;
+
+/// Name a nonzero status from such an entry point, for an error message.
+pub fn ffi_status_detail(status: i32) -> String {
+    if status >= CUBLAS_STATUS_BASE {
+        format!("cublas_status={}", status - CUBLAS_STATUS_BASE)
+    } else {
+        format!("cuda_status={status}")
     }
 }

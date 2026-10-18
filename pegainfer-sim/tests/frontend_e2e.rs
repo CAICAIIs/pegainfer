@@ -1,5 +1,8 @@
 use std::fs;
 use std::net::TcpListener;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -7,6 +10,15 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
+use pegainfer_frontend::engine::Engine;
+use pegainfer_frontend::engine::EngineInfo;
+use pegainfer_frontend::engine::LiveScheduler;
+use pegainfer_frontend::engine::QueuedRequest;
+use pegainfer_frontend::engine::RequestId;
+use pegainfer_frontend::engine::RequestLedger;
+use pegainfer_frontend::engine::Scheduler;
+use pegainfer_frontend::engine::SchedulerMetrics;
+use pegainfer_frontend::engine::spawn_scheduler;
 use pegainfer_sim::SimulatedEngineConfig;
 use pegainfer_sim::profile::EngineProfile;
 use pegainfer_sim::profile::LoadedEngineProfile;
@@ -19,6 +31,7 @@ use reqwest::Client;
 use serde_json::Value;
 use serde_json::json;
 use tempfile::TempDir;
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -143,6 +156,7 @@ impl SimServer {
                 std::future::ready(Ok(engine.into())),
                 &model_path_buf,
                 vec![served_model_name],
+                pegainfer_frontend::vllm::ParserSelection::Auto,
                 port,
                 Some(128),
                 engine_count,
@@ -768,6 +782,7 @@ async fn frontend_rejects_engine_partition_mismatch() -> Result<()> {
             std::future::ready(Ok(engine.into())),
             model_dir.path(),
             vec![MODEL_NAME.to_string()],
+            pegainfer_frontend::vllm::ParserSelection::Auto,
             port,
             Some(128),
             2,
@@ -782,6 +797,187 @@ async fn frontend_rejects_engine_partition_mismatch() -> Result<()> {
         .contains("declared 2 engines but the launched engine exposes 1 schedulers")
     {
         bail!("unexpected partition-mismatch error: {error:#}");
+    }
+    Ok(())
+}
+
+/// Fails, or panics, on the first step that has a request to work on.
+#[derive(Default)]
+struct FatalScheduler {
+    queued: u64,
+    panics: bool,
+}
+
+impl Scheduler for FatalScheduler {
+    fn submit(&mut self, _request: QueuedRequest) {
+        self.queued += 1;
+    }
+
+    fn step(&mut self, _ledger: &mut RequestLedger) -> Result<()> {
+        if self.queued > 0 {
+            assert!(!self.panics, "injected panic");
+            bail!("injected fatal");
+        }
+        Ok(())
+    }
+
+    fn metrics(&self) -> SchedulerMetrics {
+        SchedulerMetrics {
+            num_waiting_reqs: self.queued,
+            ..SchedulerMetrics::default()
+        }
+    }
+}
+
+/// Keeps every request it admits running until the request is aborted.
+struct HoldScheduler {
+    queued: Vec<RequestId>,
+    running: Vec<RequestId>,
+    admitted: Arc<AtomicBool>,
+}
+
+impl Scheduler for HoldScheduler {
+    fn submit(&mut self, request: QueuedRequest) {
+        self.queued.push(request.id);
+    }
+
+    fn step(&mut self, ledger: &mut RequestLedger) -> Result<()> {
+        for id in self.queued.drain(..) {
+            ledger.admit(id);
+            self.running.push(id);
+            self.admitted.store(true, Ordering::Release);
+        }
+        self.running.retain(|&id| {
+            if ledger.is_aborted(id) {
+                ledger.retire(id);
+                false
+            } else {
+                true
+            }
+        });
+        Ok(())
+    }
+
+    fn metrics(&self) -> SchedulerMetrics {
+        SchedulerMetrics {
+            num_running_reqs: self.running.len() as u64,
+            num_waiting_reqs: self.queued.len() as u64,
+            ..SchedulerMetrics::default()
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn frontend_shuts_down_when_its_scheduler_panics() -> Result<()> {
+    let scheduler = FatalScheduler {
+        panics: true,
+        ..FatalScheduler::default()
+    };
+    let (base_url, server, _model_dir) =
+        serve_schedulers(vec![spawn_scheduler("panic", scheduler)]).await?;
+    expect_error_response(&test_client()?, &base_url, 0).await?;
+    expect_scheduler_exit(server).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_scheduler_answers_and_stops_the_other_engines() -> Result<()> {
+    let admitted = Arc::new(AtomicBool::new(false));
+    let hold = HoldScheduler {
+        queued: Vec::new(),
+        running: Vec::new(),
+        admitted: Arc::clone(&admitted),
+    };
+    let (base_url, server, _model_dir) = serve_schedulers(vec![
+        spawn_scheduler("hold", hold),
+        spawn_scheduler("fatal", FatalScheduler::default()),
+    ])
+    .await?;
+    let client = test_client()?;
+    let held = tokio::spawn({
+        let client = client.clone();
+        let base_url = base_url.clone();
+        async move { expect_error_response(&client, &base_url, 0).await }
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !admitted.load(Ordering::Acquire) {
+        if Instant::now() >= deadline {
+            bail!("engine 0 never admitted the held request");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    expect_error_response(&client, &base_url, 1).await?;
+    held.await.context("held request task panicked")??;
+    expect_scheduler_exit(server).await
+}
+
+/// Serves one engine per scheduler and waits until the server is healthy. The
+/// server runs on its own thread and runtime, so one that never stops fails the
+/// test instead of blocking the test runtime's shutdown on a scheduler join.
+async fn serve_schedulers(
+    schedulers: Vec<LiveScheduler>,
+) -> Result<(String, oneshot::Receiver<Result<()>>, TempDir)> {
+    let model_dir = model_dir_with_minimal_metadata()?;
+    let port = reserve_loopback_port()?;
+    let engine_count = schedulers.len();
+    let engine = Engine {
+        schedulers,
+        info: EngineInfo {
+            kv_capacity: None,
+            servable_len: None,
+        },
+        lora: None,
+    };
+    let model_path = model_dir.path().to_path_buf();
+    let (done_tx, done) = oneshot::channel();
+    std::thread::spawn(move || {
+        let result = tokio::runtime::Runtime::new()
+            .context("failed to build the server runtime")
+            .and_then(|runtime| {
+                runtime.block_on(pegainfer_frontend::vllm::serve_with_engine_count(
+                    std::future::ready(Ok(engine.into())),
+                    &model_path,
+                    vec![MODEL_NAME.to_string()],
+                    pegainfer_frontend::vllm::ParserSelection::Auto,
+                    port,
+                    Some(128),
+                    engine_count,
+                    CancellationToken::new(),
+                ))
+            });
+        let _ = done_tx.send(result);
+    });
+    let base_url = format!("http://127.0.0.1:{port}");
+    wait_for_health(&test_client()?, &base_url).await?;
+    Ok((base_url, done, model_dir))
+}
+
+/// Sends one completion to `engine` and requires the server to answer it with an error.
+async fn expect_error_response(client: &Client, base_url: &str, engine: u32) -> Result<()> {
+    let response = client
+        .post(format!("{base_url}/v1/completions"))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header("X-data-parallel-rank", engine.to_string())
+        .body(completion_body(MODEL_NAME, false).to_string())
+        .send()
+        .await
+        .with_context(|| format!("the request to engine {engine} got no response"))?;
+    let status = response.status();
+    let body = response.text().await?;
+    if status.is_success() {
+        bail!("the request to engine {engine} succeeded: {body}");
+    }
+    Ok(())
+}
+
+async fn expect_scheduler_exit(server: oneshot::Receiver<Result<()>>) -> Result<()> {
+    let result = tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .context("server kept running after its scheduler exited")?
+        .context("server thread ended without a result")?;
+    let error = result.expect_err("a server whose scheduler exited must stop with an error");
+    if !format!("{error:#}").contains("scheduler exited") {
+        bail!("unexpected shutdown error: {error:#}");
     }
     Ok(())
 }
@@ -903,6 +1099,155 @@ async fn chat_completions_returns_correct_format() -> Result<()> {
         prompt_tokens + completion_tokens,
         "total_tokens must equal prompt + completion: {response}"
     );
+
+    server.shutdown().await
+}
+
+/// The every-chat-route fixture with a `reasoning_effort` guard shaped like
+/// Qwen3.8's template (`docs/models/qwen35/support-qwen38.md`): the check is
+/// *inside* the thinking branch, so `enable_thinking=false` — which the renderer
+/// derives from `reasoning_effort=none` — skips it entirely. `raise_exception`
+/// is deliberately not registered by the pinned frontend, so a rejected value is
+/// a hard render failure exactly as in production, not a friendly message. The
+/// config carries the save-time `output_gate_type` marker, which triggers the
+/// serving-side startup probe; the guarded template then arms the mapping.
+fn model_dir_with_effort_guard() -> Result<TempDir> {
+    let dir = model_dir_with_minimal_metadata()?;
+    fs::write(
+        dir.path().join("tokenizer_config.json"),
+        TINY_TOKENIZER_CONFIG_EFFORT_GUARD_JSON,
+    )
+    .context("failed to write effort-guard tokenizer_config.json")?;
+    fs::write(
+        dir.path().join("config.json"),
+        TINY_CONFIG_JSON_EFFORT_GUARD,
+    )
+    .context("failed to write effort-guard config.json")?;
+    Ok(dir)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reasoning_effort_extremes_are_mapped_onto_the_templates_vocabulary() -> Result<()> {
+    let server = SimServer::spawn_with_model_dir(model_dir_with_effort_guard()?).await?;
+    let client = test_client()?;
+
+    let chat = |body: Value| {
+        let client = &client;
+        let base_url = server.base_url.clone();
+        async move {
+            let response = client
+                .post(format!("{base_url}/v1/chat/completions"))
+                .json(&body)
+                .send()
+                .await?;
+            let status = response.status();
+            let text = response.text().await?;
+            anyhow::Ok((status, text))
+        }
+    };
+
+    // Without the rewrite each of these hits the template's reject branch; the
+    // middleware maps them onto `xhigh` / `low` before the renderer sees them.
+    for effort in ["high", "max", "minimal"] {
+        let (status, text) = chat(json!({
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content": "alpha beta"}],
+            "max_tokens": 2,
+            "temperature": 0.0,
+            "reasoning_effort": effort
+        }))
+        .await?;
+        if !status.is_success() {
+            bail!(
+                "reasoning_effort={effort} must be mapped onto the template's vocabulary, got {status}: {text}"
+            );
+        }
+    }
+
+    // Values the template already accepts, and `none`, which the renderer turns
+    // into enable_thinking=false so the guard never runs.
+    for effort in ["xhigh", "medium", "low", "none"] {
+        let (status, text) = chat(json!({
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content": "alpha beta"}],
+            "max_tokens": 2,
+            "temperature": 0.0,
+            "reasoning_effort": effort
+        }))
+        .await?;
+        if !status.is_success() {
+            bail!("reasoning_effort={effort} is valid and must pass through, got {status}: {text}");
+        }
+    }
+
+    // Control: the guard is live, and only the *top-level* field is rewritten.
+    // Addressed through template kwargs the caller keeps full control, so a
+    // rejected value still fails the render.
+    let (status, text) = chat(json!({
+        "model": MODEL_NAME,
+        "messages": [{"role": "user", "content": "alpha beta"}],
+        "max_tokens": 2,
+        "temperature": 0.0,
+        "chat_template_kwargs": {"reasoning_effort": "high", "enable_thinking": true}
+    }))
+    .await?;
+    if status.is_success() {
+        bail!(
+            "a template-kwargs reasoning_effort outside the vocabulary must still be rejected: {text}"
+        );
+    }
+
+    server.shutdown().await
+}
+
+/// A per-request template whose effort vocabulary is the *inverse* of the
+/// served default's: it accepts `low|high|max` and raises on anything else,
+/// so `xhigh` — what the default-template mapping produces — is rejected here.
+const ACCEPTING_EFFORT_TEMPLATE: &str = r"{%- set resolved = reasoning_effort|default('high') %}{%- if resolved not in ('low', 'high', 'max') %}{{ raise_exception('Unexpected reasoning effort ' ~ reasoning_effort) }}{%- endif %}{% for message in messages %}{{ message.content }}{% endfor %}";
+
+/// The startup probe measures the checkpoint's default template, so its verdict
+/// has no authority over a request that overrides it. `reasoning_effort:"high"`
+/// with the override above must reach the renderer verbatim: rewriting it to
+/// `xhigh` on the default's authority would turn a working request into a
+/// render failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_per_request_chat_template_override_keeps_its_own_effort_vocabulary() -> Result<()> {
+    let server = SimServer::spawn_with_model_dir(model_dir_with_effort_guard()?).await?;
+    let client = test_client()?;
+
+    let chat = |effort: String| {
+        let client = &client;
+        let base_url = server.base_url.clone();
+        async move {
+            let response = client
+                .post(format!("{base_url}/v1/chat/completions"))
+                .json(&json!({
+                    "model": MODEL_NAME,
+                    "messages": [{"role": "user", "content": "alpha beta"}],
+                    "max_tokens": 2,
+                    "temperature": 0.0,
+                    "reasoning_effort": effort,
+                    "chat_template": ACCEPTING_EFFORT_TEMPLATE
+                }))
+                .send()
+                .await?;
+            let status = response.status();
+            let text = response.text().await?;
+            anyhow::Ok((status, text))
+        }
+    };
+
+    let (status, text) = chat("high".to_string()).await?;
+    if !status.is_success() {
+        bail!("an override that accepts `high` must receive it verbatim, got {status}: {text}");
+    }
+
+    // Control: the override's guard is live and its vocabulary really is the
+    // inverse one, so the request above passed because the layer stayed out.
+    let (status, text) = chat("xhigh".to_string()).await?;
+    if status.is_success() {
+        bail!("the override rejects `xhigh`, so its guard must fail this render: {text}");
+    }
 
     server.shutdown().await
 }
@@ -1063,7 +1408,13 @@ async fn simulated_frontend_metadata_contract_is_executable() -> Result<()> {
     let server = SimServer::spawn_with_model_dir(model_dir).await?;
     server.shutdown().await?;
 
-    let error = match SimServer::spawn_with_model_dir(empty_model_dir()?).await {
+    let failed = tokio::time::timeout(
+        HTTP_TIMEOUT,
+        SimServer::spawn_with_model_dir(empty_model_dir()?),
+    )
+    .await
+    .context("a frontend that cannot load its tokenizer must fail fast")?;
+    let error = match failed {
         Ok(server) => {
             server.shutdown().await?;
             bail!("empty local model metadata directory should fail frontend startup");
@@ -1324,9 +1675,28 @@ const TINY_TOKENIZER_CONFIG_JSON: &str = r#"{
   "chat_template": "{% for message in messages %}{{ message.content }}{% endfor %}"
 }"#;
 
+/// Qwen3.8's guard shape: the vocabulary check lives inside the thinking branch,
+/// so it only runs when `enable_thinking` is not disabled.
+const TINY_TOKENIZER_CONFIG_EFFORT_GUARD_JSON: &str = r#"{
+  "unk_token": "<unk>",
+  "tokenizer_class": "PreTrainedTokenizerFast",
+  "chat_template": "{%- if enable_thinking is undefined or enable_thinking is true %}{%- set resolved = reasoning_effort|default('xhigh') %}{%- if resolved not in ('xhigh', 'medium', 'low') %}{{ raise_exception('Unexpected reasoning effort ' ~ reasoning_effort) }}{%- endif %}{%- endif %}{% for message in messages %}{{ message.content }}{% endfor %}"
+}"#;
+
 // Leave room for simulated alternatives (scored id + 1..k) within the vocabulary.
 const TINY_CONFIG_JSON: &str = r#"{
   "model_type": "pegainfer_sim",
   "max_position_embeddings": 128,
   "vocab_size": 16
+}"#;
+
+/// The tiny config plus the save-time `output_gate_type` marker a Qwen3.8
+/// checkpoint carries — the field that triggers the serving-side
+/// `reasoning_effort` startup probe
+/// (`pegainfer-frontend/src/vllm/reasoning_effort.rs`).
+const TINY_CONFIG_JSON_EFFORT_GUARD: &str = r#"{
+  "model_type": "pegainfer_sim",
+  "max_position_embeddings": 128,
+  "vocab_size": 16,
+  "text_config": {"output_gate_type": "swish"}
 }"#;

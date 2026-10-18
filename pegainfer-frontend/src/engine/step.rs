@@ -51,6 +51,13 @@ impl std::fmt::Display for RequestId {
 pub struct Request {
     pub prompt_tokens: Vec<u32>,
     pub params: crate::sampler::SamplingParams,
+    /// Count of leading prompt tokens that render the conversation's messages;
+    /// the chat template's generation prompt follows them. The next turn of
+    /// the conversation repeats exactly these tokens, so a scheduler that
+    /// snapshots its state there serves that turn from the snapshot. `None`
+    /// when the frontend did not measure it (a completion, or a chat body the
+    /// chat layer could not read).
+    pub history_tokens: Option<usize>,
     pub stop_policy: StopPolicy,
     pub max_tokens: usize,
     pub lora_adapter: Option<String>,
@@ -78,9 +85,9 @@ pub struct QueuedRequest {
     pub request: Request,
 }
 
-/// Everything one scheduler step produced, in one message. The scheduler-side
-/// ledger sends exactly one per step that touched any request; an idle step
-/// sends nothing.
+/// Everything one scheduler step produced, in one message. Empty `updates`
+/// notify the frontend of changed metrics, for example after cancellation.
+/// A step with no request updates or metric changes sends nothing.
 #[derive(Debug, Default)]
 pub struct StepOutputs {
     pub updates: Vec<RequestUpdate>,

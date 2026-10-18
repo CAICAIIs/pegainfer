@@ -9,6 +9,8 @@ use pegainfer_frontend::model_line::CliDecodeOverlap;
 use pegainfer_frontend::model_line::CliError;
 use pegainfer_frontend::model_line::LaunchContext;
 use pegainfer_frontend::model_line::ModelLine;
+use pegainfer_frontend::model_line::ServePlan;
+use pegainfer_frontend::vllm::ParserSelection;
 
 use crate::Qwen35DecodeOverlap;
 use crate::Qwen35LaunchOptions;
@@ -146,6 +148,18 @@ impl ModelLine for Qwen35Line {
         Ok(())
     }
 
+    fn serve_plan(&self, _ctx: &LaunchContext<'_>) -> Result<ServePlan, CliError> {
+        Ok(ServePlan {
+            // Both generations' templates request the Qwen Coder tool syntax,
+            // but upstream `Auto` matches the model *path* by substring: a
+            // `Qwen3.8-27B` directory resolves to the JSON `qwen3_xml` parser
+            // (`docs/models/qwen35/support-qwen38.md`). The line knows better
+            // than the directory name.
+            auto_tool_call_parser: Some(ParserSelection::Explicit("qwen3_coder".to_string())),
+            ..Default::default()
+        })
+    }
+
     fn launch(&self, ctx: &LaunchContext<'_>) -> anyhow::Result<LaunchedEngine> {
         let cli = cli(ctx);
         crate::launch_with_options_policy_and_overlap(
@@ -165,7 +179,7 @@ impl ModelLine for Qwen35Line {
             resolve_decode_overlap(ctx.shared.decode_overlap)
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?,
         )
-        .map(LaunchedEngine::Handle)
+        .map(LaunchedEngine::Stepped)
     }
 }
 
@@ -305,6 +319,35 @@ mod tests {
         assert!(
             error.to_string().contains("--max-batch must be in 1..="),
             "unexpected error: {error}"
+        );
+    }
+
+    /// The server resolves `--tool-call-parser` through this plan, so the
+    /// line's answer is the parser the served grammar gets: `auto` must become
+    /// the Coder parser both generations' templates emit, and an explicit
+    /// choice must survive untouched.
+    #[test]
+    fn auto_tool_call_parser_resolves_to_the_coder_parser() {
+        let (shared, matches, _) =
+            parse_for_line(&MODEL_LINE, &["pegainfer"]).expect("the shared flags parse");
+        let config = serde_json::json!({});
+        let ctx = LaunchContext {
+            model_path: std::path::Path::new("unused"),
+            config: &config,
+            shared: &shared,
+            matches: &matches,
+        };
+        let plan = MODEL_LINE.serve_plan(&ctx).expect("the plan builds");
+
+        assert_eq!(
+            plan.resolve_tool_call_parser(ParserSelection::Auto),
+            ParserSelection::Explicit("qwen3_coder".to_string())
+        );
+        let explicit = ParserSelection::Explicit("qwen3_xml".to_string());
+        assert_eq!(
+            plan.resolve_tool_call_parser(explicit.clone()),
+            explicit,
+            "an explicit name is the caller's to make"
         );
     }
 }
