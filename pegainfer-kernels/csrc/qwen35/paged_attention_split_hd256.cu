@@ -1,7 +1,14 @@
 // Split-KV paged attention decode at HEAD_DIM=256 (Qwen3.5 full-attention
 // layers), the path small decode batches take instead of FlashInfer's.
 
-#include "../shared/paged_launch.cuh"
+#include "../shared/ffi_guard.cuh"
+
+#include <cfloat>
+#include <cmath>
+#include <cstdint>
+
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
 
 extern "C" {
 
