@@ -37,7 +37,7 @@ This closes the missing report layer. It does not optimize latency or throughput
 
 ## Issue #465 Position
 
-Issue #465 is the sustained evidence milestone. The retained 2026-07-18 run covered host-staged and NCCL under the fixed short-shape HTTP soak contract with zero failures/timeouts, full required trace coverage, clean follow-up recovery, output hashes, resource samples, and first/last-quartile drift fields. The NCCL row used NCCL `2.26.2` with `NCCL_IB_DISABLE=1` and `NCCL_P2P_DISABLE=1`; keep that runtime boundary attached to the evidence.
+Issue #465 is the sustained evidence milestone. The retained 2026-10-18 run on 2x GH200, a 120-second smoke and a 30-minute run per concurrency, covered host-staged and NCCL under the fixed short-shape HTTP soak contract with zero failures/timeouts, full required trace coverage, clean follow-up recovery, output hashes, resource samples, and first/last-quartile drift fields. The NCCL row used NCCL `2.30.7` selected through `PEGAINFER_NCCL_LIB_DIR`; keep that runtime boundary attached to the evidence.
 
 This closes the first retained soak baseline. It does not set hard latency or drift budgets, does not cover long-prefill scheduling, and does not claim production readiness.
 

@@ -183,7 +183,7 @@ The combined host-staged/NCCL report hard-fails when either backend is missing, 
 
 ## Local Tooling Gate
 
-These commands were run on 2026-07-18:
+These commands were last run on 2026-10-18:
 
 ```bash
 python3 -m py_compile scripts/bench_http_common.py scripts/bench_http_serving.py scripts/bench_http_sweep.py scripts/bench_dsv2lite_http_slo.py scripts/bench_dsv2lite_http_soak.py
@@ -198,21 +198,24 @@ Regenerate retained reports when their profile, schema, or measurement contract 
 
 ### Issue #465 Retained HTTP Soak
 
-The retained #465 rerun used code commit `a5703d0424d917ce99b4bd8691b0b86eecde966f`, model revision `604d5664dddd88a0433dbae533b7fe9472482de0`, 2x RTX 5090, `prompt_words=64`, `max_tokens=64`, greedy sampling, ignore-EOS, concurrency `4,8`, `duration_s=120`, `bucket_s=60`, `num_requests=8`, and full required trace coverage. Later commits harden the retained gate semantics; regenerate the artifacts before claiming final-head evidence for the changed benchmark schema or runtime path. The combined report SHA-256 is `1c06e8825da70888277f1485f54d7f4fb9b2f61d617149d3ac7357cd5a03e7f1`.
+The current retained #465 run used code commit `56b9d1f00f500f07e18ff28b92c1a9a955775b5d`, model revision `604d5664dddd88a0433dbae533b7fe9472482de0`, 2x GH200 120GB (sm_90) with CUDA 13.1, `prompt_words=64`, `max_tokens=64`, greedy sampling, ignore-EOS, concurrency `4,8`, and full required trace coverage. It ran in two phases: a smoke at `duration_s=120`, `bucket_s=60`, `num_requests=8`, then the retained run at `duration_s=1800`, `bucket_s=300`, `num_requests=32`. The NCCL server loaded NCCL `2.30.7` through `PEGAINFER_NCCL_LIB_DIR`, with no other NCCL settings. A bucket runs whole leaf chunks until it reaches its target wall time, so a backend with slower chunks covers the declared duration with fewer, longer buckets (host-staged c4 used five buckets of about 360 seconds).
 
-| Artifact basename | Backend | SHA-256 | Result | Boundary |
+| Artifact basename | Phase | Backend | SHA-256 | Result |
 | --- | --- | --- | --- | --- |
-| `soak_summary.json` | host-staged | `3fe4f163024602a51f10cac0c15cc24a5feffd92bbcb93091e175cd63e49bd33` | `completed=112`, `failed=0`, `timeouts=0`, `soak_gate.passed=true`, clean follow-up passed, combined output hash `6912777bed672f57` | Host-staged sustained HTTP soak evidence |
-| `soak_summary.json` | NCCL | `52c2a70d895fc0c080233961ea06824097fbf5b7241a0983e41c0ca6646e762f` | `completed=128`, `failed=0`, `timeouts=0`, `soak_gate.passed=true`, clean follow-up passed, combined output hash `24f2db9fc47acc10` | NCCL sustained HTTP soak evidence with NCCL `2.26.2`, `NCCL_IB_DISABLE=1`, `NCCL_P2P_DISABLE=1` |
-| `retained_soak_report.json` | combined | `1c06e8825da70888277f1485f54d7f4fb9b2f61d617149d3ac7357cd5a03e7f1` | `coverage_gate.passed=true`, `child_gates={host-staged:true,nccl:true}`, commit/model provenance consistent, runtime boundaries present | Combined host-staged/NCCL #465 report |
+| `soak_summary.json` | smoke | host-staged | `096ecb676b1dae37f7fd959afcf7721ada292dbb93a5ad06e7a5d594c2813a7e` | `completed=120`, `failed=0`, `timeouts=0`, `soak_gate.passed=true` |
+| `soak_summary.json` | smoke | NCCL | `824d8a405fa16071f515e367bca12b3dd1093a87bf2c31705498ae842e239ba0` | `completed=152`, `failed=0`, `timeouts=0`, `soak_gate.passed=true` |
+| `retained_soak_report.json` | smoke | combined | `da22cee908de2d105b342cae78bc300fe18a565d7d6ad67d79d87b239eeb057e` | `coverage_gate.passed=true` |
+| `soak_summary.json` | retained | host-staged | `dbc08ed68db613318663e5e41bb875d30a7e9f4b73de38173c2cb821067b6883` | `completed=1696`, `failed=0`, `timeouts=0`, `soak_gate.passed=true`, combined output hash `e84becdb6eb366b5` |
+| `soak_summary.json` | retained | NCCL | `e4e726def1a23fae0225e61b3d2864eab57518b2d571ab4b99900ea93fe5e69d` | `completed=2368`, `failed=0`, `timeouts=0`, `soak_gate.passed=true`, combined output hash `f3a984f819f4dbbe` |
+| `retained_soak_report.json` | retained | combined | `ca1aec2223f46ac0302884e8d905f408e755f3cf42e2bfc4fac51ac456c2db4c` | `coverage_gate.passed=true`, `child_gates={host-staged:true,nccl:true}`, commit, contract and model provenance consistent, runtime boundaries present |
 
-Resource and drift fields are retained for diagnosis, not hard budgets. Host-staged max device memory stayed flat in both concurrency buckets, with output-token throughput drift `-1.5%` at c4 and `-0.8%` at c8; RSS moved `+1.6%` at c4 and `+12.1%` at c8. NCCL max device memory stayed flat, with output-token throughput drift `-1.0%` at c4 and `+1.1%` at c8; RSS moved `+1.6%` at c4 and `+3.8%` at c8. The NCCL server used a conservative single-node runtime selection and reached readiness after the NCCL communicator init path completed; do not turn this row into a default-runtime speed claim.
+Resource and drift fields are retained for diagnosis, not hard budgets. Over the retained run, the first to last quartile median drift was: host-staged output-token throughput `+2.3%` at c4 and `+0.6%` at c8, RSS `-0.9%` and `+0.5%`; NCCL output-token throughput `+3.7%` and `+1.6%`, RSS `-1.7%` and `-1.2%`. Max device memory stayed flat on both backends, and TTFT p95 moved by at most `0.3%`. RSS rises once traffic starts (host-staged from 0.7 GB to at most 2.2 GB, NCCL from 1.2 GB to at most 2.1 GB) and then holds between the first and last quartiles. The clean follow-up request returned the same output hash, `a167eb22438e35ae`, on both backends in both phases. The earlier 2026-07-18 run on 2x RTX 5090 (commit `a5703d04`, NCCL `2.26.2`, 120 seconds) predates the hardened gate and is not comparable.
 
 Reviewer evidence summary for issue/PR text:
 
-- Combined artifact basename/SHA: `retained_soak_report.json` / `1c06e8825da70888277f1485f54d7f4fb9b2f61d617149d3ac7357cd5a03e7f1`.
-- Child artifact basenames/SHA: host-staged `soak_summary.json` / `3fe4f163024602a51f10cac0c15cc24a5feffd92bbcb93091e175cd63e49bd33`; NCCL `soak_summary.json` / `52c2a70d895fc0c080233961ea06824097fbf5b7241a0983e41c0ca6646e762f`.
-- Gate result: host-staged and NCCL child gates passed, combined gate passed, commit/model provenance consistent, runtime boundary retained.
+- Combined artifact basename/SHA: `retained_soak_report.json` / `ca1aec2223f46ac0302884e8d905f408e755f3cf42e2bfc4fac51ac456c2db4c`.
+- Child artifact basenames/SHA: host-staged `soak_summary.json` / `dbc08ed68db613318663e5e41bb875d30a7e9f4b73de38173c2cb821067b6883`; NCCL `soak_summary.json` / `e4e726def1a23fae0225e61b3d2864eab57518b2d571ab4b99900ea93fe5e69d`.
+- Gate result: host-staged and NCCL child gates passed, combined gate passed, commit, contract and model provenance consistent, runtime boundary retained.
 - Claim boundary: short-shape sustained HTTP soak evidence only; no production-readiness, default-runtime NCCL, long/mixed-prompt, or vLLM-parity claim.
 
 ### Issue #466 Retained HTTP SLO Evidence
