@@ -660,6 +660,7 @@ pub fn rms_norm_gated_batch_into<'a>(
     activation: GatedNormActivation,
 ) {
     let gate = gate.into();
+    gate.assert_in_row("rms_norm_gated gate");
     let total_heads = x.seq_len * num_heads;
     assert_eq!(x.hidden_dim, num_heads * head_dim);
     assert_eq!(gate.width, x.hidden_dim);

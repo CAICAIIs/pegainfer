@@ -75,6 +75,8 @@ pub(crate) fn gated_delta_rule_decode_batch_into<'a>(
 ) {
     let b_proj = b_proj.into();
     let a_proj = a_proj.into();
+    b_proj.assert_in_row("gated_delta_rule_decode b_proj");
+    a_proj.assert_in_row("gated_delta_rule_decode a_proj");
     assert_eq!(qkv.seq_len, batch_size);
     assert_eq!(b_proj.states.seq_len, batch_size);
     assert_eq!(a_proj.states.seq_len, batch_size);
@@ -129,6 +131,7 @@ pub(crate) fn conv1d_decode_batch_into<'a>(
     kernel_size: usize,
 ) {
     let x = x.into();
+    x.assert_in_row("conv1d_decode x");
     let batch_size = x.states.seq_len;
     let num_channels = x.width;
     assert_eq!(out.hidden_dim, num_channels);
@@ -995,6 +998,23 @@ mod tests {
         Ok(())
     }
 
+    /// Runs `f` with a band that ends past its row; the wrapper must panic on
+    /// the band check before anything is launched.
+    fn assert_band_rejected<T>(f: impl FnOnce() -> T) {
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+            .err()
+            .expect("a band past its row reached the launch");
+        let message = err
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| err.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        assert!(
+            message.contains("exceed the row's"),
+            "unexpected panic: {message}"
+        );
+    }
+
     /// One band per projection, laid side by side in every slot of one fused
     /// tensor, against the same values in their own buffers.
     fn fused_and_separate(
@@ -1105,6 +1125,7 @@ mod tests {
             band_out.iter().any(|x| *x != 0.0),
             "the guard reads nothing when every output is zero"
         );
+        assert_band_rejected(|| run(fused.columns(z_dim + 1, qkv_dim)));
         Ok(())
     }
 
@@ -1213,6 +1234,18 @@ mod tests {
             band_state.iter().any(|x| *x != 0.0),
             "the guard reads no state when every entry is zero"
         );
+        assert_band_rejected(|| {
+            run(
+                fused_ba.columns(num_value_heads + 1, num_value_heads),
+                fused_ba.columns(0, num_value_heads),
+            )
+        });
+        assert_band_rejected(|| {
+            run(
+                fused_ba.columns(0, num_value_heads),
+                fused_ba.columns(num_value_heads + 1, num_value_heads),
+            )
+        });
         Ok(())
     }
 
@@ -1283,6 +1316,7 @@ mod tests {
             band_out.iter().any(|x| *x != 0.0),
             "the guard reads nothing when every output is zero"
         );
+        assert_band_rejected(|| run(fused.columns(qkv_dim + 1, z_dim)));
         Ok(())
     }
 }
