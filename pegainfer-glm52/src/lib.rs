@@ -8,6 +8,9 @@
 //! padding rows) and the per-MoE-layer DeepEP collectives pair by entry
 //! count under the conservative protocol-max bound.
 
+// `glm52` needs the MoE submodules and NCCL at build time; without it this crate is empty.
+#![cfg(feature = "glm52")]
+
 mod bookend;
 mod config;
 mod dense;

@@ -46,7 +46,7 @@
 > of linear in history (c1 p50 ~270 ms at every turn; c8 late-turn p50
 > 1,186 → 454 ms), with byte-identical greedy outputs.
 >
-> **Last touched:** 2026-08
+> **Last touched:** 2026-10
 
 ## Preparation
 
@@ -559,8 +559,8 @@ table:
   establish continuity.
 - Validation:
   - `cargo fmt --all -- --check` passed.
-  - `cargo test --release -p pegainfer-glm52 --lib` passed in the development
-    container
+  - `cargo test --release -p pegainfer-glm52 --features glm52 --lib` passed in
+    the development container
     with NCCL 2.30 from the installed Python wheel: 88 passed, 21
     GPU-dependent tests ignored.
 
