@@ -1,20 +1,28 @@
 //! Batch-1 matvec gate.
 //!
-//! A single decode token routes its projections through the warp-per-row matvec
-//! instead of the tiled GEMM. This gate holds that kernel to a float64
-//! reference on the shapes Qwen3.5-4B launches per decode step, and holds the
-//! shapes it cannot serve (unaligned K, too few rows, more than one token) on
-//! the GEMM path — a silent extra fallback would make the parity numbers
-//! meaningless.
+//! A line that opts in routes a single decode token's projections through the
+//! warp-per-row matvec instead of the tiled GEMM. This gate holds that kernel to
+//! a float64 reference on the shapes Qwen3.5-4B launches per decode step, holds
+//! the shapes it cannot serve (unaligned K, too few rows, more than one token)
+//! on the GEMM path, and holds a line that never opts in on the GEMM path too —
+//! a silent fallback would make the parity numbers meaningless.
 //!
 //!   cargo test --release -p pegainfer-kernels --test gemv_bf16_parity -- --nocapture
+
+use std::sync::Mutex;
 
 use half::bf16;
 use pegainfer_kernels::ops::gemm_into_checked;
 use pegainfer_kernels::ops::gemv_served;
+use pegainfer_kernels::ops::set_n1_matvec;
 use pegainfer_kernels::tensor::DeviceContext;
 use pegainfer_kernels::tensor::DeviceMatrix;
 use pegainfer_kernels::tensor::HiddenStates;
+
+/// The routing flag and its counter are process-global, so these gates run one
+/// at a time: in parallel, one test's served count would land inside another
+/// test's before/after window.
+static GATE: Mutex<()> = Mutex::new(());
 
 /// (label, M = out rows, K = in cols): the projections of one Qwen3.5-4B layer
 /// plus the LM head, at the hidden sizes the decode step uses.
@@ -101,6 +109,8 @@ fn check_shape(ctx: &DeviceContext, name: &str, rows: usize, cols: usize, seed: 
 
 #[test]
 fn batch_one_projections_take_the_matvec() {
+    let _gate = GATE.lock().expect("gate lock");
+    set_n1_matvec(true);
     let Ok(ctx) = DeviceContext::new() else {
         eprintln!("skipping gemv_bf16_parity: no CUDA device — gate inconclusive");
         return;
@@ -111,7 +121,32 @@ fn batch_one_projections_take_the_matvec() {
 }
 
 #[test]
+fn lines_that_never_opt_in_keep_the_gemm() {
+    let _gate = GATE.lock().expect("gate lock");
+    set_n1_matvec(false);
+    let Ok(ctx) = DeviceContext::new() else {
+        eprintln!("skipping gemv_bf16_parity: no CUDA device — gate inconclusive");
+        return;
+    };
+    let (name, rows, cols) = SERVED[0];
+    let w = w_data(0x0F0F, rows, cols);
+    let x = x_data(0x1E1E, cols, 1);
+    let w_d = DeviceMatrix::from_host(&ctx, &w, rows, cols).expect("W h2d");
+    let x_d = HiddenStates::from_host(&ctx, &x, cols, 1).expect("X h2d");
+    let mut out = HiddenStates::zeros(&ctx, rows, 1).expect("out");
+    let served_before = gemv_served();
+    gemm_into_checked(&ctx, &w_d, &x_d, &mut out).expect("projection");
+    assert_eq!(
+        gemv_served(),
+        served_before,
+        "{name}: a batch-1 projection on a line that never opted in must stay on the GEMM"
+    );
+}
+
+#[test]
 fn shapes_the_matvec_cannot_serve_stay_on_the_gemm() {
+    let _gate = GATE.lock().expect("gate lock");
+    set_n1_matvec(true);
     let Ok(ctx) = DeviceContext::new() else {
         eprintln!("skipping gemv_bf16_parity: no CUDA device — gate inconclusive");
         return;
