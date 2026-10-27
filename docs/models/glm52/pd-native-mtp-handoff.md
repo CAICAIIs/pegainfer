@@ -559,10 +559,11 @@ table:
   establish continuity.
 - Validation:
   - `cargo fmt --all -- --check` passed.
-  - `cargo test --release -p pegainfer-glm52 --features glm52 --lib` passed in
-    the development container
+  - `cargo test --release -p pegainfer-glm52 --lib` passed in the development
+    container
     with NCCL 2.30 from the installed Python wheel: 88 passed, 21
-    GPU-dependent tests ignored.
+    GPU-dependent tests ignored. (The crate is gated on `glm52` now, so that
+    run is `cargo test --release -p pegainfer-glm52 --features glm52 --lib`.)
 
 ### Implementation state
 
