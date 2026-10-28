@@ -17,11 +17,18 @@ use super::config::LocalGeometry;
 /// single request, 64 for sixteen. Splitting the KV range instead wins at every
 /// bucket this threshold admits, measured on one tree with two runs a side:
 /// bs1 9.41/9.36 → 8.57/8.57 ms, c8 11.25/11.27 → 10.65/10.67, c16 13.06/13.08
-/// → 12.80/12.82 mean TPOT, qps16 unchanged. The wider buckets keep FlashInfer:
-/// on an sm_90 card at 1024 in and 256 out, routing them through the split form
-/// measured 10.23/10.25 against 9.65/9.67 ms mean TPOT at c32 and 16.56/16.58
-/// against 14.98/15.14 at c64. See `docs/models/qwen35/decode-kernel-attribution.md`.
-pub(crate) const SPLIT_DECODE_MAX_BATCH: usize = 16;
+/// → 12.80/12.82 mean TPOT, qps16 unchanged.
+///
+/// The wider buckets kept FlashInfer on the strength of an sm_90 run at 1024 in
+/// and 256 out (c32 10.23/10.25 against 9.65/9.67 ms mean TPOT). At a long
+/// context the split form wins there as well: on one A100 at 8192 in and 1024
+/// out, a 32-way decode step goes 22.52 → 18.32 ms at 16 splits and 18.12 at
+/// 32, and at 1024 in it goes 13.18 → 12.71. The 64 bucket keeps FlashInfer:
+/// the shipped path reads 28.54 → 28.57 ms there at 9216 in, and the split form
+/// measures 27.40, a gain smaller than the short-context loss the sm_90 run
+/// shows at that width. See
+/// `docs/models/qwen35/decode-kernel-attribution.md`.
+pub(crate) const SPLIT_DECODE_MAX_BATCH: usize = 32;
 
 /// Query heads per kv head the split-KV kernel is built for, one warp each. A
 /// checkpoint with another GQA group (the 27B sizes run 6) keeps the FlashInfer
@@ -35,9 +42,17 @@ pub(crate) const SPLIT_DECODE_GQA_GROUP: usize = 4;
 /// simply leaves later CTAs empty. The counts are where each bucket's curve
 /// flattens on the standalone harness: 32 splits is best at batch 1
 /// (27.98 µs against 34.98 at 16), and 16 is best at batch 8 (57.26 against
-/// 60.58 at 32) and batch 16 (96.26 against 98.47).
+/// 60.58 at 32) and batch 16 (96.26 against 98.47). Above 16 the per-request KV
+/// range is what the step waits on, so 32 splits wins: 18.32 → 18.12 ms at
+/// 9216 in, against 19.05 at 8.
 pub(crate) fn split_decode_splits(batch: usize) -> usize {
-    if batch <= 2 { 32 } else { 16 }
+    if batch <= 2 {
+        32
+    } else if batch <= 16 {
+        16
+    } else {
+        32
+    }
 }
 
 /// Upper bound on [`split_decode_splits`], for sizing the partial buffers.
@@ -264,5 +279,29 @@ impl BatchDecodeBuffers35 {
             .memcpy_htod(&kv_tile_indices, &mut self.kv_tile_indices_d)?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_admitted_bucket_fits_the_partial_buffers() {
+        for batch in 1..=SPLIT_DECODE_MAX_BATCH {
+            let splits = split_decode_splits(batch);
+            assert!(
+                (1..=SPLIT_DECODE_MAX_SPLITS).contains(&splits),
+                "batch {batch} asks for {splits} splits and the partials hold {SPLIT_DECODE_MAX_SPLITS}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_middle_buckets_keep_the_split_count_they_were_tuned_at() {
+        assert_eq!(split_decode_splits(1), 32);
+        assert_eq!(split_decode_splits(8), 16);
+        assert_eq!(split_decode_splits(16), 16);
+        assert_eq!(split_decode_splits(SPLIT_DECODE_MAX_BATCH), 32);
     }
 }
