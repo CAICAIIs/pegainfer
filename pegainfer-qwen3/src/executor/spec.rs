@@ -59,8 +59,8 @@ impl Qwen3Executor {
                 req.request_id
             );
             anyhow::ensure!(
-                self.dflash_ready_requests.contains(&req.request_id),
-                "speculative verification requested before DFlash state is ready for {:?}",
+                self.draft_ready_requests.contains(&req.request_id),
+                "speculative verification requested before draft state is ready for {:?}",
                 req.request_id
             );
             anyhow::ensure!(
@@ -180,7 +180,7 @@ impl Qwen3Executor {
             }
             if std::env::var_os("PEGAINFER_TEST_LOG").is_some() {
                 log::debug!(
-                    "Qwen3 DFlash commit round={} request={} accepted_len={}",
+                    "Qwen3 speculative commit round={} request={} accepted_len={}",
                     verify_round,
                     req_result.request_id,
                     req_result.accepted_tokens.len(),
@@ -217,8 +217,8 @@ impl Qwen3Executor {
         );
         for req in plan.requests {
             anyhow::ensure!(
-                self.dflash_ready_requests.contains(&req.request_id),
-                "speculative draft requested before DFlash state is ready for {:?}",
+                self.draft_ready_requests.contains(&req.request_id),
+                "speculative draft requested before draft state is ready for {:?}",
                 req.request_id
             );
         }

@@ -70,6 +70,7 @@ pub(crate) struct FakeExecutor {
     speculative: bool,
     /// Requests the fake reports as NOT having captured draft context.
     not_ready: HashSet<RequestId>,
+    max_draft_batch: Option<usize>,
     async_prefill: Option<Arc<AsyncPrefillGate>>,
     parked_prefill: Option<PrefillResult>,
     // `cached_tokens` the first prefill chunk of every request reports (a
@@ -106,6 +107,7 @@ impl FakeExecutor {
             emit_logprobs: false,
             speculative: false,
             not_ready: HashSet::new(),
+            max_draft_batch: None,
             async_prefill: None,
             parked_prefill: None,
             prefix_hit_tokens: Some(0),
@@ -186,6 +188,11 @@ impl FakeExecutor {
     /// Report one request as NOT draft-ready (no captured draft context).
     pub(crate) fn with_request_not_ready(mut self, request_id: RequestId) -> Self {
         self.not_ready.insert(request_id);
+        self
+    }
+
+    pub(crate) fn with_max_draft_batch(mut self, limit: usize) -> Self {
+        self.max_draft_batch = Some(limit);
         self
     }
 
@@ -308,6 +315,10 @@ impl ModelExecutor for FakeExecutor {
         self.speculative && !self.not_ready.contains(&request_id)
     }
 
+    fn max_draft_batch(&self) -> Option<usize> {
+        self.max_draft_batch
+    }
+
     fn connector_lookup_counters(&self) -> ConnectorLookupCounters {
         self.connector_lookups
     }
@@ -372,7 +383,7 @@ impl ModelExecutor for FakeExecutor {
                 .iter()
                 .map(|req| self.fake_prefill_result(req))
                 .collect(),
-            dflash_context_captured_requests: Vec::new(),
+            draft_context_captured_requests: Vec::new(),
         })
     }
 
@@ -440,7 +451,7 @@ impl ModelExecutor for FakeExecutor {
         if let Some(gate) = &self.async_prefill {
             self.parked_prefill = Some(PrefillResult {
                 requests: std::mem::take(&mut prefill_requests),
-                dflash_context_captured_requests: Vec::new(),
+                draft_context_captured_requests: Vec::new(),
             });
             gate.launches.fetch_add(1, Ordering::SeqCst);
         }
