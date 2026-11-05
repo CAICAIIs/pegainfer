@@ -2217,11 +2217,14 @@ impl TpWorkerState {
                     .as_mut()
                     .expect("prefill-phase TP request owns its recurrent state"),
             ];
+            // TP prefills one request at a time, so the pass stays on the context
+            // stream; the shared KV buffer is held by the model.
+            let kv_buffer = self.model.kv_buffer().clone();
             let logits = self.model.batch_prefill_logits(
                 &prompt,
                 std::slice::from_ref(&kv_views[row_idx]),
                 &mut recurrent_refs,
-                self.model.kv_buffer(),
+                &kv_buffer,
             )?;
 
             if chunk.finish_prefill {

@@ -1,11 +1,14 @@
 //! Qwen3.5 batch prefill and unified step (prefill + decode combined).
 //!
 //! Linear attention (GDR chunkwise) does not have an efficient batched prefill
-//! kernel, so `batch_prefill` runs each request's prefill serially. Full-attention
-//! layers also run per-request to reuse the existing paged prefill path.
+//! kernel, so one request's prefill is a pass of its own. Passes for the requests
+//! of one chunk run concurrently on alternate streams: a single request's chain
+//! leaves the GPU idle between kernels and at the tail of its last GEMM, and
+//! interleaving independent chains fills both. Full-attention layers also run
+//! per-request to reuse the existing paged prefill path.
 //!
 //! `unified_step` combines:
-//!   1. Serial `batch_prefill` for new requests entering the batch.
+//!   1. `batch_prefill` for new requests entering the batch.
 //!   2. `batch_decode_graph` for existing decode requests (CUDA Graph for
 //!      compiled GQA groups; eager prefill fallback for uncompiled ones).
 
@@ -13,6 +16,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use cudarc::driver::CudaStream;
+use pegainfer_core::tensor::DeviceVec;
 use pegainfer_core::tensor::HiddenStates;
 use pegainfer_frontend::engine::panic_message;
 use pegainfer_kernels::tensor::StreamOverrideGuard;
@@ -24,18 +28,28 @@ use super::recurrent_state::RecurrentState;
 use super::weights::Qwen35Model;
 use crate::batch_decode::DecodeGraphUse;
 
+/// Alternate streams used to overlap the requests of one prefill chunk. The
+/// scheduler's default budget (`--max-prefill-tokens 4096`) admits four
+/// 1024-token prompts per step; past a handful the extra streams only add
+/// scheduler pressure.
+const PREFILL_STREAMS: usize = 4;
+
 pub(crate) struct UnifiedStepOutput {
     pub(crate) prefill_logits: Option<HiddenStates>,
     pub(crate) decoded: bool,
 }
 
 impl Qwen35Model {
-    /// Prefill `n` prompts sequentially, updating each request's KV and recurrent state.
+    /// Prefill `n` prompts, updating each request's KV and recurrent state.
+    ///
+    /// Requests are independent, so their passes run on [`Self::prefill_streams`]
+    /// when more than one is queued; the streams are joined back to the context
+    /// stream before the last-token logits are computed. A single request, and TP
+    /// (whose collectives must stay on one stream), keep the one-at-a-time pass.
     ///
     /// Returns batched last-token logits `[selection_vocab, n]` in request order.
-    /// Requests are independent — there is no cross-request batching in the prefill pass.
     pub(crate) fn batch_prefill_logits(
-        &self,
+        &mut self,
         prompts: &[&[u32]],
         views: &[KvView],
         recurrent_states: &mut [&mut RecurrentState],
@@ -48,16 +62,91 @@ impl Qwen35Model {
             n == recurrent_states.len(),
             "prompts / recurrent states len mismatch"
         );
+
+        if n == 1 || self.tp_comm.is_some() {
+            let mut last_hiddens = Vec::with_capacity(n);
+            for i in 0..n {
+                last_hiddens.push(self.prefill_last_hidden(
+                    prompts[i],
+                    &views[i],
+                    kv_buffer,
+                    recurrent_states[i],
+                )?);
+            }
+            return self.batch_last_hidden_logits(&last_hiddens);
+        }
+
+        self.ensure_prefill_streams()?;
+        let streams = self.prefill_streams.clone();
         let mut last_hiddens = Vec::with_capacity(n);
         for i in 0..n {
-            last_hiddens.push(self.prefill_last_hidden(
+            let stream = Arc::clone(&streams[i % streams.len()]);
+            // Request state was staged on the context stream; order it before
+            // this pass without blocking the host.
+            stream
+                .join(&self.ctx.stream)
+                .map_err(|err| anyhow::anyhow!("join Qwen3.5 prefill stream {i}: {err}"))?;
+            last_hiddens.push(self.prefill_last_hidden_on_stream(
+                &stream,
                 prompts[i],
                 &views[i],
                 kv_buffer,
                 recurrent_states[i],
             )?);
         }
+        for i in 0..n {
+            self.ctx
+                .stream
+                .join(&streams[i % streams.len()])
+                .map_err(|err| anyhow::anyhow!("join Qwen3.5 prefill result {i}: {err}"))?;
+        }
         self.batch_last_hidden_logits(&last_hiddens)
+    }
+
+    fn ensure_prefill_streams(&mut self) -> Result<()> {
+        if !self.prefill_streams.is_empty() {
+            return Ok(());
+        }
+        for _ in 0..PREFILL_STREAMS {
+            let stream = self
+                .ctx
+                .ctx
+                .new_stream()
+                .map_err(|err| anyhow::anyhow!("create Qwen3.5 prefill stream: {err}"))?;
+            self.prefill_streams.push(stream);
+        }
+        Ok(())
+    }
+
+    /// One request's prefill on `stream`, allocations included.
+    ///
+    /// The context stream is swapped for the pass so every buffer it allocates is
+    /// also released on the stream that used it: `cudaMallocAsync` orders a free
+    /// against the stream it is queued on, and a free queued on the default
+    /// stream would hand this pass's still-in-flight memory to the next request.
+    fn prefill_last_hidden_on_stream(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        token_ids: &[u32],
+        view: &KvView,
+        kv_buffer: &KvBuffer,
+        recurrent: &mut RecurrentState,
+    ) -> Result<DeviceVec> {
+        let cu_stream = stream.cu_stream();
+        let original_stream = std::mem::replace(&mut self.ctx.stream, Arc::clone(stream));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _stream_override = unsafe { StreamOverrideGuard::activate_prefill(cu_stream) };
+            self.prefill_last_hidden(token_ids, view, kv_buffer, recurrent)
+        }));
+        self.ctx.stream = original_stream;
+
+        match result {
+            Ok(result) => result,
+            Err(panic) => anyhow::bail!(
+                "Qwen3.5 overlapped prefill panicked: {}",
+                panic_message(panic.as_ref())
+            ),
+        }
     }
 
     /// Run the complete prefill path on `stream`, including allocations, copies,
@@ -90,8 +179,9 @@ impl Qwen35Model {
 
     /// Unified step: prefill new requests and decode existing requests in one call.
     ///
-    /// Prefill is run serially per-request (GDR chunkwise per request). Decode runs
-    /// via CUDA Graph on the pre-allocated `graph_state` for the decode batch.
+    /// The chunk's prefills run per-request (GDR chunkwise per request), the
+    /// requests overlapping on alternate streams. Decode runs via CUDA Graph on
+    /// the pre-allocated `graph_state` for the decode batch.
     ///
     /// Either `prefill_prompts` or `decode_tokens` may be empty (but not both).
     ///
@@ -99,7 +189,7 @@ impl Qwen35Model {
     /// Decode logits remain in `graph_state.buffers.logits`; callers sample from
     /// that batched buffer directly to avoid per-request extraction.
     pub(crate) fn unified_step(
-        &self,
+        &mut self,
         prefill_prompts: &[&[u32]],
         prefill_views: &[KvView],
         prefill_recurrent_states: &mut [&mut RecurrentState],
@@ -148,6 +238,7 @@ impl Qwen35Model {
 
 #[cfg(test)]
 mod tests {
+    use pegainfer_core::tensor::DeviceContext;
     use pegainfer_core::tensor::HiddenStates;
     use pegainfer_kv_cache::KvCacheManager;
 
@@ -183,7 +274,7 @@ mod tests {
         ) else {
             return;
         };
-        let model = Qwen35Model::from_safetensors(&model_path, 0, 2, 0).unwrap();
+        let mut model = Qwen35Model::from_safetensors(&model_path, 0, 2, 0).unwrap();
 
         let decodable = model.config.decodable_vocab;
         let selection = model.config.selection_vocab;
@@ -192,21 +283,22 @@ mod tests {
             return;
         }
 
-        let pad_tail_is_suppressed = |logits: &HiddenStates, label: &str| {
-            assert_eq!(logits.hidden_dim, selection, "{label}: arena width");
-            let row = crate::ops::extract_vec(&model.ctx, logits, 0).unwrap();
-            let row = row.to_host(&model.ctx).unwrap();
-            for (id, value) in row.iter().enumerate().take(selection).skip(decodable) {
+        let pad_tail_is_suppressed =
+            |ctx: &DeviceContext, logits: &HiddenStates, label: &str| {
+                assert_eq!(logits.hidden_dim, selection, "{label}: arena width");
+                let row = crate::ops::extract_vec(ctx, logits, 0).unwrap();
+                let row = row.to_host(ctx).unwrap();
+                for (id, value) in row.iter().enumerate().take(selection).skip(decodable) {
+                    assert!(
+                        value.is_sign_negative() && value.is_infinite(),
+                        "{label}: pad id {id} survived selection (want -inf, got {value})"
+                    );
+                }
                 assert!(
-                    value.is_sign_negative() && value.is_infinite(),
-                    "{label}: pad id {id} survived selection (want -inf, got {value})"
+                    row[..decodable].iter().any(|value| value.is_finite()),
+                    "{label}: decodable vocab came out entirely -inf"
                 );
-            }
-            assert!(
-                row[..decodable].iter().any(|value| value.is_finite()),
-                "{label}: decodable vocab came out entirely -inf"
-            );
-        };
+            };
 
         let prompt = vec![9707, 374, 220, 17];
         let prompt_refs = [&prompt[..]];
@@ -223,7 +315,7 @@ mod tests {
         let prefill_logits = model
             .batch_prefill_logits(&prompt_refs, &views, &mut rec_refs, cache.buffer())
             .unwrap();
-        pad_tail_is_suppressed(&prefill_logits, "prefill");
+        pad_tail_is_suppressed(&model.ctx, &prefill_logits, "prefill");
 
         let next = greedy_sample_batch(&model, &prefill_logits, 1)[0];
         cache.apply_prefill(&mut kv, Some(next)).unwrap();
@@ -244,12 +336,12 @@ mod tests {
                 DecodeGraphUse::Serve,
             )
             .unwrap();
-        pad_tail_is_suppressed(&graph_state.buffers.logits, "decode");
+        pad_tail_is_suppressed(&model.ctx, &graph_state.buffers.logits, "decode");
         let decoded = greedy_sample_batch(&model, &graph_state.buffers.logits, 1)[0];
         cache.apply_decode(&mut kv, decoded).unwrap();
     }
 
-    fn run_decode_path(model: &Qwen35Model, unified: bool) -> (Vec<u32>, Vec<u32>) {
+    fn run_decode_path(model: &mut Qwen35Model, unified: bool) -> (Vec<u32>, Vec<u32>) {
         let prompt_a: Vec<u32> = vec![9707];
         let prompt_b: Vec<u32> = vec![3838, 374, 220, 17, 10, 17];
         let prompts = [&prompt_a[..], &prompt_b[..]];
@@ -349,9 +441,9 @@ mod tests {
         else {
             return;
         };
-        let model = Qwen35Model::from_safetensors(&model_path, 0, 2, 0).unwrap();
-        let ref_tokens = run_decode_path(&model, false);
-        let unified_tokens = run_decode_path(&model, true);
+        let mut model = Qwen35Model::from_safetensors(&model_path, 0, 2, 0).unwrap();
+        let ref_tokens = run_decode_path(&mut model, false);
+        let unified_tokens = run_decode_path(&mut model, true);
 
         assert_eq!(
             unified_tokens, ref_tokens,
