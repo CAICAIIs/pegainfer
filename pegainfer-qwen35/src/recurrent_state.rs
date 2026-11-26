@@ -39,6 +39,8 @@ pub(crate) struct LinearStatePointerTables {
     pub(crate) state_ptrs: Vec<CudaSlice<u64>>,
     pub(crate) conv_state_ptrs: Vec<CudaSlice<u64>>,
     batch_size: usize,
+    last_active_slots: Vec<usize>,
+    last_padded_bs: usize,
 }
 
 /// Per-layer element counts shared by allocation and reservation:
@@ -70,9 +72,136 @@ impl RecurrentState {
 
         Ok(Self { layers, seq_len: 0 })
     }
+
+    /// 复用已分配槽位时清零 GPU recurrent/conv state，避免按请求反复 malloc/free。
+    pub(crate) fn reset(&mut self, ctx: &DeviceContext) -> Result<()> {
+        for layer in &mut self.layers {
+            ctx.stream
+                .memset_zeros(&mut layer.state)
+                .map_err(|e| anyhow::anyhow!("Reset recurrent state failed: {e}"))?;
+            ctx.stream
+                .memset_zeros(&mut layer.conv_state.data)
+                .map_err(|e| anyhow::anyhow!("Reset conv state failed: {e}"))?;
+        }
+        self.seq_len = 0;
+        Ok(())
+    }
+
+    /// 提取各 linear layer 的稳定设备指针（仅在启动预分配后读取一次）。
+    pub(crate) fn layer_device_ptrs(&self, ctx: &DeviceContext) -> (Vec<u64>, Vec<u64>) {
+        use cudarc::driver::DevicePtr;
+        let mut state_ptrs = Vec::with_capacity(self.layers.len());
+        let mut conv_ptrs = Vec::with_capacity(self.layers.len());
+        for layer in &self.layers {
+            let (sp, _gs) = layer.state.device_ptr(&ctx.stream);
+            let (cp, _gc) = layer.conv_state.data.device_ptr(&ctx.stream);
+            state_ptrs.push(sp);
+            conv_ptrs.push(cp);
+        }
+        (state_ptrs, conv_ptrs)
+    }
 }
 
 impl LinearStatePointerTables {
+    /// 估算 pointer table 占用的显存字节数。
+    pub(crate) fn estimate_bytes(config: &Config35, batch_capacity: usize) -> usize {
+        let num_linear_layers = config.num_hidden_layers - config.num_full_attention_layers();
+        num_linear_layers * 2 * batch_capacity * std::mem::size_of::<u64>()
+    }
+
+    /// 为 CUDA Graph 预分配固定地址的 pointer table，后续仅原地覆写内容。
+    pub(crate) fn new_for_capacity(
+        ctx: &DeviceContext,
+        config: &Config35,
+        batch_capacity: usize,
+        label: &str,
+    ) -> Result<Self> {
+        let num_linear_layers = config.num_hidden_layers - config.num_full_attention_layers();
+        let mut state_ptrs = Vec::with_capacity(num_linear_layers);
+        let mut conv_state_ptrs = Vec::with_capacity(num_linear_layers);
+        for layer_idx in 0..num_linear_layers {
+            state_ptrs.push(ctx.stream.alloc_zeros(batch_capacity).map_err(|e| {
+                anyhow::anyhow!("alloc {label} linear state pointer table {layer_idx}: {e}")
+            })?);
+            conv_state_ptrs.push(ctx.stream.alloc_zeros(batch_capacity).map_err(|e| {
+                anyhow::anyhow!("alloc {label} conv state pointer table {layer_idx}: {e}")
+            })?);
+        }
+        Ok(Self {
+            state_ptrs,
+            conv_state_ptrs,
+            batch_size: batch_capacity,
+            last_active_slots: Vec::new(),
+            last_padded_bs: 0,
+        })
+    }
+
+    /// 将 `0..active_slots.len()` 映射到对应 cohort 槽位，其余 `..padded_bs` 指向共享 padding state。
+    /// 当 `active_slots` 与 `padded_bs` 未变化时直接跳过 H2D 拷贝。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn sync_slots(
+        &mut self,
+        ctx: &DeviceContext,
+        slot_state_ptrs: &[Vec<u64>],
+        slot_conv_ptrs: &[Vec<u64>],
+        padding_state_ptrs: &[u64],
+        padding_conv_ptrs: &[u64],
+        active_slots: &[usize],
+        padded_bs: usize,
+        label: &str,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            padded_bs <= self.batch_size,
+            "{label} pointer table capacity {} is smaller than padded batch {padded_bs}",
+            self.batch_size
+        );
+        anyhow::ensure!(
+            active_slots.len() <= padded_bs,
+            "{label} active slots {} exceed padded batch {padded_bs}",
+            active_slots.len()
+        );
+        if self.last_padded_bs == padded_bs && self.last_active_slots == active_slots {
+            return Ok(());
+        }
+
+        let num_linear_layers = self.state_ptrs.len();
+        let mut row_state_ptrs = Vec::with_capacity(padded_bs);
+        let mut row_conv_ptrs = Vec::with_capacity(padded_bs);
+        for layer_idx in 0..num_linear_layers {
+            row_state_ptrs.clear();
+            row_conv_ptrs.clear();
+            for &slot_idx in active_slots {
+                row_state_ptrs.push(slot_state_ptrs[slot_idx][layer_idx]);
+                row_conv_ptrs.push(slot_conv_ptrs[slot_idx][layer_idx]);
+            }
+            for _ in active_slots.len()..padded_bs {
+                row_state_ptrs.push(padding_state_ptrs[layer_idx]);
+                row_conv_ptrs.push(padding_conv_ptrs[layer_idx]);
+            }
+            ctx.stream
+                .memcpy_htod(
+                    &row_state_ptrs,
+                    &mut self.state_ptrs[layer_idx].slice_mut(0..padded_bs),
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!("sync {label} linear state pointer table {layer_idx}: {e}")
+                })?;
+            ctx.stream
+                .memcpy_htod(
+                    &row_conv_ptrs,
+                    &mut self.conv_state_ptrs[layer_idx].slice_mut(0..padded_bs),
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!("sync {label} conv state pointer table {layer_idx}: {e}")
+                })?;
+        }
+
+        self.last_active_slots.clear();
+        self.last_active_slots.extend_from_slice(active_slots);
+        self.last_padded_bs = padded_bs;
+        Ok(())
+    }
+
     pub(crate) fn from_recurrent_refs(
         ctx: &DeviceContext,
         config: &Config35,
@@ -118,6 +247,8 @@ impl LinearStatePointerTables {
             state_ptrs: linear_state_ptrs,
             conv_state_ptrs: linear_conv_state_ptrs,
             batch_size,
+            last_active_slots: Vec::new(),
+            last_padded_bs: 0,
         })
     }
 

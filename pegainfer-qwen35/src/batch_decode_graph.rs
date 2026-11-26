@@ -1,4 +1,6 @@
-//! CUDA Graph state for Qwen3.5 batched decode with bucket padding.
+//! Qwen3.5 batched decode 的 CUDA Graph 状态（按 cohort 持有）。
+
+use std::sync::Arc;
 
 use anyhow::Result;
 use pegainfer_core::cuda_graph::CudaGraphState;
@@ -11,13 +13,13 @@ use super::decode_buffers::BatchDecodeBuffers35;
 use super::recurrent_state::LinearStatePointerTables;
 use super::recurrent_state::RecurrentState;
 
-/// Bucket sizes for CUDA Graph capture. Actual batch is padded to nearest bucket.
+/// CUDA Graph capture 桶宽，实际 batch 向上对齐到最近桶。
 pub(crate) const BATCH_BUCKETS: &[usize] = &[1, 2, 4, 8, 16, 32, 64];
 
-/// Maximum supported batch size (= largest bucket).
+/// 单张 decode graph 的最大宽度（单 cohort 上限）。
 pub(crate) const MAX_BATCH: usize = 64;
 
-/// Find the smallest bucket >= `bs`. Panics if `bs` > MAX_BATCH.
+/// 返回 >= `bs` 的最小 bucket；超过 `MAX_BATCH` 直接 panic。
 pub(crate) fn bucket_for(bs: usize) -> usize {
     for &b in BATCH_BUCKETS {
         if b >= bs {
@@ -30,41 +32,42 @@ pub(crate) fn bucket_for(bs: usize) -> usize {
     );
 }
 
-/// CUDA Graph state for Qwen3.5 batch decode.
+/// 单个 cohort 的 CUDA Graph decode 状态。
 ///
-/// Owns one pre-allocated `RecurrentState` slot per decode-batch capacity
-/// and shared decode buffers. Slot `i` always maps to position `i` in the batch — when a request
-/// occupies slot `i`, its recurrent state lives at `slot_states[i]` for the
-/// entire lifetime of that request in the batch. The CUDA Graph captured for
-/// a given bucket size always accesses `slot_states[0..bucket_size]`, so GPU
-/// pointer addresses are identical on every replay.
-///
-/// # Slot management
-///
-/// Callers must ensure that positions 0..batch_size are active requests and
-/// positions batch_size..padded_batch_size are padding. When a request
-/// finishes mid-batch, move the last slot's data to fill the gap:
-/// ```text
-/// copy_state_to_slot(ctx, last_slot_src, vacated_slot_idx)
-/// ```
-/// and update the caller's slot-to-request mapping accordingly.
+/// 启动时一次性预分配 `slot_capacity` 份 `RecurrentState` 与固定地址的
+/// `linear_pointer_tables`；请求从准入到退休持有同一 `slot_idx`，prefill 直接写入
+/// `slot_states[slot_idx]`。decode 前按当前 cohort active 列表原地更新 pointer table，
+/// padding 行指向共享 `padding_state`，既避免退休时大块 D2D compaction，也避免
+/// padding 行覆盖同一 cohort 内正在 chunked prefill 的槽位。
 pub(crate) struct BatchDecodeGraphState {
     pub(crate) buffers: BatchDecodeBuffers35,
     pub(crate) slot_states: Vec<RecurrentState>,
+    slot_state_ptrs: Vec<Vec<u64>>,
+    slot_conv_ptrs: Vec<Vec<u64>>,
+    _padding_state: Arc<RecurrentState>,
+    padding_state_ptrs: Vec<u64>,
+    padding_conv_ptrs: Vec<u64>,
     pub(crate) linear_pointer_tables: LinearStatePointerTables,
-    /// One `CudaGraphState` per BATCH_BUCKETS entry (indexed by position).
+    /// 与 `BATCH_BUCKETS` 一一对应的 `CudaGraphState`。
     pub(crate) graphs: Vec<CudaGraphState>,
 }
 
 impl BatchDecodeGraphState {
-    /// Create a graph state at `max_batch` slots (loader-validated bucket).
-    pub(crate) fn with_capacity(
+    /// 分配一个 cohort 的 graph state：`slot_capacity` 份 recurrent state、
+    /// 对齐到 bucket 的 decode buffer 与 pointer table，以及共享 `padding_state`。
+    pub(crate) fn with_capacity_and_padding(
         ctx: &DeviceContext,
         config: &Config35,
         tensor_parallel: TensorParallelConfig,
         kv_pool: &KvPool,
-        max_batch: usize,
+        slot_capacity: usize,
+        padding_state: Arc<RecurrentState>,
     ) -> Result<Self> {
+        anyhow::ensure!(
+            (1..=MAX_BATCH).contains(&slot_capacity),
+            "Qwen3.5 cohort slot capacity must be in 1..={MAX_BATCH}, got {slot_capacity}"
+        );
+        let graph_bucket = bucket_for(slot_capacity);
         let padding_page_id = kv_pool.padding_page_id();
         let max_total_pages = kv_pool.capacity_pages();
 
@@ -72,25 +75,25 @@ impl BatchDecodeGraphState {
             ctx,
             config,
             tensor_parallel,
-            max_batch,
+            graph_bucket,
             max_total_pages,
             padding_page_id,
         )?;
 
-        let mut slot_states = Vec::with_capacity(max_batch);
-        for _ in 0..max_batch {
-            slot_states.push(RecurrentState::new(ctx, config)?);
+        let mut slot_states = Vec::with_capacity(slot_capacity);
+        let mut slot_state_ptrs = Vec::with_capacity(slot_capacity);
+        let mut slot_conv_ptrs = Vec::with_capacity(slot_capacity);
+        for _ in 0..slot_capacity {
+            let state = RecurrentState::new(ctx, config)?;
+            let (sp, cp) = state.layer_device_ptrs(ctx);
+            slot_state_ptrs.push(sp);
+            slot_conv_ptrs.push(cp);
+            slot_states.push(state);
         }
-        let linear_pointer_tables = {
-            let mut slot_refs: Vec<&mut RecurrentState> = slot_states.iter_mut().collect();
-            LinearStatePointerTables::from_recurrent_refs(
-                ctx,
-                config,
-                &mut slot_refs,
-                max_batch,
-                "Qwen3.5 graph",
-            )?
-        };
+
+        let (padding_state_ptrs, padding_conv_ptrs) = padding_state.layer_device_ptrs(ctx);
+        let linear_pointer_tables =
+            LinearStatePointerTables::new_for_capacity(ctx, config, graph_bucket, "Qwen3.5 graph")?;
 
         let graphs = BATCH_BUCKETS
             .iter()
@@ -100,32 +103,49 @@ impl BatchDecodeGraphState {
         Ok(Self {
             buffers,
             slot_states,
+            slot_state_ptrs,
+            slot_conv_ptrs,
+            _padding_state: padding_state,
+            padding_state_ptrs,
+            padding_conv_ptrs,
             linear_pointer_tables,
             graphs,
         })
     }
 
-    /// D2D copy `src` recurrent state into slot `slot_idx`.
-    ///
-    /// Call once when a request joins the batch (after prefill finishes).
-    /// After this call, `slot_states[slot_idx]` IS the canonical state; the
-    /// original `src` is no longer used.
-    pub(crate) fn copy_state_to_slot(
+    /// 同步本 cohort 当前 active 槽位映射到 GPU pointer table（稳态无变更时零拷贝）。
+    pub(crate) fn sync_active_slots(
         &mut self,
         ctx: &DeviceContext,
-        src: &RecurrentState,
-        slot_idx: usize,
+        active_slots: &[usize],
+        padded_bs: usize,
     ) -> Result<()> {
-        let dst = &mut self.slot_states[slot_idx];
-        for (dst_layer, src_layer) in dst.layers.iter_mut().zip(src.layers.iter()) {
-            ctx.stream
-                .memcpy_dtod(&src_layer.state, &mut dst_layer.state)
-                .map_err(|e| anyhow::anyhow!("copy recurrent state to slot {slot_idx}: {e}"))?;
-            ctx.stream
-                .memcpy_dtod(&src_layer.conv_state.data, &mut dst_layer.conv_state.data)
-                .map_err(|e| anyhow::anyhow!("copy conv state to slot {slot_idx}: {e}"))?;
+        for &slot_idx in active_slots {
+            anyhow::ensure!(
+                slot_idx < self.slot_states.len(),
+                "Qwen3.5 active slot {slot_idx} out of range 0..{}",
+                self.slot_states.len()
+            );
         }
-        dst.seq_len = src.seq_len;
-        Ok(())
+        self.linear_pointer_tables.sync_slots(
+            ctx,
+            &self.slot_state_ptrs,
+            &self.slot_conv_ptrs,
+            &self.padding_state_ptrs,
+            &self.padding_conv_ptrs,
+            active_slots,
+            padded_bs,
+            "Qwen3.5 graph",
+        )
+    }
+
+    /// 清零指定槽位以供新准入请求原地 prefill。
+    pub(crate) fn reset_slot(&mut self, ctx: &DeviceContext, slot_idx: usize) -> Result<()> {
+        anyhow::ensure!(
+            slot_idx < self.slot_states.len(),
+            "Qwen3.5 reset slot {slot_idx} out of range 0..{}",
+            self.slot_states.len()
+        );
+        self.slot_states[slot_idx].reset(ctx)
     }
 }

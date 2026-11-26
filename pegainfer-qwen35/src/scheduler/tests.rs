@@ -104,9 +104,8 @@ impl PrefillPromoteBackend for PruneTestBackend {
 
     fn promote_prefill_state(
         &mut self,
-        _active_len: usize,
         _state: PrefillBackendState,
-    ) -> ActiveBackendState {
+    ) -> (CohortId, ActiveBackendState) {
         panic!("prune test must not promote prefill state")
     }
 
@@ -203,9 +202,8 @@ impl PrefillPromoteBackend for LifecycleTestBackend {
 
     fn promote_prefill_state(
         &mut self,
-        _active_len: usize,
         _state: PrefillBackendState,
-    ) -> ActiveBackendState {
+    ) -> (CohortId, ActiveBackendState) {
         panic!("completion lifecycle test must not promote prefill state")
     }
 
@@ -249,7 +247,7 @@ fn closed_pending_work_is_pruned_before_admission() {
         test_request("closed", closed_sink),
         test_request("open", open_sink),
     ];
-    let mut active = Vec::new();
+    let mut active = [Vec::new(), Vec::new()];
     let mut prefilling = Vec::new();
     let mut backend = PruneTestBackend::default();
 
@@ -283,9 +281,12 @@ fn closed_resident_work_is_absent_from_post_prune_load() {
     let (closed_prefill_sink, closed_prefill_rx) = TokenSink::standalone();
     drop(closed_prefill_rx);
     let (pending_sink, _pending_rx) = TokenSink::standalone();
-    let mut active = vec![
-        active_request(10, "active-closed", closed_active_sink),
-        active_request(11, "active-open", open_active_sink),
+    let mut active = [
+        vec![
+            active_request(10, "active-closed", closed_active_sink),
+            active_request(11, "active-open", open_active_sink),
+        ],
+        Vec::new(),
     ];
     let mut prefilling = vec![prefilling_request(
         12,
@@ -299,8 +300,8 @@ fn closed_resident_work_is_absent_from_post_prune_load() {
         prune_closed_requests(&mut backend, &mut active, &mut prefilling, &mut pending).is_ok()
     );
 
-    assert_eq!(active.len(), 1);
-    assert_eq!(active[0].request_id.as_deref(), Some("active-open"));
+    assert_eq!(active[0].len(), 1);
+    assert_eq!(active[0][0].request_id.as_deref(), Some("active-open"));
     assert!(prefilling.is_empty());
     assert_eq!(
         logical_load_counts(&active, &prefilling, 0, pending.len()),
@@ -318,7 +319,10 @@ fn closed_resident_frees_capacity_for_same_tick_admission() {
     let (closed_sink, closed_rx) = TokenSink::standalone();
     drop(closed_rx);
     let (pending_sink, _pending_rx) = TokenSink::standalone();
-    let mut active = vec![active_request(20, "resident-closed", closed_sink)];
+    let mut active = [
+        vec![active_request(20, "resident-closed", closed_sink)],
+        Vec::new(),
+    ];
     let mut prefilling = Vec::new();
     let mut pending = vec![test_request("replacement", pending_sink)];
     let mut backend = PruneTestBackend::default();
@@ -329,6 +333,7 @@ fn closed_resident_frees_capacity_for_same_tick_admission() {
 
     let active_budget: Vec<ActiveKvBudget> = active
         .iter()
+        .flat_map(|c| c.iter())
         .map(|req| ActiveKvBudget {
             prompt_len: req.prompt_len,
             generated_count: req.generated_count,
@@ -347,7 +352,7 @@ fn closed_resident_frees_capacity_for_same_tick_admission() {
         |req| req.max_tokens,
     );
 
-    assert!(active.is_empty());
+    assert!(active[0].is_empty());
     assert_eq!(backend.retired_active, vec![RequestId::new(20)]);
     assert_eq!(admission.pending.len(), 1);
     assert_eq!(
@@ -365,7 +370,7 @@ fn closed_materialized_prefill_requires_existing_worker_state() {
         cursor: 1,
         ..prefilling_request(21, "prefill-materialized", closed_sink)
     }];
-    let mut active = Vec::new();
+    let mut active = [Vec::new(), Vec::new()];
     let mut pending = Vec::new();
     let mut backend = PruneTestBackend::default();
 
@@ -386,7 +391,10 @@ fn prune_drop_failure_preserves_pending_for_terminal_fanout() {
     drop(closed_rx);
     let (pending_tx, mut pending_rx) = TokenSink::standalone();
     let (_observer_tx, observer_rx) = TokenSink::standalone();
-    let mut active = vec![active_request(22, "closed-active", closed_tx)];
+    let mut active = [
+        vec![active_request(22, "closed-active", closed_tx)],
+        Vec::new(),
+    ];
     let mut prefilling = Vec::new();
     let mut pending = vec![test_request("live-pending", pending_tx)];
     let mut backend = LifecycleTestBackend::new(None, observer_rx);
@@ -398,7 +406,7 @@ fn prune_drop_failure_preserves_pending_for_terminal_fanout() {
             Ok(()) => panic!("injected prune drop should fail"),
             Err(failure) => failure,
         };
-    assert!(active.is_empty());
+    assert!(active[0].is_empty());
     assert_eq!(failure.transient.len(), 1);
     assert_eq!(pending.len(), 1);
 
@@ -530,7 +538,7 @@ fn decode_completion_drop_failure_publishes_only_terminal_error() {
         &mut submit_rx,
         &load_tx,
         64,
-        Vec::new(),
+        [Vec::new(), Vec::new()],
         Vec::new(),
         Vec::new(),
         Vec::new(),
@@ -553,7 +561,7 @@ fn immediate_prefill_completion_waits_for_drop() {
     request.req.params.ignore_eos = true;
     request.step_chunk = 1;
     let chunk = ScheduledChunk::from(vec![request]);
-    let mut active = Vec::new();
+    let mut active = [Vec::new(), Vec::new()];
     let mut prefilling = Vec::new();
     let mut backend = LifecycleTestBackend::new(None, token_rx);
 
@@ -571,7 +579,7 @@ fn immediate_prefill_completion_waits_for_drop() {
         .is_ok()
     );
 
-    assert!(active.is_empty());
+    assert!(active[0].is_empty() && active[1].is_empty());
     assert!(prefilling.is_empty());
     assert_eq!(
         backend.prefill_drops,
@@ -605,7 +613,7 @@ fn immediate_prefill_drop_failure_publishes_only_terminal_error() {
     remaining.req.params.ignore_eos = true;
     remaining.step_chunk = 1;
     let chunk = ScheduledChunk::from(vec![request, remaining]);
-    let mut active = Vec::new();
+    let mut active = [Vec::new(), Vec::new()];
     let mut prefilling = Vec::new();
     let mut backend = LifecycleTestBackend::new(None, token_rx);
     backend.fail_prefill_drop = true;
@@ -673,7 +681,7 @@ fn terminal_shutdown_closes_drains_and_errors_every_owner_once() {
     let (closed_tx, closed_rx) = TokenSink::standalone();
     drop(closed_rx);
 
-    let active = vec![active_request(40, "active", active_tx)];
+    let active = [vec![active_request(40, "active", active_tx)], Vec::new()];
     let prefilling = vec![prefilling_request(41, "prefilling", prefill_tx)];
     let pending = vec![
         test_request("duplicate-external-id", pending_tx),
@@ -891,6 +899,7 @@ fn tp_engine_rejects_cuda_graph_before_model_load() {
         },
         1,
         1,
+        1,
     ) {
         Ok(_) => panic!("TP CUDA Graph startup should fail"),
         Err(err) => err.to_string(),
@@ -907,7 +916,7 @@ fn tp2_scheduler_runs_forced_mixed_steps() {
         return;
     };
     let handle =
-        start_tp_with_capacity(&model_path, 42, &[0, 1], 2, 1).expect("start TP2 scheduler");
+        start_tp_with_capacity(&model_path, 42, &[0, 1], 2, 2, 1).expect("start TP2 scheduler");
     let (decode_tx, mut decode_rx) = TokenSink::standalone();
     let (prefill_tx, mut prefill_rx) = TokenSink::standalone();
 

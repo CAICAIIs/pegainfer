@@ -1,5 +1,55 @@
 use crate::Qwen35SchedulerPolicy;
 
+/// Decode cohort 标识：单 GPU 双 cohort 轮流调度 A/B，TP 与单 cohort 仅使用 A。
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) enum CohortId {
+    A = 0,
+    B = 1,
+}
+
+impl CohortId {
+    pub(super) const fn index(self) -> usize {
+        self as usize
+    }
+
+    pub(super) const fn other(self) -> Self {
+        match self {
+            Self::A => Self::B,
+            Self::B => Self::A,
+        }
+    }
+}
+
+/// 准入时为新请求分配目标 cohort：优先填满 A，确保 `c <= decode_width` 时只跑 A、
+/// B 保持空闲；超过单 cohort 宽度后再溢出到 B。
+pub(super) fn assign_cohort(cohort_free: [usize; 2]) -> Option<CohortId> {
+    if cohort_free[CohortId::A.index()] > 0 {
+        Some(CohortId::A)
+    } else if cohort_free[CohortId::B.index()] > 0 {
+        Some(CohortId::B)
+    } else {
+        None
+    }
+}
+
+/// 选择本步要 decode 的 cohort 以及下一步的轮转起点：
+/// - 只有 A 活跃时只跑 A（行为与单 cohort 一致）；
+/// - 只有 B 活跃时只跑 B；
+/// - A/B 均活跃时按 `next_turn` 严格交替（A -> B -> A -> B）。
+pub(super) fn next_decode_cohort(
+    active_counts: [usize; 2],
+    next_turn: CohortId,
+) -> Option<(CohortId, CohortId)> {
+    let a = active_counts[CohortId::A.index()] > 0;
+    let b = active_counts[CohortId::B.index()] > 0;
+    match (a, b) {
+        (false, false) => None,
+        (true, false) => Some((CohortId::A, CohortId::A)),
+        (false, true) => Some((CohortId::B, CohortId::B)),
+        (true, true) => Some((next_turn, next_turn.other())),
+    }
+}
+
 pub(super) enum ExecutionPlan<T> {
     Prefill { pending: Vec<T> },
     Decode,
@@ -37,12 +87,6 @@ pub(super) struct PrefillQueueState {
 }
 
 const DECODE_FINISH_WINDOW_TOKENS: usize = 4;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct SlotCompaction {
-    pub(super) moved_from: usize,
-    pub(super) moved_to: usize,
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum RejectReason {
@@ -174,10 +218,6 @@ fn active_future_pages(active: &[ActiveKvBudget], page_size: usize) -> usize {
         .sum()
 }
 
-pub(super) fn slot_for_new_request(active_count: usize, max_batch: usize) -> Option<usize> {
-    (active_count < max_batch).then_some(active_count)
-}
-
 /// KV-lifetime budget of a request for chunked prefill
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct PrefillKvBudget {
@@ -203,12 +243,16 @@ pub(super) fn prefilling_future_pages(prefilling: &[PrefillKvBudget], page_size:
 }
 
 /// Decide how many prompt tokens each FIFO-front prefilling request prefills this step
-/// return FIFO order with token budget
-pub(super) fn plan_prefill_chunks(remaining: &[usize], budget: usize) -> Vec<usize> {
+/// return FIFO order with token budget and per-step request count cap (`max_reqs`, matching decode sampling scratch).
+pub(super) fn plan_prefill_chunks(
+    remaining: &[usize],
+    budget: usize,
+    max_reqs: usize,
+) -> Vec<usize> {
     let mut chunks = Vec::new();
     let mut left = budget;
     for &rem in remaining {
-        if left == 0 || rem == 0 {
+        if left == 0 || rem == 0 || chunks.len() >= max_reqs {
             break;
         }
         let take = rem.min(left);
@@ -219,22 +263,6 @@ pub(super) fn plan_prefill_chunks(remaining: &[usize], budget: usize) -> Vec<usi
         }
     }
     chunks
-}
-
-pub(super) fn compaction_after_retire(
-    active_len_before: usize,
-    retired_idx: usize,
-) -> Option<SlotCompaction> {
-    assert!(
-        retired_idx < active_len_before,
-        "retired Qwen3.5 slot index must be active"
-    );
-
-    let last = active_len_before - 1;
-    (retired_idx < last).then_some(SlotCompaction {
-        moved_from: last,
-        moved_to: retired_idx,
-    })
 }
 
 #[cfg(test)]
@@ -800,58 +828,24 @@ mod tests {
     }
 
     #[test]
-    fn graph_slot_assignment_stays_dense_after_retirement() {
-        assert_eq!(slot_for_new_request(0, 4), Some(0));
-        assert_eq!(slot_for_new_request(3, 4), Some(3));
-        assert_eq!(slot_for_new_request(4, 4), None);
-
-        assert_eq!(
-            compaction_after_retire(4, 1),
-            Some(SlotCompaction {
-                moved_from: 3,
-                moved_to: 1
-            }),
-            "retiring a middle slot moves the last dense slot into the hole"
-        );
-        assert_eq!(
-            compaction_after_retire(4, 0),
-            Some(SlotCompaction {
-                moved_from: 3,
-                moved_to: 0
-            }),
-            "retiring the first slot also moves the last dense slot into the hole"
-        );
-        assert_eq!(
-            compaction_after_retire(4, 3),
-            None,
-            "retiring the last slot does not need a recurrent-state copy"
-        );
-        assert_eq!(
-            slot_for_new_request(3, 4),
-            Some(3),
-            "after compaction, the next request reuses the next dense slot"
-        );
-    }
-
-    #[test]
     fn prefill_chunks_slice_long_prompt_and_stop_packing() {
         // One long prompt, budget smaller than its remaining work: take a
         // partial chunk and stop so it stays at the front next step.
-        assert_eq!(plan_prefill_chunks(&[5000], 512), vec![512]);
-        assert_eq!(plan_prefill_chunks(&[5000, 8], 512), vec![512]);
+        assert_eq!(plan_prefill_chunks(&[5000], 512, 64), vec![512]);
+        assert_eq!(plan_prefill_chunks(&[5000, 8], 512, 64), vec![512]);
     }
 
     #[test]
     fn prefill_chunks_pack_short_prompts_up_to_budget() {
         // Several short prompts pack into one step until the budget runs out.
         assert_eq!(
-            plan_prefill_chunks(&[100, 100, 100], 512),
+            plan_prefill_chunks(&[100, 100, 100], 512, 64),
             vec![100, 100, 100]
         );
         // Third prompt only partially fits: 200 + 200 = 400 used, 112 left, the
         // 300-token prompt takes 112 and stops.
         assert_eq!(
-            plan_prefill_chunks(&[200, 200, 300], 512),
+            plan_prefill_chunks(&[200, 200, 300], 512, 64),
             vec![200, 200, 112]
         );
     }
@@ -859,22 +853,85 @@ mod tests {
     #[test]
     fn prefill_chunks_complete_then_continue_to_next() {
         // A prompt that exactly fits the budget completes; packing continues.
-        assert_eq!(plan_prefill_chunks(&[512, 8], 1024), vec![512, 8]);
+        assert_eq!(plan_prefill_chunks(&[512, 8], 1024, 64), vec![512, 8]);
     }
 
     #[test]
     fn prefill_chunks_huge_budget_prefills_everything_in_one_step() {
         // The pre-#375 behaviour: a budget above total remaining work prefills
-        // every prompt in a single step.
+        // every prompt in a single step (up to max_reqs).
         assert_eq!(
-            plan_prefill_chunks(&[1000, 2000, 3000], usize::MAX),
+            plan_prefill_chunks(&[1000, 2000, 3000], usize::MAX, 64),
             vec![1000, 2000, 3000]
         );
     }
 
     #[test]
+    fn prefill_chunks_cap_request_count_to_decode_width() {
+        let remaining = vec![1usize; 128];
+        let chunks = plan_prefill_chunks(&remaining, 1024, 64);
+        assert_eq!(chunks.len(), 64);
+    }
+
+    #[test]
     fn prefill_chunks_empty_queue_schedules_nothing() {
-        assert!(plan_prefill_chunks(&[], 512).is_empty());
+        assert!(plan_prefill_chunks(&[], 512, 64).is_empty());
+    }
+
+    #[test]
+    fn cohort_assignment_fills_a_before_spilling_to_b() {
+        assert_eq!(assign_cohort([64, 64]), Some(CohortId::A));
+        assert_eq!(assign_cohort([1, 64]), Some(CohortId::A));
+        assert_eq!(assign_cohort([0, 64]), Some(CohortId::B));
+        assert_eq!(assign_cohort([0, 1]), Some(CohortId::B));
+        assert_eq!(assign_cohort([0, 0]), None);
+    }
+
+    #[test]
+    fn decode_cohort_selection_stays_on_a_under_64_and_alternates_above_64() {
+        assert_eq!(next_decode_cohort([0, 0], CohortId::A), None);
+        // c <= 64：只跑 A，next_turn 保持 A。
+        assert_eq!(
+            next_decode_cohort([64, 0], CohortId::A),
+            Some((CohortId::A, CohortId::A))
+        );
+        assert_eq!(
+            next_decode_cohort([32, 0], CohortId::B),
+            Some((CohortId::A, CohortId::A))
+        );
+        // 仅 B 活跃时只跑 B。
+        assert_eq!(
+            next_decode_cohort([0, 12], CohortId::A),
+            Some((CohortId::B, CohortId::B))
+        );
+        // c > 64：A/B 严格交替。
+        let (first, turn1) = next_decode_cohort([64, 32], CohortId::A).unwrap();
+        let (second, turn2) = next_decode_cohort([64, 32], turn1).unwrap();
+        let (third, turn3) = next_decode_cohort([64, 32], turn2).unwrap();
+        assert_eq!(
+            (first, second, third),
+            (CohortId::A, CohortId::B, CohortId::A)
+        );
+        assert_eq!(turn3, CohortId::B);
+    }
+
+    #[test]
+    fn admission_admits_128_resident_requests_and_defers_129th() {
+        let pending: Vec<Pending> = (0..129).map(|i| pending_with_max(i, 16, 16)).collect();
+        let outcome = admit_pending_requests(
+            pending,
+            &[],
+            128,
+            16,
+            10_000,
+            10_000,
+            262_144,
+            |req| req.prompt_len,
+            |req| req.max_tokens,
+        );
+        assert_eq!(outcome.pending.len(), 128);
+        assert_eq!(ids(&outcome.deferred), vec![128]);
+        assert!(outcome.rejected.is_empty());
     }
 
     #[test]

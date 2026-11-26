@@ -1,4 +1,4 @@
-//! Qwen3.5's [`ModelLine`] implementation.
+//! Qwen3.5 的 [`ModelLine`] 实现。
 
 use std::collections::BTreeSet;
 
@@ -13,19 +13,23 @@ use pegainfer_frontend::model_line::ModelLine;
 use crate::Qwen35DecodeOverlap;
 use crate::Qwen35LaunchOptions;
 use crate::Qwen35SchedulerPolicy;
+use crate::ServingCapacity;
 
 pub static MODEL_LINE: Qwen35Line = Qwen35Line;
 
 pub struct Qwen35Line;
 
-// Qwen3.5-exclusive CLI flags.
+// Qwen3.5 专属 CLI 参数：将单步 decode 宽度与最大驻留数分开命名。
 #[derive(ClapArgs)]
 struct Qwen35Cli {
-    /// Decode-batch capacity, 1..=64. Qwen3.5 internally rounds allocation to
-    /// the next graph bucket but admits only this many scheduler slots; defaults
-    /// to 64.
+    /// 单步 decode 宽度，1..=64，默认 64。
     #[arg(long)]
-    max_batch: Option<usize>,
+    decode_width: Option<usize>,
+
+    /// 最大驻留请求数：单 GPU 默认 2 × decode_width（128，A/B 双 cohort），
+    /// TP 默认与 decode_width 一致（64，单 cohort）；超出范围直接报错。
+    #[arg(long)]
+    max_resident: Option<usize>,
 
     /// Qwen3.5 prefill/decode scheduler policy. Defaults to `off`; `auto` is
     /// opt-in and currently single-GPU only.
@@ -54,6 +58,14 @@ impl CliQwen35SchedulerPolicy {
 
 fn cli(ctx: &LaunchContext<'_>) -> Qwen35Cli {
     Qwen35Cli::from_arg_matches(ctx.matches).expect("Qwen35Cli parses from the merged command")
+}
+
+fn resolve_capacity_args(cli: &Qwen35Cli, tp_size: usize) -> (usize, usize) {
+    let decode_width = cli.decode_width.unwrap_or(crate::DEFAULT_DECODE_WIDTH);
+    let max_resident = cli
+        .max_resident
+        .unwrap_or_else(|| ServingCapacity::default_max_resident(decode_width, tp_size));
+    (decode_width, max_resident)
 }
 
 fn resolve_decode_overlap(overlap: CliDecodeOverlap) -> Result<Qwen35DecodeOverlap, CliError> {
@@ -105,22 +117,17 @@ impl ModelLine for Qwen35Line {
     ) -> Result<(), CliError> {
         let cli = cli(ctx);
         let decode_overlap = resolve_decode_overlap(ctx.shared.decode_overlap)?;
-        if let Some(max_batch) = cli.max_batch {
-            if !(1..=crate::MAX_DECODE_BATCH).contains(&max_batch) {
-                return Err(CliError::rule(format!(
-                    "--max-batch must be in 1..={} for Qwen3.5, got {max_batch}",
-                    crate::MAX_DECODE_BATCH
-                )));
-            }
-        }
-        if decode_overlap != Qwen35DecodeOverlap::Off {
-            let max_batch = cli.max_batch.unwrap_or(crate::MAX_DECODE_BATCH);
-            if max_batch > crate::MAX_SHARED_SM_DECODE_BATCH {
-                return Err(CliError::rule(format!(
-                    "Qwen3.5 --decode-overlap=stream requires --max-batch <= {}; got {max_batch}",
-                    crate::MAX_SHARED_SM_DECODE_BATCH
-                )));
-            }
+        let (decode_width, max_resident) = resolve_capacity_args(&cli, ctx.shared.tp_size);
+        ServingCapacity::validate_request(decode_width, max_resident, ctx.shared.tp_size)
+            .map_err(|err| CliError::rule(err.to_string()))?;
+
+        if decode_overlap != Qwen35DecodeOverlap::Off
+            && decode_width > crate::MAX_SHARED_SM_DECODE_BATCH
+        {
+            return Err(CliError::rule(format!(
+                "Qwen3.5 --decode-overlap=stream requires --decode-width <= {}; got {decode_width}",
+                crate::MAX_SHARED_SM_DECODE_BATCH
+            )));
         }
         if decode_overlap != Qwen35DecodeOverlap::Off
             && matches!(cli.qwen35_scheduler_policy, CliQwen35SchedulerPolicy::Auto)
@@ -146,13 +153,15 @@ impl ModelLine for Qwen35Line {
 
     fn launch(&self, ctx: &LaunchContext<'_>) -> anyhow::Result<LaunchedEngine> {
         let cli = cli(ctx);
+        let (decode_width, max_resident) = resolve_capacity_args(&cli, ctx.shared.tp_size);
         crate::launch_with_options_policy_and_overlap(
             ctx.model_path,
             Qwen35LaunchOptions {
                 device_ordinal: ctx.shared.device_ordinal,
                 tp_size: ctx.shared.tp_size,
                 cuda_graph: ctx.shared.cuda_graph,
-                max_batch: cli.max_batch.unwrap_or(crate::MAX_DECODE_BATCH),
+                decode_width,
+                max_resident,
                 max_prefill_tokens: ctx
                     .shared
                     .max_prefill_tokens
@@ -204,6 +213,20 @@ mod tests {
     }
 
     #[test]
+    fn rejects_tp_dual_cohort_max_resident() {
+        let error = validate_argv(&[
+            "pegainfer",
+            "--tp-size",
+            "2",
+            "--cuda-graph=false",
+            "--max-resident",
+            "128",
+        ])
+        .expect_err("Qwen3.5 TP should reject max_resident > decode_width");
+        assert!(error.to_string().contains("single cohort"));
+    }
+
+    #[test]
     fn accepts_scheduler_policy_off() {
         validate_argv(&["pegainfer", "--qwen35-scheduler-policy", "off"])
             .expect("Qwen3.5 should accept explicit scheduler-policy off");
@@ -211,22 +234,22 @@ mod tests {
 
     #[test]
     fn accepts_shared_stream_overlap() {
-        let max_batch = crate::MAX_SHARED_SM_DECODE_BATCH.to_string();
+        let decode_width = crate::MAX_SHARED_SM_DECODE_BATCH.to_string();
         validate_argv(&[
             "pegainfer",
             "--decode-overlap",
             "stream",
-            "--max-batch",
-            &max_batch,
+            "--decode-width",
+            &decode_width,
         ])
         .expect("Qwen3.5 should accept shared-stream overlap");
     }
 
     #[test]
-    fn rejects_stream_overlap_default_max_batch() {
+    fn rejects_stream_overlap_default_decode_width() {
         let error = validate_argv(&["pegainfer", "--decode-overlap", "stream"])
-            .expect_err("Qwen3.5 should reject stream overlap at the default max_batch");
-        assert!(error.to_string().contains("max-batch"));
+            .expect_err("Qwen3.5 should reject stream overlap at the default decode_width");
+        assert!(error.to_string().contains("decode-width"));
         assert!(
             error
                 .to_string()
@@ -247,7 +270,7 @@ mod tests {
             "pegainfer",
             "--decode-overlap",
             "stream",
-            "--max-batch",
+            "--decode-width",
             "32",
             "--qwen35-scheduler-policy",
             "auto",
@@ -271,18 +294,28 @@ mod tests {
     }
 
     #[test]
-    fn accepts_non_bucket_scheduler_max_batch() {
-        validate_argv(&["pegainfer", "--max-batch", "5"])
-            .expect("Qwen3.5 should accept scheduler max_batch between decode buckets");
+    fn accepts_explicit_decode_width_and_max_resident() {
+        validate_argv(&["pegainfer", "--decode-width", "64", "--max-resident", "128"])
+            .expect("Qwen3.5 should accept 64/128 on single GPU");
+        validate_argv(&["pegainfer", "--decode-width", "5", "--max-resident", "5"])
+            .expect("Qwen3.5 should accept sub-bucket decode_width/max_resident");
     }
 
     #[test]
-    fn rejects_zero_scheduler_max_batch() {
-        let error = validate_argv(&["pegainfer", "--max-batch", "0"])
-            .expect_err("Qwen3.5 should reject zero scheduler max_batch");
-        assert!(
-            error.to_string().contains("--max-batch must be in 1..="),
-            "unexpected error: {error}"
-        );
+    fn rejects_legacy_max_batch_flag() {
+        let error = validate_argv(&["pegainfer", "--max-batch", "64"])
+            .expect_err("--max-batch should no longer be accepted");
+        assert!(error.to_string().contains("max-batch"));
+    }
+
+    #[test]
+    fn rejects_zero_decode_width_and_over_resident() {
+        let error = validate_argv(&["pegainfer", "--decode-width", "0"])
+            .expect_err("Qwen3.5 should reject zero decode_width");
+        assert!(error.to_string().contains("decode_width must be in 1..="));
+
+        let error = validate_argv(&["pegainfer", "--decode-width", "64", "--max-resident", "129"])
+            .expect_err("Qwen3.5 should reject max_resident > 2 * decode_width");
+        assert!(error.to_string().contains("max_resident"));
     }
 }

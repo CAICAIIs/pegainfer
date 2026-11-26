@@ -55,6 +55,8 @@ pub struct EngineHandle {
     /// KV pool capacity in blocks + block size, or `None` if the engine did not
     /// report it. See [`KvCapacity`].
     kv_capacity: Option<KvCapacity>,
+    /// Maximum concurrent resident sequences the engine can admit, if reported.
+    max_num_seqs: Option<usize>,
     /// One optional live-load feed per scheduler partition. A normal engine
     /// has one partition; a data-parallel engine exposes one per logical DP
     /// rank. Each handle clone owns cloned receivers and `watch` fans out.
@@ -115,6 +117,7 @@ impl EngineHandle {
             }),
             servable_len: None,
             kv_capacity: None,
+            max_num_seqs: None,
             metrics_watches: vec![None],
         }
     }
@@ -140,6 +143,16 @@ impl EngineHandle {
     /// at once.
     pub(crate) fn kv_capacity(&self) -> Option<KvCapacity> {
         self.kv_capacity
+    }
+
+    #[must_use]
+    pub fn with_max_num_seqs(mut self, max_num_seqs: usize) -> Self {
+        self.max_num_seqs = Some(max_num_seqs);
+        self
+    }
+
+    pub fn max_num_seqs(&self) -> Option<usize> {
+        self.max_num_seqs
     }
 
     #[must_use]

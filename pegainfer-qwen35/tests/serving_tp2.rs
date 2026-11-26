@@ -84,6 +84,7 @@ async fn spawn_ready_server(
                 ..EngineLoadOptions::default()
             },
             8,
+            8,
             max_prefill_tokens,
         )
     })
@@ -208,6 +209,7 @@ fn assert_invalid_cuda_graph_tp_startup_fails(model_path: &str) -> Result<()> {
             seed: 42,
             ..EngineLoadOptions::default()
         },
+        8,
         8,
         1,
     ) else {

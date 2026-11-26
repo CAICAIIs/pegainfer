@@ -18,6 +18,7 @@ use pegainfer_core::tensor::HiddenStates;
 use pegainfer_frontend::engine::panic_message;
 use pegainfer_kernels::tensor::StreamOverrideGuard;
 
+#[cfg(test)]
 use super::batch_decode_graph::BatchDecodeGraphState;
 use super::recurrent_state::RecurrentState;
 use super::weights::Qwen35Model;
@@ -96,6 +97,7 @@ impl Qwen35Model {
     /// Prefill logits are returned as `[selection_vocab, n_prefill]` in request order.
     /// Decode logits remain in `graph_state.buffers.logits`; callers sample from
     /// that batched buffer directly to avoid per-request extraction.
+    #[cfg(test)]
     pub(crate) fn unified_step(
         &self,
         prefill_prompts: &[&[u32]],
@@ -103,6 +105,7 @@ impl Qwen35Model {
         prefill_recurrent_states: &mut [&mut RecurrentState],
         decode_tokens: &[u32],
         decode_kv_states: &mut [&mut KvState],
+        decode_slot_indices: &[usize],
         graph_state: &mut BatchDecodeGraphState,
     ) -> Result<UnifiedStepOutput> {
         anyhow::ensure!(
@@ -125,7 +128,12 @@ impl Qwen35Model {
         let decoded = if decode_tokens.is_empty() {
             false
         } else {
-            self.batch_decode_graph(decode_tokens, decode_kv_states, graph_state)?;
+            self.batch_decode_graph(
+                decode_tokens,
+                decode_kv_states,
+                decode_slot_indices,
+                graph_state,
+            )?;
             true
         };
 
@@ -163,7 +171,7 @@ mod tests {
         else {
             return;
         };
-        let model = Qwen35Model::from_safetensors(&model_path, 0, 2).unwrap();
+        let model = Qwen35Model::from_safetensors_with_capacity(&model_path, 0, 2, 2).unwrap();
 
         let prompt_a: Vec<u32> = vec![9707];
         let prompt_b: Vec<u32> = vec![3838, 374, 220, 17, 10, 17];
@@ -173,23 +181,17 @@ mod tests {
         let ref_tokens = {
             let prompts_ref: Vec<&[u32]> = vec![&prompt_a, &prompt_b];
             let mut kv_states: Vec<KvState> = vec![model.alloc_kv(), model.alloc_kv()];
-            let mut rec_states: Vec<RecurrentState> = vec![
-                RecurrentState::new(&model.ctx, &model.config).unwrap(),
-                RecurrentState::new(&model.ctx, &model.config).unwrap(),
-            ];
-            let mut rec_refs: Vec<&mut RecurrentState> = rec_states.iter_mut().collect();
-            let first_logits = model
-                .batch_prefill_logits(&prompts_ref, &mut kv_states, &mut rec_refs)
-                .unwrap();
+            let mut gs = model.create_batch_decode_graph_state().unwrap();
+            let first_logits = {
+                let mut rec_refs: Vec<&mut RecurrentState> =
+                    gs.slot_states.iter_mut().take(2).collect();
+                model
+                    .batch_prefill_logits(&prompts_ref, &mut kv_states, &mut rec_refs)
+                    .unwrap()
+            };
             let first = greedy_sample_batch(&model, &first_logits, 2);
             let first_a = first[0];
             let first_b = first[1];
-
-            let mut gs = model.create_batch_decode_graph_state().unwrap();
-            gs.copy_state_to_slot(&model.ctx, &rec_states[0], 0)
-                .unwrap();
-            gs.copy_state_to_slot(&model.ctx, &rec_states[1], 1)
-                .unwrap();
             model.ctx.sync().unwrap();
 
             let mut tokens_a = vec![first_a];
@@ -199,7 +201,7 @@ mod tests {
             for _ in 1..num_steps {
                 let tids = [*tokens_a.last().unwrap(), *tokens_b.last().unwrap()];
                 model
-                    .batch_decode_graph(&tids, &mut kv_refs, &mut gs)
+                    .batch_decode_graph(&tids, &mut kv_refs, &[0, 1], &mut gs)
                     .unwrap();
                 let next = greedy_sample_batch(&model, &gs.buffers.logits, 2);
                 tokens_a.push(next[0]);
@@ -212,33 +214,17 @@ mod tests {
         let unified_tokens = {
             let prompts_ref: Vec<&[u32]> = vec![&prompt_a, &prompt_b];
             let mut kv_states: Vec<KvState> = vec![model.alloc_kv(), model.alloc_kv()];
-            let mut rec_states: Vec<RecurrentState> = vec![
-                RecurrentState::new(&model.ctx, &model.config).unwrap(),
-                RecurrentState::new(&model.ctx, &model.config).unwrap(),
-            ];
-            let mut rec_refs: Vec<&mut RecurrentState> = rec_states.iter_mut().collect();
-
-            let output = model
-                .unified_step(
-                    &prompts_ref,
-                    &mut kv_states,
-                    &mut rec_refs,
-                    &[],
-                    &mut [],
-                    &mut model.create_batch_decode_graph_state().unwrap(),
-                )
-                .unwrap();
-            let prefill_logits = output.prefill_logits.as_ref().unwrap();
-            let first = greedy_sample_batch(&model, prefill_logits, 2);
+            let mut gs = model.create_batch_decode_graph_state().unwrap();
+            let first_logits = {
+                let mut rec_refs: Vec<&mut RecurrentState> =
+                    gs.slot_states.iter_mut().take(2).collect();
+                model
+                    .batch_prefill_logits(&prompts_ref, &mut kv_states, &mut rec_refs)
+                    .unwrap()
+            };
+            let first = greedy_sample_batch(&model, &first_logits, 2);
             let first_a = first[0];
             let first_b = first[1];
-
-            // Transfer prefill states to decode graph slots
-            let mut gs = model.create_batch_decode_graph_state().unwrap();
-            gs.copy_state_to_slot(&model.ctx, &rec_states[0], 0)
-                .unwrap();
-            gs.copy_state_to_slot(&model.ctx, &rec_states[1], 1)
-                .unwrap();
 
             let mut kv_refs: Vec<&mut KvState> = kv_states.iter_mut().collect();
 
@@ -248,7 +234,7 @@ mod tests {
             for _ in 1..num_steps {
                 let tids = [*tokens_a.last().unwrap(), *tokens_b.last().unwrap()];
                 let output = model
-                    .unified_step(&[], &mut [], &mut [], &tids, &mut kv_refs, &mut gs)
+                    .unified_step(&[], &mut [], &mut [], &tids, &mut kv_refs, &[0, 1], &mut gs)
                     .unwrap();
                 assert!(output.decoded);
                 let next = greedy_sample_batch(&model, &gs.buffers.logits, 2);

@@ -89,6 +89,7 @@ impl LocalEngineBridge {
             self.data_parallel_size,
             self.max_model_len,
             self.handle.kv_capacity(),
+            self.handle.max_num_seqs(),
             self.metrics_watch.clone(),
             &shutdown,
         )
@@ -701,6 +702,7 @@ async fn connect_link(
     data_parallel_size: u32,
     max_model_len: u32,
     kv_capacity: Option<crate::engine::KvCapacity>,
+    max_num_seqs: Option<usize>,
     metrics_watch: Option<watch::Receiver<SchedulerMetrics>>,
     shutdown: &CancellationToken,
 ) -> Result<BridgeLink> {
@@ -745,6 +747,7 @@ async fn connect_link(
     };
     info!(
         "local engine {engine_index} KV capacity: {kv_capacity:?} -> \
+         max_num_seqs={max_num_seqs:?} \
          kv_cache_size_tokens={kv_cache_size_tokens:?} \
          kv_cache_max_concurrency={kv_cache_max_concurrency:?}"
     );

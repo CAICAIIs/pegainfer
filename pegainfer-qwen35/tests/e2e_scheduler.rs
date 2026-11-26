@@ -676,11 +676,9 @@ fn test_e2e_qwen35_scheduler() {
         pegainfer_qwen35::runtime::Qwen35Model::from_safetensors_with_options(&model_path, true)
             .expect("Failed to load model");
     let tokenizer = common::load_tokenizer(&model_path);
-    // Use reduced batch capacity (8) to fit on 16GB GPUs alongside the model.
     let handle = pegainfer_qwen35::runtime::start_with_capacity(
         model,
         42,
-        8,
         pegainfer_qwen35::DEFAULT_MAX_PREFILL_TOKENS,
     )
     .expect("Failed to start Qwen3.5 scheduler");
@@ -714,6 +712,7 @@ fn test_e2e_qwen35_shared_sm_last_decoder() {
                 seed: 42,
                 ..EngineLoadOptions::default()
             },
+            4,
             4,
             8192,
             pegainfer_qwen35::Qwen35SchedulerPolicy::Off,
@@ -749,6 +748,7 @@ fn test_e2e_qwen35_shared_sm_last_decoder() {
             seed: 42,
             ..EngineLoadOptions::default()
         },
+        4,
         4,
         8192,
         pegainfer_qwen35::Qwen35SchedulerPolicy::Off,
@@ -839,6 +839,7 @@ fn test_e2e_qwen35_scheduler_tp2() {
             ..EngineLoadOptions::default()
         },
         8,
+        8,
         pegainfer_qwen35::DEFAULT_MAX_PREFILL_TOKENS,
     )
     .expect("Failed to start Qwen3.5 TP2 scheduler");
@@ -846,4 +847,209 @@ fn test_e2e_qwen35_scheduler_tp2() {
 
     let max_context_tokens = max_position_embeddings(&model_path);
     run_full_scheduler_e2e(&handle, &tokenizer, max_context_tokens, "TP2");
+}
+
+#[test]
+fn test_e2e_qwen35_dual_cohort_c128_and_slot_reuse() {
+    pegainfer_core::logging::init_default();
+    let Some(model_path) =
+        common::model_path_or_skip("test_e2e_qwen35_dual_cohort_c128_and_slot_reuse")
+    else {
+        return;
+    };
+
+    let tokenizer = common::load_tokenizer(&model_path);
+    let handle = pegainfer_qwen35::start_engine_with_capacity_policy_and_overlap(
+        Path::new(&model_path),
+        EngineLoadOptions {
+            enable_cuda_graph: true,
+            device_ordinals: vec![0],
+            seed: 42,
+            ..EngineLoadOptions::default()
+        },
+        64,
+        128,
+        pegainfer_qwen35::DEFAULT_MAX_PREFILL_TOKENS,
+        pegainfer_qwen35::Qwen35SchedulerPolicy::Off,
+        pegainfer_qwen35::Qwen35DecodeOverlap::Off,
+    )
+    .expect("Failed to start Qwen3.5 dual-cohort c128 scheduler");
+    assert_eq!(
+        handle.max_num_seqs(),
+        Some(128),
+        "single-GPU default dual-cohort handle must report max_num_seqs=128"
+    );
+
+    let encoded_cases: Vec<(&str, Vec<u32>)> = CASES
+        .iter()
+        .map(|case| {
+            (
+                case.name,
+                tokenizer.encode(case.prompt, false).expect("encode failed"),
+            )
+        })
+        .collect();
+    let (math_ref_tokens, _) = generate_tokens(&handle, &tokenizer, CASES[2].prompt, 8);
+    assert!(!math_ref_tokens.is_empty());
+
+    // 1) c=64 回归：单 cohort A 服务 64 并发请求。
+    {
+        let mut rxs = Vec::with_capacity(64);
+        for i in 0..64 {
+            let (name, prompt_tokens) = &encoded_cases[i % encoded_cases.len()];
+            let (token_tx, token_rx) = TokenSink::standalone();
+            handle
+                .submit(GenerateRequest {
+                    trace_parent: None,
+                    request_id: Some(format!("c64-{i}-{name}")),
+                    queued_at_unix_s: None,
+                    data_parallel_rank: None,
+                    prompt_tokens: prompt_tokens.clone(),
+                    params: SamplingParams::default(),
+                    max_tokens: 16,
+                    lora_adapter: None,
+                    kv_transfer_params: None,
+                    token_tx,
+                    logprobs: 0,
+                    echo: false,
+                })
+                .expect("submit c64 failed");
+            rxs.push((i, *name, token_rx));
+        }
+        for (i, name, mut rx) in rxs {
+            let res = collect_generation_with_timeout(
+                &mut rx,
+                &format!("c64-{i}-{name}"),
+                0,
+                std::time::Duration::from_secs(60),
+            );
+            assert!(!res.tokens.is_empty(), "c64-{i} produced no tokens");
+            assert!(
+                matches!(res.finish_reason, FinishReason::Length | FinishReason::Stop),
+                "c64-{i} unexpected finish reason: {:?}",
+                res.finish_reason
+            );
+        }
+    }
+
+    // 2) c=128 双 cohort A/B 轮转 + 跨 cohort 中途断连取消。
+    {
+        let mut load = handle
+            .metrics_watch()
+            .expect("scheduler must expose metrics");
+        let mut rxs = Vec::with_capacity(128);
+        for i in 0..128 {
+            let (name, prompt_tokens) = &encoded_cases[i % encoded_cases.len()];
+            let (token_tx, token_rx) = TokenSink::standalone();
+            handle
+                .submit(GenerateRequest {
+                    trace_parent: None,
+                    request_id: Some(format!("c128-{i}-{name}")),
+                    queued_at_unix_s: None,
+                    data_parallel_rank: None,
+                    prompt_tokens: prompt_tokens.clone(),
+                    params: SamplingParams {
+                        ignore_eos: true,
+                        ..SamplingParams::default()
+                    },
+                    max_tokens: 64,
+                    lora_adapter: None,
+                    kv_transfer_params: None,
+                    token_tx,
+                    logprobs: 0,
+                    echo: false,
+                })
+                .expect("submit c128 failed");
+            rxs.push((i, *name, token_rx));
+        }
+
+        // 确认运行中请求数确实超过单 cohort 64 限制（进入双 cohort 驻留）。
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        let mut observed_running = 0u64;
+        loop {
+            let snapshot = *load.borrow_and_update();
+            observed_running = observed_running.max(snapshot.num_running_reqs);
+            if observed_running > 64 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for >64 running requests; peak={observed_running}, last={snapshot:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        info!("  PASS: observed dual-cohort num_running_reqs={observed_running} (>64)");
+
+        // 取消 A/B 两边各 8 个请求（先等首个 token 后断连），验证跨 cohort 槽位安全回收。
+        let mut kept = Vec::with_capacity(112);
+        for (i, name, mut rx) in rxs {
+            let cancel_a = (8..16).contains(&i);
+            let cancel_b = (72..80).contains(&i);
+            if cancel_a || cancel_b {
+                wait_for_first_token(&mut rx, &format!("c128-cancel-{i}"));
+                drop(rx);
+            } else {
+                kept.push((i, name, rx));
+            }
+        }
+
+        for (i, name, mut rx) in kept {
+            let res = collect_generation_with_timeout(
+                &mut rx,
+                &format!("c128-{i}-{name}"),
+                0,
+                std::time::Duration::from_secs(90),
+            );
+            assert!(!res.tokens.is_empty(), "c128-{i} produced no tokens");
+            assert!(
+                matches!(res.finish_reason, FinishReason::Length | FinishReason::Stop),
+                "c128-{i} unexpected finish reason: {:?}",
+                res.finish_reason
+            );
+        }
+    }
+
+    // 3) 全部 128 个驻留槽位复用与状态清零验证（无泄漏、无跨请求状态串扰）。
+    {
+        let mut rxs = Vec::with_capacity(128);
+        for i in 0..128 {
+            let prompt_tokens = encoded_cases[2].1.clone();
+            let (token_tx, token_rx) = TokenSink::standalone();
+            handle
+                .submit(GenerateRequest {
+                    trace_parent: None,
+                    request_id: Some(format!("c128-reuse-{i}")),
+                    queued_at_unix_s: None,
+                    data_parallel_rank: None,
+                    prompt_tokens,
+                    params: SamplingParams::default(),
+                    max_tokens: 8,
+                    lora_adapter: None,
+                    kv_transfer_params: None,
+                    token_tx,
+                    logprobs: 0,
+                    echo: false,
+                })
+                .expect("submit c128 reuse failed");
+            rxs.push((i, token_rx));
+        }
+
+        for (i, mut rx) in rxs {
+            let res = collect_generation_with_timeout(
+                &mut rx,
+                &format!("c128-reuse-{i}"),
+                0,
+                std::time::Duration::from_secs(90),
+            );
+            assert_eq!(
+                res.tokens[0], math_ref_tokens[0],
+                "c128-reuse-{i} first token diverged from clean greedy reference (possible state leak)"
+            );
+            assert!(
+                matches!(res.finish_reason, FinishReason::Length | FinishReason::Stop),
+                "c128-reuse-{i} unexpected finish reason: {:?}",
+                res.finish_reason
+            );
+        }
+    }
 }

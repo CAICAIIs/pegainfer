@@ -15,7 +15,6 @@ use pegainfer_frontend::sampler::SamplingParams;
 use crate::batch_decode_graph::BatchDecodeGraphState;
 use crate::decode_buffers::BatchDecodeBuffers35;
 use crate::logprobs::snapshot_requested_logprobs;
-use crate::recurrent_state::RecurrentState;
 use crate::weights::Qwen35Model;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -108,17 +107,25 @@ struct ActiveRequest {
 pub struct Qwen35Executor {
     model: Qwen35Model,
     graph_state: BatchDecodeGraphState,
+    free_slots: Vec<usize>,
     active: Vec<ActiveRequest>,
 }
 
 impl Qwen35Executor {
     pub fn from_runtime(model_path: &str, device_ordinal: usize, max_batch: usize) -> Result<Self> {
-        let model = Qwen35Model::from_safetensors(model_path, device_ordinal, max_batch)?;
+        let model = Qwen35Model::from_safetensors_with_capacity(
+            model_path,
+            device_ordinal,
+            max_batch,
+            max_batch,
+        )?;
         model.tune_decode_gemm_algos()?;
         let graph_state = model.create_batch_decode_graph_state()?;
+        let free_slots = (0..graph_state.slot_states.len()).rev().collect();
         Ok(Self {
             model,
             graph_state,
+            free_slots,
             active: Vec::new(),
         })
     }
@@ -164,38 +171,58 @@ impl Qwen35Executor {
             .iter()
             .map(|_| self.model.alloc_kv())
             .collect();
-        let mut recurrent_states: Vec<RecurrentState> = plan
-            .requests
-            .iter()
-            .map(|_| RecurrentState::new(self.model.device_ctx(), self.model.config()))
-            .collect::<Result<_>>()?;
-        let mut recurrent_refs: Vec<&mut RecurrentState> = recurrent_states.iter_mut().collect();
-        let logits =
-            self.model
-                .batch_prefill_logits(&prompts, &mut kv_states, &mut recurrent_refs)?;
+        let mut assigned_slots = Vec::with_capacity(plan.requests.len());
+        for _ in 0..plan.requests.len() {
+            let slot_idx = self
+                .free_slots
+                .pop()
+                .ok_or_else(|| anyhow::anyhow!("Qwen3.5 logits executor out of state slots"))?;
+            self.graph_state
+                .reset_slot(self.model.device_ctx(), slot_idx)?;
+            assigned_slots.push(slot_idx);
+        }
 
-        let requested_logprobs: Vec<usize> = plan.requests.iter().map(|req| req.logprobs).collect();
-        let cpu_logits =
-            snapshot_requested_logprobs(self.model.device_ctx(), &logits, &requested_logprobs)?;
-        let tokens =
-            select_default_tokens_from_logits(&self.model, &logits, &mut self.graph_state.buffers)?;
+        let logits = {
+            let mut last_hiddens = Vec::with_capacity(prompts.len());
+            for i in 0..prompts.len() {
+                let slot_idx = assigned_slots[i];
+                let res = self.model.batch_prefill_logits(
+                    &[prompts[i]],
+                    &mut kv_states[i..=i],
+                    &mut [&mut self.graph_state.slot_states[slot_idx]],
+                );
+                match res {
+                    Ok(row_logits) => last_hiddens.push(row_logits),
+                    Err(err) => {
+                        for s in assigned_slots {
+                            self.free_slots.push(s);
+                        }
+                        return Err(err);
+                    }
+                }
+            }
+            last_hiddens
+        };
 
         let mut results = Vec::with_capacity(plan.requests.len());
-        for (i, (req, kv)) in plan.requests.iter().zip(kv_states).enumerate() {
-            let first_token = tokens[i];
-            let first_token_logprob = cpu_logits[i].as_ref().and_then(|row| {
+        for (i, ((req, kv), row_logits)) in
+            plan.requests.iter().zip(kv_states).zip(logits).enumerate()
+        {
+            let cpu_logits =
+                snapshot_requested_logprobs(self.model.device_ctx(), &row_logits, &[req.logprobs])?;
+            let tokens = select_default_tokens_from_logits(
+                &self.model,
+                &row_logits,
+                &mut self.graph_state.buffers,
+            )?;
+            let first_token = tokens[0];
+            let first_token_logprob = cpu_logits[0].as_ref().and_then(|row| {
                 pegainfer_sample::token_logprob_from_row(row, first_token, req.logprobs)
             });
-            let slot_idx = self.active.len();
-            self.graph_state.copy_state_to_slot(
-                self.model.device_ctx(),
-                &recurrent_states[i],
-                slot_idx,
-            )?;
             self.active.push(ActiveRequest {
                 request_id: req.request_id,
                 kv,
-                graph_slot_idx: slot_idx,
+                graph_slot_idx: assigned_slots[i],
             });
             results.push(PrefillRequestResult {
                 request_id: req.request_id,
@@ -224,10 +251,15 @@ impl Qwen35Executor {
         }
 
         let token_ids: Vec<u32> = plan.requests.iter().map(|req| req.token_id).collect();
+        let slot_indices: Vec<usize> = self.active.iter().map(|req| req.graph_slot_idx).collect();
         let mut kv_refs: Vec<&mut KvState> =
             self.active.iter_mut().map(|req| &mut req.kv).collect();
-        self.model
-            .batch_decode_graph(&token_ids, &mut kv_refs, &mut self.graph_state)?;
+        self.model.batch_decode_graph(
+            &token_ids,
+            &mut kv_refs,
+            &slot_indices,
+            &mut self.graph_state,
+        )?;
 
         let requested_logprobs: Vec<usize> = plan.requests.iter().map(|req| req.logprobs).collect();
         let cpu_logits = snapshot_requested_logprobs(
@@ -266,51 +298,8 @@ impl Qwen35Executor {
         else {
             return Ok(());
         };
-        self.compact_slot(idx)
-    }
-
-    fn compact_slot(&mut self, idx: usize) -> Result<()> {
-        let last = self.active.len() - 1;
-        self.active.swap_remove(idx);
-
-        if idx < self.active.len() {
-            anyhow::ensure!(
-                self.active[idx].graph_slot_idx == last,
-                "Qwen3.5 logits executor slot invariant broken: active slot {} moved from graph slot {}, expected {}",
-                idx,
-                self.active[idx].graph_slot_idx,
-                last
-            );
-            for layer_idx in 0..self.graph_state.slot_states[last].layers.len() {
-                let (src_part, dst_part) = if idx < last {
-                    let (left, right) = self.graph_state.slot_states.split_at_mut(last);
-                    (
-                        &right[0].layers[layer_idx],
-                        &mut left[idx].layers[layer_idx],
-                    )
-                } else {
-                    unreachable!("idx < active.len() <= last");
-                };
-                self.model
-                    .device_ctx()
-                    .stream
-                    .memcpy_dtod(&src_part.state, &mut dst_part.state)
-                    .map_err(|e| {
-                        anyhow::anyhow!("compact Qwen3.5 logits executor state copy failed: {e}")
-                    })?;
-                self.model
-                    .device_ctx()
-                    .stream
-                    .memcpy_dtod(&src_part.conv_state.data, &mut dst_part.conv_state.data)
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "compact Qwen3.5 logits executor conv_state copy failed: {e}"
-                        )
-                    })?;
-            }
-            self.graph_state.slot_states[idx].seq_len = self.graph_state.slot_states[last].seq_len;
-            self.active[idx].graph_slot_idx = idx;
-        }
+        let removed = self.active.swap_remove(idx);
+        self.free_slots.push(removed.graph_slot_idx);
         Ok(())
     }
 }

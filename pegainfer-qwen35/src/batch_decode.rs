@@ -304,24 +304,21 @@ impl Qwen35Model {
     // CUDA Graph batch decode
     // =========================================================================
 
-    /// CUDA Graph batch decode step.
-    ///
-    /// Pads the batch to the nearest bucket size, fills padding positions with
-    /// dummy KV metadata (pointing to the reserved padding page), then
-    /// captures or replays a per-bucket CUDA Graph for the full kernel sequence.
-    ///
-    /// Recurrent state is owned by `graph_state.slot_states`: the caller must
-    /// pack active requests into positions 0..batch_size before calling. After
-    /// the call, `slot_states[i]` contains the updated state for request i.
+    /// CUDA Graph batch decode step（按 cohort 的 `slot_indices` 映射 recurrent state）。
     pub(crate) fn batch_decode_graph(
         &self,
         token_ids: &[u32],
         kv_states: &mut [&mut KvState],
+        slot_indices: &[usize],
         graph_state: &mut BatchDecodeGraphState,
     ) -> Result<()> {
         let bs = token_ids.len();
         anyhow::ensure!(bs > 0, "batch_decode_graph requires at least one request");
         anyhow::ensure!(bs == kv_states.len(), "token_ids / kv_states len mismatch");
+        anyhow::ensure!(
+            bs == slot_indices.len(),
+            "token_ids / slot_indices len mismatch"
+        );
         anyhow::ensure!(
             bs <= graph_state.slot_states.len(),
             "batch size {bs} exceeds decode capacity {}",
@@ -340,10 +337,16 @@ impl Qwen35Model {
             });
             // Paged-prefill attention stays eager; verify_graph records that
             // captured prefill attention under-reads growing decode KV.
-            return self.batch_decode_batched_hybrid(token_ids, kv_states, graph_state);
+            return self.batch_decode_batched_hybrid(
+                token_ids,
+                kv_states,
+                slot_indices,
+                graph_state,
+            );
         }
 
         let padded_bs = bucket_for(bs);
+        graph_state.sync_active_slots(&self.ctx, slot_indices, padded_bs)?;
         graph_state.linear_pointer_tables.validate_for(
             &self.config,
             padded_bs,
@@ -358,7 +361,7 @@ impl Qwen35Model {
             self.ensure_rope_cache_covers(pos + 1)?;
             kv.ensure_capacity(pos + 1)?;
             kv.advance(1);
-            graph_state.slot_states[i].seq_len += 1;
+            graph_state.slot_states[slot_indices[i]].seq_len += 1;
             positions.push(pos as i32);
         }
 
@@ -407,9 +410,11 @@ impl Qwen35Model {
         &self,
         token_ids: &[u32],
         kv_states: &mut [&mut KvState],
+        slot_indices: &[usize],
         graph_state: &mut BatchDecodeGraphState,
     ) -> Result<()> {
         let bs = token_ids.len();
+        graph_state.sync_active_slots(&self.ctx, slot_indices, bs)?;
         graph_state.linear_pointer_tables.validate_for(
             &self.config,
             bs,
@@ -424,7 +429,7 @@ impl Qwen35Model {
             kv.ensure_capacity(pos + 1)
                 .with_context(|| format!("hybrid decode KV capacity pos={} slot={i}", pos + 1))?;
             kv.advance(1);
-            graph_state.slot_states[i].seq_len += 1;
+            graph_state.slot_states[slot_indices[i]].seq_len += 1;
             positions_i32.push(pos as i32);
             start_positions.push(pos);
         }

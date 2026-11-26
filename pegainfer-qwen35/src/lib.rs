@@ -6,6 +6,7 @@
 
 mod batch_decode;
 pub(crate) mod batch_decode_graph;
+mod capacity;
 pub(crate) mod config;
 mod decode_buffers;
 mod executor;
@@ -29,14 +30,21 @@ use std::path::Path;
 
 use anyhow::Result;
 use anyhow::anyhow;
+pub use capacity::ServingCapacity;
 pub(crate) use config::probe_config_json;
 use pegainfer_frontend::engine::EngineHandle;
 use pegainfer_frontend::engine::EngineLoadOptions;
 use pegainfer_frontend::engine::EpBackend;
 pub use scheduler::DEFAULT_MAX_PREFILL_TOKENS;
 
-/// Maximum supported Qwen3.5 decode scheduler slots.
-const MAX_DECODE_BATCH: usize = batch_decode_graph::MAX_BATCH;
+/// 单步 decode 默认/最大宽度（64）。
+pub const DEFAULT_DECODE_WIDTH: usize = capacity::DEFAULT_DECODE_WIDTH;
+
+/// 单 GPU 默认最大驻留请求数（2 × 64 = 128）。
+pub const DEFAULT_SINGLE_GPU_MAX_RESIDENT: usize = capacity::DEFAULT_SINGLE_GPU_MAX_RESIDENT;
+
+/// TP 默认最大驻留请求数（单 cohort 64）。
+pub const DEFAULT_TP_MAX_RESIDENT: usize = capacity::DEFAULT_TP_MAX_RESIDENT;
 
 /// Current safe Qwen3.5 Shared-SM overlap admission cap.
 ///
@@ -99,13 +107,16 @@ pub enum Qwen35DecodeOverlap {
 pub fn start_engine(
     model_path: &Path,
     options: EngineLoadOptions,
-    max_batch: usize,
+    decode_width: usize,
     max_prefill_tokens: usize,
 ) -> Result<EngineHandle> {
+    let max_resident =
+        ServingCapacity::default_max_resident(decode_width, options.device_ordinals.len().max(1));
     start_engine_with_capacity_and_policy(
         model_path,
         options,
-        max_batch,
+        decode_width,
+        max_resident,
         max_prefill_tokens,
         Qwen35SchedulerPolicy::Off,
     )
@@ -119,7 +130,10 @@ pub struct Qwen35LaunchOptions {
     tp_size: usize,
     /// TP Phase 1 supports eager-only multi-GPU execution.
     cuda_graph: bool,
-    max_batch: usize,
+    /// 单步 decode 宽度（1..=64，默认 64）。
+    decode_width: usize,
+    /// 最大驻留请求数（单 GPU 默认 128，TP 默认 64）。
+    max_resident: usize,
     max_prefill_tokens: usize,
 }
 
@@ -151,7 +165,8 @@ pub fn launch_with_options_policy_and_overlap(
             ep_backend: EpBackend::Nccl,
             seed: 42,
         },
-        options.max_batch,
+        options.decode_width,
+        options.max_resident,
         options.max_prefill_tokens,
         scheduler_policy,
         decode_overlap,
@@ -161,13 +176,15 @@ pub fn launch_with_options_policy_and_overlap(
 pub fn start_engine_with_capacity(
     model_path: &Path,
     options: EngineLoadOptions,
-    max_batch: usize,
+    decode_width: usize,
+    max_resident: usize,
     max_prefill_tokens: usize,
 ) -> Result<EngineHandle> {
     start_engine_with_capacity_and_policy(
         model_path,
         options,
-        max_batch,
+        decode_width,
+        max_resident,
         max_prefill_tokens,
         Qwen35SchedulerPolicy::Off,
     )
@@ -176,14 +193,16 @@ pub fn start_engine_with_capacity(
 pub(crate) fn start_engine_with_capacity_and_policy(
     model_path: &Path,
     options: EngineLoadOptions,
-    max_batch: usize,
+    decode_width: usize,
+    max_resident: usize,
     max_prefill_tokens: usize,
     scheduler_policy: Qwen35SchedulerPolicy,
 ) -> Result<EngineHandle> {
     start_engine_with_capacity_policy_and_overlap(
         model_path,
         options,
-        max_batch,
+        decode_width,
+        max_resident,
         max_prefill_tokens,
         scheduler_policy,
         Qwen35DecodeOverlap::Off,
@@ -193,21 +212,20 @@ pub(crate) fn start_engine_with_capacity_and_policy(
 pub fn start_engine_with_capacity_policy_and_overlap(
     model_path: &Path,
     options: EngineLoadOptions,
-    max_batch: usize,
+    decode_width: usize,
+    max_resident: usize,
     max_prefill_tokens: usize,
     scheduler_policy: Qwen35SchedulerPolicy,
     decode_overlap: Qwen35DecodeOverlap,
 ) -> Result<EngineHandle> {
-    anyhow::ensure!(
-        (1..=MAX_DECODE_BATCH).contains(&max_batch),
-        "Qwen3.5 max_batch must be in 1..={MAX_DECODE_BATCH}, got {max_batch}"
-    );
     let EngineLoadOptions {
         enable_cuda_graph,
         device_ordinals,
         seed,
         ..
     } = options;
+    let tp_world_size = device_ordinals.len().max(1);
+    ServingCapacity::validate_request(decode_width, max_resident, tp_world_size)?;
     anyhow::ensure!(
         scheduler_policy == Qwen35SchedulerPolicy::Off
             || decode_overlap == Qwen35DecodeOverlap::Off,
@@ -215,8 +233,8 @@ pub fn start_engine_with_capacity_policy_and_overlap(
     );
     if decode_overlap == Qwen35DecodeOverlap::SharedSm {
         anyhow::ensure!(
-            max_batch <= MAX_SHARED_SM_DECODE_BATCH,
-            "Qwen3.5 --decode-overlap=stream currently requires --max-batch <= {MAX_SHARED_SM_DECODE_BATCH}; larger decode buckets still fall back to the prefill GEMM handle"
+            decode_width <= MAX_SHARED_SM_DECODE_BATCH,
+            "Qwen3.5 --decode-overlap=stream currently requires --decode-width <= {MAX_SHARED_SM_DECODE_BATCH}; larger decode buckets still fall back to the prefill GEMM handle"
         );
     }
     if device_ordinals.len() > 1 {
@@ -241,7 +259,8 @@ pub fn start_engine_with_capacity_policy_and_overlap(
             model_path,
             seed,
             &device_ordinals,
-            max_batch,
+            decode_width,
+            max_resident,
             max_prefill_tokens,
         );
     }
@@ -263,11 +282,15 @@ pub fn start_engine_with_capacity_policy_and_overlap(
     let model_path = model_path
         .to_str()
         .ok_or_else(|| anyhow!("model path must be valid UTF-8"))?;
-    let model = weights::Qwen35Model::from_safetensors(model_path, device_ordinal, max_batch)?;
+    let model = weights::Qwen35Model::from_safetensors_with_capacity(
+        model_path,
+        device_ordinal,
+        decode_width,
+        max_resident,
+    )?;
     scheduler::start_with_capacity_and_policy(
         model,
         seed,
-        max_batch,
         max_prefill_tokens,
         scheduler_policy,
         decode_overlap,
@@ -294,7 +317,8 @@ mod tests {
             device_ordinal: 3,
             tp_size: 0,
             cuda_graph: false,
-            max_batch: 1,
+            decode_width: 1,
+            max_resident: 1,
             max_prefill_tokens: 1,
         };
 
@@ -320,6 +344,7 @@ mod tests {
             },
             1,
             1,
+            1,
             Qwen35SchedulerPolicy::Auto,
         )
         .err()
@@ -328,6 +353,29 @@ mod tests {
 
         assert!(err.contains("scheduler policy"));
         assert!(err.contains("single-GPU only"));
+    }
+
+    #[test]
+    fn tp_rejects_dual_cohort_max_resident_before_loading_model() {
+        let err = start_engine_with_capacity_and_policy(
+            Path::new("unused-model-path"),
+            EngineLoadOptions {
+                enable_cuda_graph: false,
+                device_ordinals: vec![0, 1],
+                parallel_config: None,
+                ep_backend: EpBackend::Nccl,
+                seed: 42,
+            },
+            64,
+            128,
+            1024,
+            Qwen35SchedulerPolicy::Off,
+        )
+        .err()
+        .expect("TP must reject max_resident > decode_width")
+        .to_string();
+
+        assert!(err.contains("single cohort"));
     }
 
     #[test]
@@ -341,6 +389,7 @@ mod tests {
                 ep_backend: EpBackend::Nccl,
                 seed: 42,
             },
+            1,
             1,
             1,
             Qwen35SchedulerPolicy::Off,
@@ -366,6 +415,7 @@ mod tests {
             },
             1,
             1,
+            1,
             Qwen35SchedulerPolicy::Auto,
             Qwen35DecodeOverlap::SharedSm,
         )
@@ -388,6 +438,7 @@ mod tests {
                 seed: 42,
             },
             MAX_SHARED_SM_DECODE_BATCH + 1,
+            MAX_SHARED_SM_DECODE_BATCH + 1,
             1,
             Qwen35SchedulerPolicy::Off,
             Qwen35DecodeOverlap::SharedSm,
@@ -396,7 +447,7 @@ mod tests {
         .expect("decode-overlap validation should reject unsafe decode bucket")
         .to_string();
 
-        assert!(err.contains("max-batch"));
+        assert!(err.contains("decode-width"));
         assert!(err.contains(&MAX_SHARED_SM_DECODE_BATCH.to_string()));
     }
 }

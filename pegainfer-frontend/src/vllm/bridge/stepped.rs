@@ -94,6 +94,7 @@ impl SteppedEngineBridge {
             self.max_model_len,
             self.kv_capacity,
             None,
+            None,
             &shutdown,
         )
         .await?;

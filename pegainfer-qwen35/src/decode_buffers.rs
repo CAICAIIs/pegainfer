@@ -62,6 +62,44 @@ pub(crate) struct BatchDecodeBuffers35 {
 }
 
 impl BatchDecodeBuffers35 {
+    /// 估算不含 `page_indices_d`（随 KV 页数变化）的固定显存字节数。
+    pub(crate) fn estimate_fixed_bytes(
+        config: &Config35,
+        tensor_parallel: TensorParallelConfig,
+        max_batch_size: usize,
+    ) -> usize {
+        let h = config.hidden_size;
+        let bs = max_batch_size;
+        let q_proj_dim = config.local_full_attn_gated_q_dim(tensor_parallel);
+        let q_dim = config.local_full_attn_q_dim(tensor_parallel);
+        let kv_dim = config.local_full_attn_kv_dim(tensor_parallel);
+        let qkv_dim = config.linear_attn_qkv_dim();
+        let z_dim = config.linear_attn_z_dim();
+        let ba_dim = config.linear_num_value_heads;
+        let intermediate = config.local_intermediate_size(tensor_parallel);
+        let vocab = config.selection_vocab;
+
+        let bf16_elems = (5 * h
+            + 3 * intermediate
+            + vocab
+            + q_proj_dim
+            + 2 * q_dim
+            + 2 * kv_dim
+            + 2 * qkv_dim
+            + 3 * z_dim
+            + 2 * ba_dim)
+            * bs;
+        let meta_bytes = (7 * bs + 1) * std::mem::size_of::<i32>();
+        // SampleScratch：probs (f32 [bs, vocab]) + argmax partials + softmax workspace + 行元数据。
+        let sample_probs_bytes = bs * vocab * std::mem::size_of::<f32>();
+        let sample_softmax_bytes = bs * vocab.div_ceil(8192) * 8 + 256;
+        let sample_argmax_bytes = bs * vocab.div_ceil(256) * 8;
+        let sample_overhead_bytes =
+            sample_probs_bytes + sample_softmax_bytes + sample_argmax_bytes + 64 * 1024;
+
+        bf16_elems * std::mem::size_of::<half::bf16>() + meta_bytes + sample_overhead_bytes
+    }
+
     pub(crate) fn new(
         ctx: &DeviceContext,
         config: &Config35,
